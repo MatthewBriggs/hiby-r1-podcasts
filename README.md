@@ -9,7 +9,7 @@ into `hiby_player` and re-pointing a launcher tile's callback at it. Nothing is
 patched on disk; the stock binary is untouched.
 
 <p align="center">
-  <img src="docs/screenshots/01-launcher.png" width="240" alt="Launcher with the Podcasts tile">
+  <img src="docs/screenshots/01-launcher-tiles.png" width="240" alt="Launcher with the Podcasts tile">
   <img src="docs/screenshots/02-feeds.png" width="240" alt="Feed list">
   <img src="docs/screenshots/05-playing.png" width="240" alt="Now playing">
 </p>
