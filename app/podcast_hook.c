@@ -34,9 +34,11 @@
 #include <linux/fb.h>
 #include <linux/input.h>
 #include <sys/wait.h>
+#include <sys/mount.h>
 
 #include "font5x7.h"
 #include "audio.h"
+#include "cover.h"
 
 /* ---- hiby_player addresses (firmware 2.0.25) ---------------------------- */
 #define ABOUT_CB_1      0x00892150u
@@ -66,6 +68,7 @@
 #define RESUME_DIR  "/data/mnt/sd_0/.podsync"
 #define RESUME_FILE RESUME_DIR "/resume.txt"
 #define LOG_PATH    "/tmp/.podcast_hook.log"
+#define RES_DIR     "/usr/data/podcast_res"
 #define SYNC_SCRIPT RESUME_DIR "/podsync_once.sh"
 #define SYNC_LOG    "/tmp/.podsync_run.log"
 #define UPDATE_BTN_H 52
@@ -89,6 +92,7 @@ static char episodes[MAX_ITEMS][NAME_LEN];
 static char episode_paths[MAX_ITEMS][PATH_LEN];
 static long episode_mtime[MAX_ITEMS];
 static int  episode_resume[MAX_ITEMS];   /* ms, or POS_FINISHED, or 0 */
+static int  episode_dur[MAX_ITEMS];
 static int  episode_count;
 
 static int screen = SCREEN_FEEDS;
@@ -98,6 +102,37 @@ static int scroll = 0;
 static char cur_feed[NAME_LEN];
 static char cur_path[PATH_LEN];
 static int  update_running = 0;
+
+static void plog(const char *fmt, ...);
+
+#define COVER_PX 150
+static uint16_t *cur_cover;      /* RGB565 square for the open feed, or NULL */
+static char      cover_feed[NAME_LEN];
+
+/* Decode once per feed; cover_load also caches the result on the card. */
+static void cover_for_feed(const char *feed) {
+    if (cur_cover && strcmp(cover_feed, feed) == 0) return;
+    free(cur_cover);
+    cur_cover = NULL;
+    snprintf(cover_feed, sizeof(cover_feed), "%s", feed);
+    char p[PATH_LEN];
+    snprintf(p, sizeof(p), "%s/%s/cover.jpg", PODCAST_DIR, feed);
+    cur_cover = cover_load(p, COVER_PX);
+    plog("[podcast] cover %s: %s\n", feed, cur_cover ? "ok" : "none");
+}
+
+static void blit_cover(uint16_t *fb, int x, int y, int px) {
+    if (!cur_cover) return;
+    for (int r = 0; r < px; r++) {
+        int sy = r * COVER_PX / px;
+        for (int c = 0; c < px; c++) {
+            int sx = c * COVER_PX / px;
+            int dx = x + c, dy = y + r;
+            if (dx < 0 || dy < 0 || dx >= FB_W || dy >= FB_H) continue;
+            fb[(size_t)dy * FB_W + dx] = cur_cover[(size_t)sy * COVER_PX + sx];
+        }
+    }
+}
 
 /* ---- logging ------------------------------------------------------------ */
 static void plog(const char *fmt, ...) {
@@ -126,26 +161,40 @@ static int is_hiby_player(void) {
 /* ---- resume positions ---------------------------------------------------- */
 /* One line per episode: "<ms>\t<path>". Kept on the SD card so it survives the
  * internal data partition filling up, which this device is prone to. */
-static int resume_lookup(const char *path) {
+/* Lines are "<ms>\t<duration_ms>\t<path>". Older two-field lines still parse,
+ * they just have no duration and so show no percentage. */
+static int resume_lookup2(const char *path, int *dur_out) {
+    if (dur_out) *dur_out = 0;
     FILE *f = fopen(RESUME_FILE, "r");
     if (!f) return 0;
-    char line[PATH_LEN + 32];
+    char line[PATH_LEN + 48];
     int ms = 0;
     while (fgets(line, sizeof(line), f)) {
-        char *tab = strchr(line, '\t');
-        if (!tab) continue;
-        *tab = '\0';
-        char *p = tab + 1;
-        char *nl = strchr(p, '\n');
+        char *nl = strchr(line, '\n');
         if (nl) *nl = '\0';
-        if (strcmp(p, path) == 0) { ms = atoi(line); break; }
+        char *t1 = strchr(line, '\t');
+        if (!t1) continue;
+        *t1 = '\0';
+        char *rest = t1 + 1;
+        char *t2 = strchr(rest, '\t');
+        int dur = 0;
+        char *pathp;
+        if (t2) { *t2 = '\0'; dur = atoi(rest); pathp = t2 + 1; }
+        else    { pathp = rest; }
+        if (strcmp(pathp, path) == 0) {
+            ms = atoi(line);
+            if (dur_out) *dur_out = dur;
+            break;
+        }
     }
     fclose(f);
     return ms;
 }
 
+static int resume_lookup(const char *path) { return resume_lookup2(path, NULL); }
+
 #define POS_FINISHED (-1)
-static void resume_store(const char *path, int ms) {
+static void resume_store(const char *path, int ms, int dur) {
     mkdir(RESUME_DIR, 0755);
     char (*keep)[PATH_LEN + 32] = malloc(sizeof(*keep) * 128);
     if (!keep) return;
@@ -156,12 +205,14 @@ static void resume_store(const char *path, int ms) {
         while (n < 127 && fgets(line, sizeof(line), f)) {
             char probe[PATH_LEN + 32];
             snprintf(probe, sizeof(probe), "%s", line);
-            char *tab = strchr(probe, '\t');
-            if (tab) {
-                char *p = tab + 1;
-                char *nl = strchr(p, '\n');
-                if (nl) *nl = '\0';
-                if (strcmp(p, path) == 0) continue;   /* replaced below */
+            char *nl = strchr(probe, '\n');
+            if (nl) *nl = '\0';
+            char *t1 = strchr(probe, '\t');
+            if (t1) {
+                char *rest = t1 + 1;
+                char *t2 = strchr(rest, '\t');
+                char *pathp = t2 ? t2 + 1 : rest;
+                if (strcmp(pathp, path) == 0) continue;   /* replaced below */
             }
             snprintf(keep[n++], PATH_LEN + 32, "%s", line);
         }
@@ -169,7 +220,7 @@ static void resume_store(const char *path, int ms) {
     }
     f = fopen(RESUME_FILE, "w");
     if (f) {
-        if (ms > 3000 || ms == POS_FINISHED) fprintf(f, "%d\t%s\n", ms, path);
+        if (ms > 3000 || ms == POS_FINISHED) fprintf(f, "%d\t%d\t%s\n", ms, dur, path);
         for (int i = 0; i < n; i++) fputs(keep[i], f);
         fclose(f);
     }
@@ -276,9 +327,18 @@ static void draw_progress_marker(uint16_t *fb, int x, int y, int idx) {
     int ms = episode_resume[idx];
     if (ms == 0) return;                       /* untouched */
     if (ms < 0) {
-        fill_rect(fb, x, y, 14, 14, COL_ACCENT);          /* finished */
+        draw_text(fb, x - 26, y - 4, "DONE", COL_ACCENT, 2, FB_W);
+        return;
+    }
+    int dur = episode_dur[idx];
+    if (dur > 0) {
+        int pct = (int)((int64_t)ms * 100 / dur);
+        if (pct > 99) pct = 99;
+        char t[8];
+        snprintf(t, sizeof(t), "%d%%", pct);
+        draw_text(fb, x - (pct >= 10 ? 26 : 14), y - 4, t, COL_ACCENT, 2, FB_W);
     } else {
-        fill_rect(fb, x, y, 14, 14, COL_BAR_BG);          /* started */
+        fill_rect(fb, x, y, 14, 14, COL_BAR_BG);
         fill_rect(fb, x, y + 7, 14, 7, COL_ACCENT);
     }
 }
@@ -298,8 +358,8 @@ static void draw_list(uint16_t *fb, char items[][NAME_LEN], int count, int sel) 
         if (idx == sel) fill_rect(fb, 0, y, 6, ROW_H - 2, COL_ACCENT);
         int right = FB_W - 16;
         if (screen == SCREEN_EPISODES) {
-            draw_progress_marker(fb, FB_W - 28, y + 20, idx);
-            right = FB_W - 36;
+            draw_progress_marker(fb, FB_W - 20, y + 20, idx);
+            right = FB_W - 70;
         }
         draw_text(fb, 18, y + 18, items[idx], COL_TEXT, 2, right);
     }
@@ -318,8 +378,11 @@ static void draw_playing(uint16_t *fb) {
 
     char t[NAME_LEN];
     snprintf(t, sizeof(t), "%s", ep_sel >= 0 ? episodes[ep_sel] : "");
-    draw_text(fb, 16, LIST_TOP + 20, cur_feed, COL_DIM, 1, FB_W - 16);
-    draw_text(fb, 16, LIST_TOP + 44, t, COL_TEXT, 2, FB_W - 16);
+    int art = cur_cover ? 84 : 0;
+    if (art) blit_cover(fb, 16, LIST_TOP + 12, art);
+    int tx = 16 + (art ? art + 12 : 0);
+    draw_text(fb, tx, LIST_TOP + 20, cur_feed, COL_DIM, 1, FB_W - 16);
+    draw_text(fb, tx, LIST_TOP + 44, t, COL_TEXT, 2, FB_W - 16);
 
     int pos = audio_position_ms(), dur = audio_duration_ms();
     int bar_y = LIST_TOP + 110, bar_h = 12;
@@ -478,7 +541,7 @@ static void load_episodes(const char *feed) {
     closedir(d);
     sort_episodes();
     for (int i = 0; i < episode_count; i++)
-        episode_resume[i] = resume_lookup(episode_paths[i]);
+        episode_resume[i] = resume_lookup2(episode_paths[i], &episode_dur[i]);
     plog("[podcast] %d episodes in %s\n", episode_count, feed);
 }
 
@@ -519,7 +582,7 @@ static void save_position(void) {
         /* A sentinel rather than 0, so "finished" and "never started" stay
          * distinguishable in the episode list. */
         if (pos > audio_duration_ms() - 5000) pos = POS_FINISHED;
-        resume_store(cur_path, pos);
+        resume_store(cur_path, pos, audio_duration_ms());
     }
 }
 
@@ -532,7 +595,8 @@ static int handle_tap(int x, int y) {
             save_position();
             audio_stop();
             if (ep_sel >= 0 && ep_sel < episode_count)
-                episode_resume[ep_sel] = resume_lookup(episode_paths[ep_sel]);
+                episode_resume[ep_sel] =
+                    resume_lookup2(episode_paths[ep_sel], &episode_dur[ep_sel]);
             screen = SCREEN_EPISODES;
             return 1;
         }
@@ -573,6 +637,7 @@ static int handle_tap(int x, int y) {
             feed_sel = idx;
             snprintf(cur_feed, sizeof(cur_feed), "%s", feeds[idx]);
             load_episodes(cur_feed);
+            cover_for_feed(cur_feed);
             screen = SCREEN_EPISODES;
             ep_sel = -1;
             scroll = 0;
@@ -657,6 +722,9 @@ static int podcast_entry(void *arg0, void *arg1) {
 
     save_position();
     audio_stop();
+    free(cur_cover);
+    cur_cover = NULL;
+    cover_feed[0] = '\0';
 
     if (snapshot) {
         memcpy(base, snapshot, page_px * 2);
@@ -685,10 +753,34 @@ static void build_trampoline(uint32_t target, uint32_t *out) {
 #endif
 #define BCACHE_FLAG 3
 
+/* Shadow the stock tile icon and label. The rootfs is read-only squashfs, so a
+ * bind mount is the only way short of reflashing. Doing it here rather than from
+ * a boot script matters: this constructor runs before main(), and the player
+ * reads its string table during startup — a backgrounded boot script lost that
+ * race for the label (though not for the icon, which is loaded later). */
+static void shadow_resources(void) {
+    static const char *pairs[][2] = {
+        { RES_DIR "/about.png",   "/usr/resource/litegui/theme1/launcher/about.png" },
+        { RES_DIR "/about_s.png", "/usr/resource/litegui/theme1/launcher/about_s.png" },
+        { RES_DIR "/about.png",   "/usr/resource/litegui/theme2/launcher/about.png" },
+        { RES_DIR "/about_s.png", "/usr/resource/litegui/theme2/launcher/about_s.png" },
+        /* Launcher tile labels live in settings.ini (music / net_set / sys_set /
+         * about), not launcher.ini — that one drives a different menu, which is
+         * why editing its <abo_dev> had no effect. */
+        { RES_DIR "/settings.ini", "/usr/resource/str/english/settings.ini" },
+    };
+    for (unsigned i = 0; i < sizeof(pairs) / sizeof(pairs[0]); i++) {
+        if (access(pairs[i][0], R_OK) != 0) continue;
+        if (mount(pairs[i][0], pairs[i][1], NULL, MS_BIND, NULL) != 0)
+            plog("[podcast] bind %s failed: %s\n", pairs[i][1], strerror(errno));
+    }
+}
+
 __attribute__((constructor))
 static void podcast_init(void) {
     if (!is_hiby_player()) return;
     plog("[podcast] init pid=%d entry=%p\n", (int)getpid(), &podcast_entry);
+    shadow_resources();
 
     volatile uint32_t *cave = (volatile uint32_t *)CAVE_ADDR;
     if (cave[0] != 0 || cave[1] != 0) { plog("[podcast] cave occupied\n"); return; }

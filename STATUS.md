@@ -1,7 +1,7 @@
 # HiBy R1 Podcasts app — status
 
-A Podcasts app that replaces the **About** launcher tile on the R1, running
-in-process inside `hiby_player`. Working proof of concept as of 2026-07-27.
+A Podcasts app that takes over the **About** launcher tile on the R1 — retitled
+"Podcasts" with a microphone icon — running in-process inside `hiby_player`.
 
 ## What works
 
@@ -11,8 +11,8 @@ built-in 5x7 font:
 - **Feeds** — an `UPDATE FEEDS` bar, then one row per folder under
   `/data/mnt/sd_0/Audiobooks`.
 - **Episodes** — audio files in the selected feed, newest first, each with a
-  played marker (solid = finished, half bar = started).
-- **Now Playing** — feed and episode name, progress bar, elapsed/total,
+  completion figure (a percentage while part-played, DONE when finished).
+- **Now Playing** — feed cover art, episode name, progress bar, elapsed/total,
   `-30 / PAUSE / +30`, and a speed control cycling 1.0/1.25/1.5/1.75/2.0x.
 
 Lists scroll by swiping, with a proportional scrollbar.
@@ -128,10 +128,33 @@ doing so makes it accumulate and ran 1.75x when 1.25x was asked for.
   next repaints. The audiobook mod solves this with a bounded "handoff watcher"
   that surfaces the player's first hidden redraws.
 - **MP3 only.** `.m4a/.m4b/.opus` are listed but will fail to decode.
-- **No cover art.** The fetcher already downloads `cover.jpg` per feed, but
-  nothing displays it; `libjpeg.so.9` is on the device and the audiobook mod
-  `dlopen`s it, though its struct-based API is ABI-fragile that way.
+- Cover art shows only on Now Playing, not in the lists.
 - Font is uppercase-only 5x7; lowercase folds to caps.
+
+## Tile icon and label
+
+The tile is renamed and re-iconed by shadowing three read-only resources with
+`mount --bind`, done from the `LD_PRELOAD` constructor rather than a boot script:
+the constructor runs before `main()`, and the player reads its string table
+during startup, a race a backgrounded boot script loses (it won for the icon,
+which is loaded later, but not for the label).
+
+The label is `<about>` in **`str/english/settings.ini`** — not `<abo_dev>` in
+`launcher.ini`, which drives a different menu. The giveaway was that the System
+tile reads "System" while `launcher.ini` says "System settings".
+
+`icon/make_icon.py` draws the 140x140 RGBA microphone with 4x supersampling and
+writes the PNG via zlib, so there is no image-library dependency.
+
+## Cover art
+
+`cover.c` decodes a feed's `cover.jpg` with the device's `libjpeg.so.9`, which is
+`dlopen`'d so a missing library degrades to no cover. libjpeg has no opaque-handle
+API, so the struct layout has to match: libjpeg 9's own headers are vendored,
+because Homebrew ships version 80 (jpeg-turbo) and 100 (IJG) and both disagree
+with the device's 90. `jpeg_CreateDecompress` validates the struct size, so a
+mismatch fails safely rather than corrupting memory. Decoding uses `scale_denom`
+to downscale during decode and caches the result next to the cover as raw RGB565.
 
 ## Recovery
 

@@ -1,0 +1,5 @@
+# Podcast subscriptions, one RSS URL per line.
+# Edit this file on the SD card, then hit UPDATE FEEDS in the app.
+
+https://feeds.theincomparable.com/vulcanhello
+https://feeds.acast.com/public/shows/thebugle
