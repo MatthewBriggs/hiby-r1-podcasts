@@ -64,7 +64,7 @@
 #define COL_BAR_BG  RGB(50, 50, 60)
 #define COL_BTN     RGB(45, 45, 58)
 
-#define PODCAST_DIR "/data/mnt/sd_0/Audiobooks"
+#define PODCAST_DIR "/data/mnt/sd_0/Podcasts"
 #define RESUME_DIR  "/data/mnt/sd_0/.podsync"
 #define RESUME_FILE RESUME_DIR "/resume.txt"
 #define LOG_PATH    "/tmp/.podcast_hook.log"
@@ -104,6 +104,98 @@ static char cur_path[PATH_LEN];
 static int  update_running = 0;
 
 static void plog(const char *fmt, ...);
+
+/* ---- volume + screen lock ------------------------------------------------ */
+#define BACKLIGHT "/sys/class/backlight/backlight_pwm0/brightness"
+static int  vol_show_frames;     /* countdown: draw the volume overlay */
+static int  vol_pct = -1;        /* last known, for the overlay */
+static int  locked;              /* screen off, touch ignored, audio keeps going */
+static int  saved_brightness = -1;
+static char bt_mixer_name[64];   /* bluealsa element, named after the device */
+
+static int read_int_file(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    int v = -1;
+    if (fscanf(f, "%d", &v) != 1) v = -1;
+    fclose(f);
+    return v;
+}
+
+static void write_int_file(const char *path, int v) {
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "%d\n", v);
+    fclose(f);
+}
+
+/* The bluealsa mixer element is named after the connected device, so look it
+ * up rather than hardcoding it. Empty means "no BT sink". */
+static void find_bt_mixer(void) {
+    bt_mixer_name[0] = '\0';
+    FILE *p = popen("amixer -D bluealsa scontrols 2>/dev/null", "r");
+    if (!p) return;
+    char line[256];
+    if (fgets(line, sizeof(line), p)) {
+        char *q1 = strchr(line, '\'');
+        char *q2 = q1 ? strchr(q1 + 1, '\'') : NULL;
+        if (q1 && q2) {
+            size_t n = (size_t)(q2 - q1 - 1);
+            if (n >= sizeof(bt_mixer_name)) n = sizeof(bt_mixer_name) - 1;
+            memcpy(bt_mixer_name, q1 + 1, n);
+            bt_mixer_name[n] = '\0';
+        }
+    }
+    pclose(p);
+}
+
+/* Read back the current level so the overlay shows something truthful. */
+static int read_volume_pct(void) {
+    char cmd[256];
+    if (bt_mixer_name[0])
+        snprintf(cmd, sizeof(cmd), "amixer -D bluealsa sget '%s' 2>/dev/null", bt_mixer_name);
+    else
+        snprintf(cmd, sizeof(cmd), "amixer sget Left 2>/dev/null");
+    FILE *p = popen(cmd, "r");
+    if (!p) return -1;
+    char line[256];
+    int pct = -1;
+    while (fgets(line, sizeof(line), p)) {
+        char *b = strchr(line, '[');
+        if (b && strchr(b, '%')) { pct = atoi(b + 1); break; }
+    }
+    pclose(p);
+    return pct;
+}
+
+static void adjust_volume(int delta_pct) {
+    char cmd[320];
+    if (bt_mixer_name[0]) {
+        snprintf(cmd, sizeof(cmd), "amixer -D bluealsa sset '%s' %d%%%c >/dev/null 2>&1",
+                 bt_mixer_name, delta_pct < 0 ? -delta_pct : delta_pct,
+                 delta_pct < 0 ? '-' : '+');
+    } else {
+        snprintf(cmd, sizeof(cmd),
+                 "amixer sset Left %d%%%c >/dev/null 2>&1; amixer sset Right %d%%%c >/dev/null 2>&1",
+                 delta_pct < 0 ? -delta_pct : delta_pct, delta_pct < 0 ? '-' : '+',
+                 delta_pct < 0 ? -delta_pct : delta_pct, delta_pct < 0 ? '-' : '+');
+    }
+    if (system(cmd) == -1) return;
+    vol_pct = read_volume_pct();
+    vol_show_frames = 45;              /* ~1.5s at 30fps */
+}
+
+static void set_locked(int on) {
+    if (on == locked) return;
+    locked = on;
+    if (on) {
+        saved_brightness = read_int_file(BACKLIGHT);
+        write_int_file(BACKLIGHT, 0);
+    } else if (saved_brightness > 0) {
+        write_int_file(BACKLIGHT, saved_brightness);
+    }
+    plog("[podcast] %s\n", on ? "locked" : "unlocked");
+}
 
 #define COVER_PX 150
 static uint16_t *cur_cover;      /* RGB565 square for the open feed, or NULL */
@@ -434,6 +526,19 @@ static void draw_update(uint16_t *fb) {
         draw_text(fb, 16, FB_H - 40, "TAP BACK WHEN READY", COL_DIM, 2, 0);
 }
 
+static void draw_volume_overlay(uint16_t *fb) {
+    if (vol_show_frames <= 0) return;
+    vol_show_frames--;
+    int h = 70, y = FB_H - h - 20;
+    fill_rect(fb, 20, y, FB_W - 40, h, COL_BTN);
+    char t[32];
+    snprintf(t, sizeof(t), "VOL %d%%", vol_pct < 0 ? 0 : vol_pct);
+    draw_text(fb, 36, y + 12, t, COL_TEXT, 2, FB_W - 40);
+    int bw = FB_W - 72, bx = 36, by = y + 44;
+    fill_rect(fb, bx, by, bw, 12, COL_BAR_BG);
+    if (vol_pct > 0) fill_rect(fb, bx, by, bw * vol_pct / 100, 12, COL_ACCENT);
+}
+
 static void draw_ui(uint16_t *fb) {
     fill_rect(fb, 0, 0, FB_W, FB_H, COL_BG);
     if (screen == SCREEN_FEEDS) {
@@ -452,6 +557,7 @@ static void draw_ui(uint16_t *fb) {
     } else {
         draw_playing(fb);
     }
+    draw_volume_overlay(fb);
 }
 
 /* ---- listing ------------------------------------------------------------ */
@@ -546,6 +652,18 @@ static void load_episodes(const char *feed) {
 }
 
 /* ---- touch -------------------------------------------------------------- */
+/* Volume and power live on the gpio/adc key nodes, not the touch node. */
+static int read_key(int *fds, int n, int *code) {
+    struct input_event ev;
+    for (int i = 0; i < n; i++) {
+        if (fds[i] < 0) continue;
+        while (read(fds[i], &ev, sizeof(ev)) == (ssize_t)sizeof(ev)) {
+            if (ev.type == EV_KEY && ev.value == 1) { *code = ev.code; return 1; }
+        }
+    }
+    return 0;
+}
+
 /* Returns 1 for a tap, 2 for a vertical swipe (dy in *ty). */
 static int read_gesture(int fd, int *tx, int *ty) {
     struct input_event ev;
@@ -693,10 +811,30 @@ static int podcast_entry(void *arg0, void *arg1) {
     if (tfd >= 0 && ioctl(tfd, EVIOCGRAB, 1) < 0)
         plog("[podcast] EVIOCGRAB failed: %s\n", strerror(errno));
 
+    /* Not grabbed: the player still needs its own key handling when we exit,
+     * and grabbing the power key risks leaving the device unresponsive. */
+    int kfds[2];
+    kfds[0] = open("/dev/input/event0", O_RDONLY | O_NONBLOCK);
+    kfds[1] = open("/dev/input/event2", O_RDONLY | O_NONBLOCK);
+    find_bt_mixer();
+    vol_pct = read_volume_pct();
+
     int page = 0, frames = 0, ticks = 0;
     for (;;) {
+        int kc;
+        while (read_key(kfds, 2, &kc)) {
+            if (locked) {
+                /* Any key wakes the screen; nothing else acts while locked. */
+                set_locked(0);
+                continue;
+            }
+            if (kc == KEY_VOLUMEUP)        adjust_volume(+4);
+            else if (kc == KEY_VOLUMEDOWN) adjust_volume(-4);
+            else if (kc == KEY_POWER)      set_locked(1);
+        }
+
         int x, y;
-        int g = tfd >= 0 ? read_gesture(tfd, &x, &y) : 0;
+        int g = (tfd >= 0 && !locked) ? read_gesture(tfd, &x, &y) : 0;
         if (g == 2) {
             /* Swipe up scrolls down. Playing screen has no list. */
             if (screen == SCREEN_FEEDS)         scroll_by(-y / ROW_H, feed_count);
@@ -710,6 +848,8 @@ static int podcast_entry(void *arg0, void *arg1) {
             ticks = 0;
             save_position();
         }
+
+        if (locked) { usleep(120000); continue; }
 
         draw_ui(base + (size_t)page * page_px);
         v.yoffset = (uint32_t)(page * FB_H);
@@ -734,6 +874,8 @@ static int podcast_entry(void *arg0, void *arg1) {
     v.yoffset = 0;
     ioctl(fbfd, FBIOPAN_DISPLAY, &v);
     munmap(base, map_len);
+    set_locked(0);                       /* never leave the panel dark */
+    for (int i = 0; i < 2; i++) if (kfds[i] >= 0) close(kfds[i]);
     if (tfd >= 0) { ioctl(tfd, EVIOCGRAB, 0); close(tfd); }
     close(fbfd);
     plog("[podcast] leaving app after %d frames\n", frames);

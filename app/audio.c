@@ -26,9 +26,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 
 #include "audio.h"
 #include "wsola.h"
+#include "mp3meta.h"
 #include <fcntl.h>
 #include <stdarg.h>
 #include <time.h>
@@ -125,12 +128,46 @@ int audio_init(void) {
     return 0;
 }
 
+/* An A2DP sink shows up as a bluealsa PCM ending in /sink. */
+static int bt_sink_connected(void) {
+    FILE *p = popen("bluealsa-cli list-pcms 2>/dev/null", "r");
+    if (!p) return 0;
+    char line[256];
+    int found = 0;
+    while (fgets(line, sizeof(line), p)) {
+        if (strstr(line, "a2dp") && strstr(line, "/sink")) { found = 1; break; }
+    }
+    pclose(p);
+    return found;
+}
+
 static void *pcm_open(unsigned int rate, int channels) {
     void *pcm = NULL;
-    const char *names[] = { "plughw:0,0", "default", "hw:0,0" };
-    for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
-        if (x_open(&pcm, names[i], SND_PCM_STREAM_PLAYBACK, 0) >= 0 && pcm) break;
+    /* Route to Bluetooth when a sink is connected, otherwise the wired DAC.
+     * "bluealsa" is the predefined plug device and auto-selects the most recent
+     * sink, converting rate/format as needed. */
+    const char *wired[] = { "plughw:0,0", "default", "hw:0,0" };
+    const char *bt[]    = { "bluealsa" };
+    int use_bt = bt_sink_connected();
+    const char **names = use_bt ? bt : wired;
+    unsigned count = use_bt ? 1 : 3;
+    alog("[audio] output: %s\n", use_bt ? "bluetooth" : "wired");
+
+    for (unsigned i = 0; i < count; i++) {
+        int rc = x_open(&pcm, names[i], SND_PCM_STREAM_PLAYBACK, 0);
+        if (rc >= 0 && pcm) break;
+        alog("[audio] open %s failed rc=%d\n", names[i], rc);
         pcm = NULL;
+    }
+    /* Fall back to wired rather than going silent if BT will not open. */
+    if (!pcm && use_bt) {
+        for (unsigned i = 0; i < 3; i++) {
+            if (x_open(&pcm, wired[i], SND_PCM_STREAM_PLAYBACK, 0) >= 0 && pcm) {
+                alog("[audio] fell back to wired\n");
+                break;
+            }
+            pcm = NULL;
+        }
     }
     if (!pcm) { g_err = "snd_pcm_open failed"; return NULL; }
 
@@ -147,7 +184,11 @@ static void *pcm_open(unsigned int rate, int channels) {
     unsigned int buf_us = 500000, per_us = 100000;   /* 500 ms / 100 ms */
     x_hwp_set_buffer_time_near(pcm, hw, &buf_us, NULL);
     x_hwp_set_period_time_near(pcm, hw, &per_us, NULL);
-    if (x_hwp_apply(pcm, hw) < 0) { g_err = "hw_params"; x_hwp_free(hw); goto fail; }
+    int hwrc = x_hwp_apply(pcm, hw);
+    if (hwrc < 0) {
+        alog("[audio] hw_params rc=%d (-16 = EBUSY, slave held elsewhere)\n", hwrc);
+        g_err = "hw_params"; x_hwp_free(hw); goto fail;
+    }
     x_hwp_free(hw);
 
     void *sw = NULL;
@@ -167,33 +208,48 @@ fail:
 static void *worker(void *unused) {
     (void)unused;
 
-    mp3dec_ex_t dec;
-    memset(&dec, 0, sizeof(dec));
-    /* MP3D_SEEK_TO_BYTE reports success then reads EOF for far offsets (its
-     * byte estimate overshoots on VBR), which broke resume. SEEK_TO_SAMPLE is
-     * exact; the audiobook mod avoided it because indexing a 6.6h book costs
-     * ~14.5MB, but podcast episodes are an order of magnitude shorter. */
+    /* mp3dec_ex_open computes duration by scanning every frame — about 5 s for a
+     * podcast episode on this device, which stalls playback start. Drive the
+     * frame decoder directly instead and take duration from the Xing header (or
+     * the CBR bitrate), which needs only the first few hundred bytes. The file
+     * is mmap'd so seeking is just moving a pointer. */
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     pthread_mutex_lock(&g_lock); g_loading = 1; pthread_mutex_unlock(&g_lock);
-    if (mp3dec_ex_open(&dec, g_path, MP3D_SEEK_TO_SAMPLE) != 0) {
-        pthread_mutex_lock(&g_lock); g_loading = 0; pthread_mutex_unlock(&g_lock);
+
+    int fd = open(g_path, O_RDONLY);
+    struct stat st;
+    if (fd < 0 || fstat(fd, &st) != 0 || st.st_size < 1024) {
+        if (fd >= 0) close(fd);
         pthread_mutex_lock(&g_lock);
-        g_err = "cannot decode file"; g_active = 0; g_running = 0;
+        g_err = "cannot open file"; g_active = 0; g_running = 0; g_loading = 0;
+        pthread_mutex_unlock(&g_lock);
+        return NULL;
+    }
+    size_t flen = (size_t)st.st_size;
+    const uint8_t *fdata = mmap(NULL, flen, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (fdata == MAP_FAILED) {
+        pthread_mutex_lock(&g_lock);
+        g_err = "cannot map file"; g_active = 0; g_running = 0; g_loading = 0;
         pthread_mutex_unlock(&g_lock);
         return NULL;
     }
 
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    pthread_mutex_lock(&g_lock); g_loading = 0; pthread_mutex_unlock(&g_lock);
-    alog("[audio] indexed in %ld ms\n",
-         (long)((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000));
+    mp3_meta_t meta;
+    if (mp3_meta_parse(fdata, flen, &meta) != 0) {
+        munmap((void *)fdata, flen);
+        pthread_mutex_lock(&g_lock);
+        g_err = "not a supported MP3"; g_active = 0; g_running = 0; g_loading = 0;
+        pthread_mutex_unlock(&g_lock);
+        return NULL;
+    }
 
-    int rate = dec.info.hz ? dec.info.hz : 44100;
-    int ch   = dec.info.channels ? dec.info.channels : 2;
+    int rate = meta.rate ? meta.rate : 44100;
+    int ch   = meta.channels ? meta.channels : 2;
 
     pthread_mutex_lock(&g_lock);
-    g_dur_ms = (int)((dec.samples / (ch ? ch : 1)) * 1000ULL / (rate ? rate : 44100));
+    g_dur_ms = meta.duration_ms;
     pthread_mutex_unlock(&g_lock);
 
     wsola_init(rate, ch);
@@ -202,58 +258,65 @@ static void *worker(void *unused) {
     void *pcm = pcm_open((unsigned)rate, ch);
     if (!pcm) {
         wsola_free();
-        mp3dec_ex_close(&dec);
+        munmap((void *)fdata, flen);
         pthread_mutex_lock(&g_lock);
-        g_active = 0; g_running = 0;
+        g_active = 0; g_running = 0; g_loading = 0;
         pthread_mutex_unlock(&g_lock);
         return NULL;
     }
 
-    /* MP3D_SEEK_TO_BYTE resyncs to the next frame rather than tracking an
-     * absolute sample index, so cur_sample cannot be used as a clock. Keep our
-     * own base + decoded-sample count instead. */
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    pthread_mutex_lock(&g_lock); g_loading = 0; pthread_mutex_unlock(&g_lock);
+    alog("[audio] opened in %ld ms (dur %d ms, toc=%d)\n",
+         (long)((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000),
+         meta.duration_ms, meta.have_toc);
+
+    mp3dec_t mp3d;
+    mp3dec_init(&mp3d);
+
+    size_t pos = meta.audio_start;
     int base_ms = 0;
     uint64_t frames_since = 0;
     if (g_start_ms > 0) {
-        uint64_t target = (uint64_t)g_start_ms * rate / 1000 * ch;
-        mp3dec_ex_seek(&dec, target);
+        pos = mp3_resync(fdata, flen, mp3_meta_seek_offset(&meta, flen, g_start_ms));
         base_ms = g_start_ms;
+        mp3dec_init(&mp3d);
     }
 
-    static mp3d_sample_t buf[MINIMP3_MAX_SAMPLES_PER_FRAME * 8];
-    const size_t want = sizeof(buf) / sizeof(buf[0]);
+    static mp3d_sample_t buf[MINIMP3_MAX_SAMPLES_PER_FRAME];
+    static mp3d_sample_t obuf[MINIMP3_MAX_SAMPLES_PER_FRAME * 4];
+    const size_t ocap = sizeof(obuf) / sizeof(obuf[0]) / 2;
 
     for (;;) {
         pthread_mutex_lock(&g_lock);
         int run = g_running, paused = g_paused, seek = g_seek_req_ms;
+        float want_speed = g_speed;
         g_seek_req_ms = -1;
         pthread_mutex_unlock(&g_lock);
         if (!run) break;
+        if (want_speed != wsola_speed()) wsola_set_speed(want_speed);
 
         if (seek >= 0) {
-            uint64_t target = (uint64_t)seek * rate / 1000 * ch;
-            if (target > dec.samples) target = dec.samples;
-            mp3dec_ex_seek(&dec, target);
+            pos = mp3_resync(fdata, flen, mp3_meta_seek_offset(&meta, flen, seek));
+            mp3dec_init(&mp3d);
             wsola_reset();
             base_ms = seek;
             frames_since = 0;
         }
         if (paused) { usleep(60000); continue; }
 
-        pthread_mutex_lock(&g_lock);
-        float want_speed = g_speed;
-        pthread_mutex_unlock(&g_lock);
-        if (want_speed != wsola_speed()) wsola_set_speed(want_speed);
+        if (pos + 4 >= flen) break;                    /* end of file */
 
-        size_t got = mp3dec_ex_read(&dec, buf, want);
-        if (got == 0) break;                       /* end of file */
+        mp3dec_frame_info_t info;
+        int samples = mp3dec_decode_frame(&mp3d, fdata + pos, (int)(flen - pos),
+                                          buf, &info);
+        if (info.frame_bytes <= 0) break;              /* cannot resync */
+        pos += (size_t)info.frame_bytes;
+        if (samples <= 0) continue;                    /* skipped/ID3 padding */
 
-        size_t in_frames = got / (ch ? ch : 1);
+        size_t in_frames = (size_t)samples;            /* per channel */
         wsola_feed(buf, in_frames);
 
-        /* Drain everything the stretcher will give us for this input. */
-        static mp3d_sample_t obuf[MINIMP3_MAX_SAMPLES_PER_FRAME * 8];
-        const size_t ocap = sizeof(obuf) / sizeof(obuf[0]) / 2;
         for (;;) {
             size_t out_frames = wsola_read(obuf, ocap);
             if (out_frames == 0) break;
@@ -280,7 +343,7 @@ static void *worker(void *unused) {
     x_drop(pcm);
     x_close(pcm);
     wsola_free();
-    mp3dec_ex_close(&dec);
+    munmap((void *)fdata, flen);
 
     pthread_mutex_lock(&g_lock);
     g_active = 0; g_running = 0; g_paused = 0;

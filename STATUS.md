@@ -100,12 +100,18 @@ plain `shell` corrupts binary with LF translation.
 
 ## Audio notes
 
-Seeks use `MP3D_SEEK_TO_SAMPLE`. `MP3D_SEEK_TO_BYTE` starts instantly but its
-byte estimate overshoots on VBR: seeking 25 min into a 34 min episode returned
-success and then read EOF, so resume silently reported FINISHED. The audiobook
-mod avoided SEEK_TO_SAMPLE because indexing a 6.6 h book cost ~14.5 MB, but a
-podcast episode is an order of magnitude shorter — a 34 min file indexes in ~3 s
-and the UI shows `LOADING...` while it does. Very long episodes will feel slow.
+Playback does not use `mp3dec_ex_*` at all. Both of its seek modes were dead
+ends: `MP3D_SEEK_TO_BYTE` reports success then reads EOF on a far seek (25 min
+into a 34 min episode), and `MP3D_SEEK_TO_SAMPLE` is exact but indexes the whole
+file. Worse, `mp3dec_ex_open` computes duration by scanning every frame either
+way, so opening an episode took ~4.8 s.
+
+Instead the worker drives `mp3dec_decode_frame` over an mmap'd file and gets
+duration from `mp3meta.c`, which reads the Xing/Info header (exact frame count,
+plus a seek TOC when present) or falls back to the CBR bitrate. That needs only
+the first few hundred bytes: **opening dropped from 4788 ms to 291 ms**. Seeking
+is a byte offset from the TOC or a linear interpolation, then a resync to the
+next frame header.
 
 HiBy's `libmp3.so` is libmpg123 but unusable — its file readers are stubs and
 `mpg123_read` returns garbled PCM for 22050 Hz MPEG-2 files. minimp3_ex (CC0,

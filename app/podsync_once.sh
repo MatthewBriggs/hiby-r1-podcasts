@@ -14,7 +14,7 @@ FEEDS="$BASE/feeds.txt"
 CURL="$BASE/curl"
 CA="$BASE/cacert.pem"
 PARSER="$BASE/parse_rss.awk"
-DEST=/data/mnt/sd_0/Audiobooks
+DEST=/data/mnt/sd_0/Podcasts
 LOG=/tmp/.podsync_run.log
 TMP=/tmp/podsync
 
