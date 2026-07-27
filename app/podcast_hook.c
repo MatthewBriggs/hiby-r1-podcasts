@@ -86,6 +86,8 @@ static uint32_t orig_cb = 0;
 static char feeds[MAX_ITEMS][NAME_LEN];
 static int  feed_count;
 static char episodes[MAX_ITEMS][NAME_LEN];
+static char episode_paths[MAX_ITEMS][PATH_LEN];
+static int  episode_resume[MAX_ITEMS];   /* ms, or POS_FINISHED, or 0 */
 static int  episode_count;
 
 static int screen = SCREEN_FEEDS;
@@ -141,6 +143,7 @@ static int resume_lookup(const char *path) {
     return ms;
 }
 
+#define POS_FINISHED (-1)
 static void resume_store(const char *path, int ms) {
     mkdir(RESUME_DIR, 0755);
     char (*keep)[PATH_LEN + 32] = malloc(sizeof(*keep) * 128);
@@ -165,7 +168,7 @@ static void resume_store(const char *path, int ms) {
     }
     f = fopen(RESUME_FILE, "w");
     if (f) {
-        if (ms > 3000) fprintf(f, "%d\t%s\n", ms, path);
+        if (ms > 3000 || ms == POS_FINISHED) fprintf(f, "%d\t%s\n", ms, path);
         for (int i = 0; i < n; i++) fputs(keep[i], f);
         fclose(f);
     }
@@ -213,6 +216,8 @@ static int update_tail(char out[][NAME_LEN], int max_lines) {
     fclose(f);
     return n;
 }
+
+static int is_audio(const char *n);
 
 /* ---- drawing ------------------------------------------------------------ */
 static void fill_rect(uint16_t *fb, int x, int y, int w, int h, uint16_t c) {
@@ -262,6 +267,21 @@ static void draw_header(uint16_t *fb, const char *title, const char *right) {
     if (right) draw_text(fb, FB_W - 70, 24, right, COL_TEXT, 2, 0);
 }
 
+/* Progress marker for an episode row: solid = finished, partial bar = started.
+ * Reads the cache filled by load_episodes; doing the lookup here would mean a
+ * directory scan and a file read per row per frame. */
+static void draw_progress_marker(uint16_t *fb, int x, int y, int idx) {
+    if (idx < 0 || idx >= episode_count) return;
+    int ms = episode_resume[idx];
+    if (ms == 0) return;                       /* untouched */
+    if (ms < 0) {
+        fill_rect(fb, x, y, 14, 14, COL_ACCENT);          /* finished */
+    } else {
+        fill_rect(fb, x, y, 14, 14, COL_BAR_BG);          /* started */
+        fill_rect(fb, x, y + 7, 14, 7, COL_ACCENT);
+    }
+}
+
 static void draw_list(uint16_t *fb, char items[][NAME_LEN], int count, int sel) {
     int top = LIST_TOP + (screen == SCREEN_FEEDS ? UPDATE_BTN_H : 0);
     if (count == 0) {
@@ -275,7 +295,12 @@ static void draw_list(uint16_t *fb, char items[][NAME_LEN], int count, int sel) 
         int y = top + i * ROW_H;
         fill_rect(fb, 0, y, FB_W, ROW_H - 2, (idx & 1) ? COL_ROW_B : COL_ROW_A);
         if (idx == sel) fill_rect(fb, 0, y, 6, ROW_H - 2, COL_ACCENT);
-        draw_text(fb, 18, y + 18, items[idx], COL_TEXT, 2, FB_W - 16);
+        int right = FB_W - 16;
+        if (screen == SCREEN_EPISODES) {
+            draw_progress_marker(fb, FB_W - 28, y + 20, idx);
+            right = FB_W - 36;
+        }
+        draw_text(fb, 18, y + 18, items[idx], COL_TEXT, 2, right);
     }
     if (count > visible) {
         /* Scrollbar: proportional thumb down the right edge. */
@@ -407,6 +432,23 @@ static void load_feeds(void) {
     plog("[podcast] %d feeds\n", feed_count);
 }
 
+/* Sort display names and their paths as one unit. */
+static void sort_episodes(void) {
+    for (int i = 1; i < episode_count; i++) {
+        char tn[NAME_LEN], tp[PATH_LEN];
+        snprintf(tn, sizeof(tn), "%s", episodes[i]);
+        snprintf(tp, sizeof(tp), "%s", episode_paths[i]);
+        int j = i - 1;
+        while (j >= 0 && strcasecmp(episodes[j], tn) > 0) {
+            snprintf(episodes[j + 1], NAME_LEN, "%s", episodes[j]);
+            snprintf(episode_paths[j + 1], PATH_LEN, "%s", episode_paths[j]);
+            j--;
+        }
+        snprintf(episodes[j + 1], NAME_LEN, "%s", tn);
+        snprintf(episode_paths[j + 1], PATH_LEN, "%s", tp);
+    }
+}
+
 static void load_episodes(const char *feed) {
     episode_count = 0;
     char dir[PATH_LEN];
@@ -417,6 +459,7 @@ static void load_episodes(const char *feed) {
     while ((e = readdir(d)) && episode_count < MAX_ITEMS) {
         if (e->d_name[0] == '.') continue;
         if (!is_audio(e->d_name)) continue;
+        snprintf(episode_paths[episode_count], PATH_LEN, "%s/%s", dir, e->d_name);
         /* Show the title without its extension; the list is the only label. */
         snprintf(episodes[episode_count], NAME_LEN, "%s", e->d_name);
         char *dot = strrchr(episodes[episode_count], '.');
@@ -424,7 +467,9 @@ static void load_episodes(const char *feed) {
         episode_count++;
     }
     closedir(d);
-    sort_items(episodes, episode_count);
+    sort_episodes();
+    for (int i = 0; i < episode_count; i++)
+        episode_resume[i] = resume_lookup(episode_paths[i]);
     plog("[podcast] %d episodes in %s\n", episode_count, feed);
 }
 
@@ -458,11 +503,13 @@ static void scroll_by(int rows, int count) {
     if (scroll < 0) scroll = 0;
 }
 
+
 static void save_position(void) {
     if (cur_path[0] && audio_duration_ms() > 0) {
         int pos = audio_position_ms();
-        /* Treat the last few seconds as finished so it restarts next time. */
-        if (pos > audio_duration_ms() - 5000) pos = 0;
+        /* A sentinel rather than 0, so "finished" and "never started" stay
+         * distinguishable in the episode list. */
+        if (pos > audio_duration_ms() - 5000) pos = POS_FINISHED;
         resume_store(cur_path, pos);
     }
 }
@@ -475,6 +522,8 @@ static int handle_tap(int x, int y) {
         if (y < HEADER_H) {
             save_position();
             audio_stop();
+            if (ep_sel >= 0 && ep_sel < episode_count)
+                episode_resume[ep_sel] = resume_lookup(episode_paths[ep_sel]);
             screen = SCREEN_EPISODES;
             return 1;
         }
@@ -522,29 +571,9 @@ static int handle_tap(int x, int y) {
     } else {
         if (idx >= 0 && idx < episode_count) {
             ep_sel = idx;
-            /* episodes[] holds display names with the extension stripped, so
-             * find the real file rather than reconstructing the name. */
-            char dirp[PATH_LEN];
-            snprintf(dirp, sizeof(dirp), "%s/%s", PODCAST_DIR, cur_feed);
-            cur_path[0] = '\0';
-            DIR *dd = opendir(dirp);
-            if (dd) {
-                struct dirent *de;
-                while ((de = readdir(dd))) {
-                    if (de->d_name[0] == '.' || !is_audio(de->d_name)) continue;
-                    char stem[NAME_LEN];
-                    snprintf(stem, sizeof(stem), "%s", de->d_name);
-                    char *d2 = strrchr(stem, '.');
-                    if (d2) *d2 = '\0';
-                    if (strcmp(stem, episodes[idx]) == 0) {
-                        snprintf(cur_path, sizeof(cur_path), "%s/%s", dirp, de->d_name);
-                        break;
-                    }
-                }
-                closedir(dd);
-            }
-            if (!cur_path[0]) return 1;
+            snprintf(cur_path, sizeof(cur_path), "%s", episode_paths[idx]);
             int start = resume_lookup(cur_path);
+            if (start < 0) start = 0;   /* finished: play again from the top */
             plog("[podcast] play %s from %dms\n", cur_path, start);
             audio_play(cur_path, start);
             screen = SCREEN_PLAYING;
