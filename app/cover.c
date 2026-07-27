@@ -10,6 +10,16 @@
  * Decoding a 3000x3000 cover on a 56 MB device is not free, so libjpeg's
  * scale_denom does the downscale during decode (it can skip most of the IDCT
  * work), and the result is cached next to the cover as a raw RGB565 blob.
+ *
+ * Cover art is untrusted input — whatever the podcast host chose to publish —
+ * and a 3000x3000 *progressive* cover was enough to get hiby_player killed by
+ * the OOM killer. Scanline streaming below keeps baseline JPEGs cheap at any
+ * size, but progressive decoding cannot stream: jpeg_start_decompress builds
+ * the whole coefficient array before it will yield a single line, and
+ * scale_denom shrinks only the output, not that array. At 3000x3000x3 that is
+ * ~54 MB on a device with about 18 MB free. So the header is checked first and
+ * anything whose working set would not fit is declined; the feed loses its
+ * thumbnail instead of the player losing its life.
  */
 
 #include <dlfcn.h>
@@ -35,6 +45,11 @@ static JDIMENSION (*x_read_scanlines)(j_decompress_ptr, JSAMPARRAY, JDIMENSION);
 static boolean (*x_finish)(j_decompress_ptr);
 static void (*x_destroy)(j_decompress_ptr);
 static void (*x_calc_dims)(j_decompress_ptr);
+
+/* Roughly half the free memory on an idle device, so a decode cannot crowd out
+ * the player even at the worst moment. Anything larger loses its thumbnail. */
+#define COVER_MEM_BUDGET  (8 * 1024 * 1024)
+#define COVER_MAX_DIM     8000
 
 static int g_tried;
 
@@ -136,6 +151,22 @@ uint16_t *cover_load(const char *jpeg_path, int px) {
     x_create(&cinfo, JPEG_LIB_VERSION, sizeof(struct jpeg_decompress_struct));
     x_stdio_src(&cinfo, f);
     x_read_header(&cinfo, TRUE);
+
+    /* Refuse what will not fit before libjpeg tries to allocate it. A corrupt
+     * or absurd SOF is caught by the dimension cap; a progressive image is
+     * charged for its full coefficient array, which is the cost scale_denom
+     * cannot avoid. */
+    if (cinfo.image_width  > COVER_MAX_DIM ||
+        cinfo.image_height > COVER_MAX_DIM ||
+        cinfo.image_width == 0 || cinfo.image_height == 0)
+        longjmp(jerr.jump, 1);
+
+    if (cinfo.progressive_mode) {
+        int64_t coeffs = (int64_t)cinfo.image_width * cinfo.image_height *
+                         (cinfo.num_components > 0 ? cinfo.num_components : 3) *
+                         (int64_t)sizeof(JCOEF);
+        if (coeffs > COVER_MEM_BUDGET) longjmp(jerr.jump, 1);
+    }
 
     /* Ask for the smallest decode that still covers the target size; libjpeg
      * supports N/8 scaling and skips most of the work for small denominators. */

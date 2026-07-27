@@ -1052,6 +1052,64 @@ static void build_trampoline(uint32_t target, uint32_t *out) {
 #endif
 #define BCACHE_FLAG 3
 
+/* ---- tile label --------------------------------------------------------- */
+/* The tile is renamed by editing one string in the firmware's own settings.ini
+ * rather than by shipping a modified copy: that file is HiBy's, and deriving the
+ * replacement at runtime also means a firmware update can never leave a stale
+ * string table bind-mounted over the new one. */
+#define LABEL_INI   "/tmp/.podcast_settings.ini"
+#define TILE_LABEL  "Podcasts"
+
+/* settings.ini is UTF-16LE, so tags have to be matched widened. */
+static size_t widen(const char *s, uint8_t *out) {
+    size_t n = 0;
+    for (; *s; s++) { out[n++] = (uint8_t)*s; out[n++] = 0; }
+    return n;
+}
+
+static const uint8_t *memfind(const uint8_t *hay, size_t hn,
+                              const uint8_t *needle, size_t nn) {
+    if (nn > hn) return NULL;
+    for (size_t i = 0; i + nn <= hn; i++)
+        if (memcmp(hay + i, needle, nn) == 0) return hay + i;
+    return NULL;
+}
+
+static const char *make_label_ini(void) {
+    static const char SRC[] = "/usr/resource/str/english/settings.ini";
+    int fd = open(SRC, O_RDONLY);
+    if (fd < 0) return NULL;
+
+    static uint8_t buf[8192];
+    ssize_t len = read(fd, buf, sizeof(buf));
+    close(fd);
+    /* A full buffer means the file was truncated, and writing a half a string
+     * table would cost every label on the screen, not just this one. */
+    if (len <= 0 || (size_t)len == sizeof(buf)) return NULL;
+
+    uint8_t otag[32], ctag[32], label[64];
+    size_t on = widen("<about>", otag);
+    size_t cn = widen("</about>", ctag);
+    size_t ln = widen(TILE_LABEL, label);
+
+    const uint8_t *a = memfind(buf, (size_t)len, otag, on);
+    if (!a) return NULL;
+    const uint8_t *b = memfind(a, (size_t)len - (size_t)(a - buf), ctag, cn);
+    if (!b) return NULL;
+
+    size_t head = (size_t)(a - buf) + on;          /* up to and including <about> */
+    size_t tail = (size_t)len - (size_t)(b - buf); /* from </about> to EOF        */
+
+    fd = open(LABEL_INI, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return NULL;
+    int ok = write(fd, buf, head)  == (ssize_t)head &&
+             write(fd, label, ln)  == (ssize_t)ln   &&
+             write(fd, b, tail)    == (ssize_t)tail;
+    close(fd);
+    if (!ok) { unlink(LABEL_INI); return NULL; }
+    return LABEL_INI;
+}
+
 /* Shadow the stock tile icon and label. The rootfs is read-only squashfs, so a
  * bind mount is the only way short of reflashing. Doing it here rather than from
  * a boot script matters: this constructor runs before main(), and the player
@@ -1063,16 +1121,22 @@ static void shadow_resources(void) {
         { RES_DIR "/about_s.png", "/usr/resource/litegui/theme1/launcher/about_s.png" },
         { RES_DIR "/about.png",   "/usr/resource/litegui/theme2/launcher/about.png" },
         { RES_DIR "/about_s.png", "/usr/resource/litegui/theme2/launcher/about_s.png" },
-        /* Launcher tile labels live in settings.ini (music / net_set / sys_set /
-         * about), not launcher.ini — that one drives a different menu, which is
-         * why editing its <abo_dev> had no effect. */
-        { RES_DIR "/settings.ini", "/usr/resource/str/english/settings.ini" },
     };
     for (unsigned i = 0; i < sizeof(pairs) / sizeof(pairs[0]); i++) {
         if (access(pairs[i][0], R_OK) != 0) continue;
         if (mount(pairs[i][0], pairs[i][1], NULL, MS_BIND, NULL) != 0)
             plog("[podcast] bind %s failed: %s\n", pairs[i][1], strerror(errno));
     }
+
+    /* Launcher tile labels live in settings.ini (music / net_set / sys_set /
+     * about), not launcher.ini — that one drives a different menu, which is why
+     * editing its <abo_dev> had no effect. */
+    const char *ini = make_label_ini();
+    if (!ini)
+        plog("[podcast] label rewrite failed; tile keeps its stock name\n");
+    else if (mount(ini, "/usr/resource/str/english/settings.ini",
+                   NULL, MS_BIND, NULL) != 0)
+        plog("[podcast] bind settings.ini failed: %s\n", strerror(errno));
 }
 
 __attribute__((constructor))

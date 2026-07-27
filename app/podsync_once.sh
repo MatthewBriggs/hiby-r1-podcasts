@@ -48,8 +48,12 @@ if [ ! -s /etc/resolv.conf ]; then
 fi
 
 # Sanitise for FAT32 while staying readable: the app shows filenames verbatim.
+# NBSP=$(printf '\302\240') — feeds sprinkle U+00A0 through titles and it ends
+# up in filenames, where it looks like a space but breaks matching and quoting.
+NBSP=$(printf '\302\240')
+
 sanitize() {
-    echo "$1" | sed -e 's/:/ -/g' -e 's/["<>|?*\/\\]//g' -e 's/[[:cntrl:]]//g' \
+    echo "$1" | sed -e "s/$NBSP/ /g" -e 's/:/ -/g' -e 's/["<>|?*\/\\]//g' -e 's/[[:cntrl:]]//g' \
                     -e 's/  */ /g' -e 's/^[ .-]*//' -e 's/[ .]*$//' | cut -c1-70
 }
 

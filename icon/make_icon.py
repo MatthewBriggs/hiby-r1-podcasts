@@ -2,9 +2,15 @@
 """Draw the Podcasts launcher icon in the stock theme's style.
 
 Measured from the shipped theme2 icons rather than guessed: 140x140, an opaque
-black field, a grey disc (87,87,91) of radius 60 centred in the tile, and a
-single flat-coloured glyph. Each app gets its own glyph colour — books pink,
-music orange, streaming green — so podcasts take violet.
+black field, a grey (87,87,91) rounded square of half-extent 60 and corner
+radius 50 centred in the tile, and a single flat-coloured glyph. Each app gets
+its own glyph colour — books pink, music orange, streaming green — so podcasts
+take violet.
+
+The corner radius matters: at r=50 the tile reads as almost round but keeps
+short flat sides, and a plain circle sits visibly narrower than its neighbours.
+The figure was fitted against the stock corner profile sampled at 50% coverage,
+and agrees with it to under a pixel at every row.
 
 Rendered with 4x supersampling and written via zlib; no image library.
 """
@@ -14,19 +20,34 @@ import zlib
 
 W = H = 140
 SS = 4
-DISC_R = 60
+HALF = 60                    # half-extent of the tile field
+CORNER_R = 50
+INSET = HALF - CORNER_R      # corner-arc centre offset from the middle
 DISC = (87, 87, 91)
 GLYPH = (167, 139, 250)      # violet, unused by the other tiles
 BG = (0, 0, 0)
 
 
 def in_disc(x, y):
-    dx, dy = x - W / 2.0, y - H / 2.0
-    return dx * dx + dy * dy <= DISC_R * DISC_R
+    """Rounded square: a rectangle with quarter-circle corners."""
+    dx, dy = abs(x - W / 2.0), abs(y - H / 2.0)
+    if dx > HALF or dy > HALF:
+        return False
+    if dx <= INSET or dy <= INSET:
+        return True
+    return (dx - INSET) ** 2 + (dy - INSET) ** 2 <= CORNER_R * CORNER_R
+
+
+# The stock glyphs cover 17-21% of the tile field. The microphone was drawn to
+# fit the old circular field and came out at 15%, reading thin beside its
+# neighbours, so it is scaled about the centre to sit in the same band.
+GLYPH_SCALE = 1.12
 
 
 def in_mic(x, y):
     """Capsule head, cradle arc, stem and base."""
+    x = (x - W / 2.0) / GLYPH_SCALE + W / 2.0
+    y = (y - H / 2.0) / GLYPH_SCALE + H / 2.0
     cx = W / 2.0
 
     hw, top, bot = 13.0, 42.0, 74.0          # head capsule
