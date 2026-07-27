@@ -5,15 +5,17 @@ A Podcasts app that takes over the **About** launcher tile on the R1 — retitle
 
 ## What works
 
-Tap **About** on the launcher and the app opens. Three screens, all drawn with a
-built-in 5x7 font:
+Tap **Podcasts** on the launcher and the app opens. Three screens, drawn with
+stb_truetype against a font already on the device (`msyh.ttf`), so accented
+titles survive:
 
 - **Feeds** — an `UPDATE FEEDS` bar, then one row per folder under
-  `/data/mnt/sd_0/Audiobooks`.
+  `/data/mnt/sd_0/Podcasts`.
 - **Episodes** — audio files in the selected feed, newest first, each with a
   completion figure (a percentage while part-played, DONE when finished).
-- **Now Playing** — feed cover art, episode name, progress bar, elapsed/total,
-  `-30 / PAUSE / +30`, and a speed control cycling 1.0/1.25/1.5/1.75/2.0x.
+- **Now Playing** — feed cover art, feed name, episode title, progress bar,
+  elapsed/total, `-30 / -10 / play-pause / +10 / +30`, a speed control cycling
+  1.0/1.25/1.5/1.75/2.0x, and scrollable show notes beneath it.
 
 Lists scroll by swiping, with a proportional scrollbar.
 
@@ -33,11 +35,12 @@ file's mtime *is* its publication date. Sorting by download time would be
 backwards: the fetcher walks the feed newest-first, so the newest episode is
 written first and would sort last.
 
-Audio plays for real: MP3 decoded with minimp3_ex and written to ALSA on a worker
-thread. Pause holds the clock, ±30s seeks, and **resume positions persist** — backing
-out stores the offset to `.podsync/resume.txt` on the SD card and re-opening the
-episode continues from there. Verified end-to-end on firmware 2.0.25; screenshots in
-`tools/` (`v2_play.png`, `v2_paused2.png`, `final_resume.png`).
+Audio plays for real: MP3 decoded with minimp3's low-level frame decoder over an
+mmap'd file and written to ALSA on a worker thread. Pause holds the clock, ±10/±30s
+seeks, and **resume positions persist** — backing out stores the offset to
+`.podsync/resume.txt` on the SD card and re-opening the episode continues from
+there. Verified end-to-end on firmware 2.0.25; screenshots in
+`docs/screenshots/`.
 
 ## How it hooks in
 
