@@ -78,7 +78,7 @@ adb push curl cacert.pem /data/mnt/sd_0/.podsync/ && adb shell chmod 755 /data/m
 Then write your subscriptions and reboot:
 
 ```bash
-adb push app/feeds.example.txt /data/mnt/sd_0/.podsync/feeds.txt && adb shell sync && adb shell reboot
+adb push app/feeds.txt /data/mnt/sd_0/.podsync/feeds.txt && adb shell sync && adb shell reboot
 ```
 
 The tile comes back as **Podcasts**, with a microphone icon.
