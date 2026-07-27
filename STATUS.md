@@ -158,7 +158,6 @@ doing so makes it accumulate and ran 1.75x when 1.25x was asked for.
   that surfaces the player's first hidden redraws.
 - **MP3 only.** `.m4a/.m4b/.opus` are listed but will fail to decode.
 - Cover art shows only on Now Playing, not in the lists.
-- Font is uppercase-only 5x7; lowercase folds to caps.
 
 ## Tile icon and label
 
@@ -184,6 +183,21 @@ because Homebrew ships version 80 (jpeg-turbo) and 100 (IJG) and both disagree
 with the device's 90. `jpeg_CreateDecompress` validates the struct size, so a
 mismatch fails safely rather than corrupting memory. Decoding uses `scale_denom`
 to downscale during decode and caches the result next to the cover as raw RGB565.
+
+## Text
+
+Rendered with stb_truetype (vendored, public domain) from a font already on the
+device, so nothing has to be shipped or licensed. The obvious choice does not
+work: `/usr/resource/fonts/default.otf` is CFF/PostScript ("OTTO") and
+stb_truetype only parses `glyf` outlines. `msyh.ttf` is TrueType and covers
+Latin-1, so that is what `text.c` loads.
+
+Glyphs are rasterised on first use and cached per (size, codepoint). The cache
+covers Latin plus General Punctuation (0x2000-0x206F) — folded in just above the
+Latin block, since podcast titles are full of en-dashes and curly quotes and a
+flat array that far would be mostly empty. Codepoints the font lacks, notably
+U+00A0, are drawn as spaces: asking for them yields `.notdef`, a visible box
+mid-sentence.
 
 ## Recovery
 

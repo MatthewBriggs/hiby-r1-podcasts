@@ -36,7 +36,7 @@
 #include <sys/wait.h>
 #include <sys/mount.h>
 
-#include "font5x7.h"
+#include "text.h"
 #include "audio.h"
 #include "cover.h"
 
@@ -78,7 +78,7 @@
 #define PATH_LEN  384
 
 #define HEADER_H 64
-#define ROW_H    56
+#define ROW_H    46
 #define LIST_TOP HEADER_H
 #define ROWS_VISIBLE ((FB_H - LIST_TOP) / ROW_H)
 
@@ -391,25 +391,26 @@ static void fill_rect(uint16_t *fb, int x, int y, int w, int h, uint16_t c) {
     }
 }
 
-static void draw_char(uint16_t *fb, int x, int y, char ch, uint16_t c, int scale) {
-    const uint8_t *g = glyph_for(ch);
-    for (int row = 0; row < GLYPH_H; row++) {
-        uint8_t bits = g[row];
-        for (int col = 0; col < GLYPH_W; col++)
-            if (bits & (1 << (GLYPH_W - 1 - col)))
-                fill_rect(fb, x + col * scale, y + row * scale, scale, scale, c);
+/* The old bitmap font took a 1..3 "scale"; keep call sites unchanged by mapping
+ * those onto pixel heights that match the previous layout closely. */
+#define TEXT_PX_SMALL  17
+#define TEXT_PX_BODY   27
+#define TEXT_PX_TITLE  32
+
+static int scale_px(int scale) {
+    switch (scale) {
+        case 1:  return TEXT_PX_SMALL;
+        case 3:  return TEXT_PX_TITLE;
+        default: return TEXT_PX_BODY;
     }
 }
 
+/* Vertically centre body text in a list row. */
+#define ROW_TEXT_Y ((ROW_H - 2 - TEXT_PX_BODY) / 2)
+
 static void draw_text(uint16_t *fb, int x, int y, const char *s,
                       uint16_t c, int scale, int right_edge) {
-    int adv = (GLYPH_W + 1) * scale;
-    if (right_edge <= 0) right_edge = FB_W;
-    for (const char *p = s; *p; p++) {
-        if (x + GLYPH_W * scale > right_edge) break;
-        draw_char(fb, x, y, *p, c, scale);
-        x += adv;
-    }
+    text_draw(fb, FB_W, FB_H, x, y, s, c, scale_px(scale), right_edge);
 }
 
 static void fmt_time(char *out, size_t n, int ms) {
@@ -422,8 +423,8 @@ static void fmt_time(char *out, size_t n, int ms) {
 
 static void draw_header(uint16_t *fb, const char *title, const char *right) {
     fill_rect(fb, 0, 0, FB_W, HEADER_H, COL_HEADER);
-    draw_text(fb, 16, 22, title, COL_TEXT, 3, FB_W - 90);
-    if (right) draw_text(fb, FB_W - 70, 24, right, COL_TEXT, 2, 0);
+    draw_text(fb, 16, (HEADER_H - TEXT_PX_TITLE) / 2, title, COL_TEXT, 3, FB_W - 90);
+    if (right) draw_text(fb, FB_W - 78, (HEADER_H - TEXT_PX_BODY) / 2, right, COL_TEXT, 2, 0);
 }
 
 /* Progress marker for an episode row: solid = finished, partial bar = started.
@@ -465,10 +466,10 @@ static void draw_list(uint16_t *fb, char items[][NAME_LEN], int count, int sel) 
         if (idx == sel) fill_rect(fb, 0, y, 6, ROW_H - 2, COL_ACCENT);
         int right = FB_W - 16;
         if (screen == SCREEN_EPISODES) {
-            draw_progress_marker(fb, FB_W - 20, y + 20, idx);
+            draw_progress_marker(fb, FB_W - 20, y + ROW_TEXT_Y + 4, idx);
             right = FB_W - 70;
         }
-        draw_text(fb, 18, y + 18, items[idx], COL_TEXT, 2, right);
+        draw_text(fb, 18, y + ROW_TEXT_Y, items[idx], COL_TEXT, 2, right);
     }
     if (count > visible) {
         /* Scrollbar: proportional thumb down the right edge. */
@@ -534,7 +535,7 @@ static void draw_update(uint16_t *fb) {
     static char lines[14][NAME_LEN];
     int n = update_tail(lines, 14);
     for (int i = 0; i < n; i++)
-        draw_text(fb, 16, LIST_TOP + 14 + i * 26, lines[i], COL_TEXT, 2, FB_W - 16);
+        draw_text(fb, 16, LIST_TOP + 12 + i * 30, lines[i], COL_TEXT, 2, FB_W - 16);
     if (update_running)
         draw_text(fb, 16, FB_H - 40, "WORKING...", COL_ACCENT, 2, 0);
     else
@@ -560,7 +561,7 @@ static void draw_ui(uint16_t *fb) {
         draw_header(fb, "PODCASTS", "EXIT");
         /* Update bar sits directly under the header, above the list. */
         fill_rect(fb, 0, LIST_TOP, FB_W, UPDATE_BTN_H, COL_BTN);
-        draw_text(fb, 16, LIST_TOP + 16, "UPDATE FEEDS", COL_ACCENT, 2, FB_W - 16);
+        draw_text(fb, 16, LIST_TOP + (UPDATE_BTN_H - TEXT_PX_BODY) / 2, "UPDATE FEEDS", COL_ACCENT, 2, FB_W - 16);
         draw_list(fb, feeds, feed_count, feed_sel);
         if (feed_count == 0)
             draw_text(fb, 16, LIST_TOP + UPDATE_BTN_H + 60, &PODCAST_DIR[16], COL_DIM, 1, 0);
