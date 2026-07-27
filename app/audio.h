@@ -14,6 +14,9 @@ int  audio_is_paused(void);
 int  audio_position_ms(void);
 int  audio_duration_ms(void);
 const char *audio_error(void);      /* NULL when fine */
+int   audio_using_bt(void);         /* output is Bluetooth, so use its mixer */
+int   audio_volume(void);           /* software volume, wired only (0-100) */
+void  audio_set_volume(int pct);
 float audio_speed(void);
 void  audio_cycle_speed(void);
 

@@ -98,6 +98,29 @@ python3 tools/tap.py 360 640       # inject a tap (About tile)
 Both move data as base64 through `adb shell`: this adbd predates `exec-out`, and
 plain `shell` corrupts binary with LF translation.
 
+## Output routing and volume
+
+Bluetooth and wired need entirely different handling.
+
+**Bluetooth** goes through BlueALSA, not the DAC. A connected A2DP sink shows up
+in `bluealsa-cli list-pcms` as a path ending `/sink`; when one is present the
+player opens the predefined `bluealsa` PCM (which auto-selects the most recent
+sink and converts rate/format) instead of `plughw:0,0`, falling back to wired
+rather than going silent. BlueALSA exposes a real mixer element named after the
+device, so volume there is a normal `amixer -D bluealsa` set.
+
+**Wired volume has to be done in software.** The CS43131's volume registers are
+not wired up on this hardware: `amixer sset Left 40` reports success and reads
+back 0, and nothing audible changes — bidhata's mod notes the same thing
+(`USE_VOLUME_CHIP` "forces volume writes to unwired CS43131 registers"). The
+stock player scales samples itself, and so does this one, just before handing
+PCM to ALSA, with a squared curve so low settings stay usable. The level is kept
+in `.podsync/volume.txt`. Without this, wired playback is silent.
+
+Volume keys are on **`event2`** (the ADC keypad), not `event0`. Both key nodes are
+grabbed while the app is open, or the stock player consumes the presses and moves
+its own volume behind us.
+
 ## Audio notes
 
 Playback does not use `mp3dec_ex_*` at all. Both of its seek modes were dead

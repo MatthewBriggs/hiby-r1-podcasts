@@ -92,6 +92,12 @@ static char  g_path[512];
 static int   g_start_ms;
 static float g_speed = 1.0f;
 static int   g_loading;
+/* The CS43131's volume registers are not wired on this device — writes to the
+ * ALSA mixer report success but read back 0 and do nothing, which is why the
+ * stock player applies volume in software. Wired output therefore scales the
+ * samples here. Bluetooth is different: bluealsa exposes a real mixer. */
+static int   g_sw_vol = 70;      /* 0-100, wired only */
+static int   g_using_bt;
 
 #define SYM(p, name) do { \
     *(void **)(&p) = dlsym(g_alsa, name); \
@@ -149,6 +155,7 @@ static void *pcm_open(unsigned int rate, int channels) {
     const char *wired[] = { "plughw:0,0", "default", "hw:0,0" };
     const char *bt[]    = { "bluealsa" };
     int use_bt = bt_sink_connected();
+    g_using_bt = use_bt;
     const char **names = use_bt ? bt : wired;
     unsigned count = use_bt ? 1 : 3;
     alog("[audio] output: %s\n", use_bt ? "bluetooth" : "wired");
@@ -320,6 +327,19 @@ static void *worker(void *unused) {
         for (;;) {
             size_t out_frames = wsola_read(obuf, ocap);
             if (out_frames == 0) break;
+
+            if (!g_using_bt) {
+                pthread_mutex_lock(&g_lock);
+                int vol = g_sw_vol;
+                pthread_mutex_unlock(&g_lock);
+                if (vol < 100) {
+                    /* Rough perceptual curve: squaring keeps low settings usable. */
+                    int gain = vol * vol * 256 / 10000;   /* 0..256 */
+                    size_t n = out_frames * (size_t)ch;
+                    for (size_t i = 0; i < n; i++)
+                        obuf[i] = (mp3d_sample_t)((obuf[i] * gain) >> 8);
+                }
+            }
             snd_pcm_uframes_t frames = out_frames;
             const char *p = (const char *)obuf;
             while (frames > 0) {
@@ -411,6 +431,16 @@ int audio_is_paused(void)  { pthread_mutex_lock(&g_lock); int v = g_paused; pthr
 int audio_position_ms(void){ pthread_mutex_lock(&g_lock); int v = g_pos_ms; pthread_mutex_unlock(&g_lock); return v; }
 int audio_duration_ms(void){ pthread_mutex_lock(&g_lock); int v = g_dur_ms; pthread_mutex_unlock(&g_lock); return v; }
 const char *audio_error(void) { return g_err; }
+
+int  audio_using_bt(void) { pthread_mutex_lock(&g_lock); int v = g_using_bt; pthread_mutex_unlock(&g_lock); return v; }
+int  audio_volume(void)   { pthread_mutex_lock(&g_lock); int v = g_sw_vol;   pthread_mutex_unlock(&g_lock); return v; }
+void audio_set_volume(int pct) {
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    pthread_mutex_lock(&g_lock);
+    g_sw_vol = pct;
+    pthread_mutex_unlock(&g_lock);
+}
 
 float audio_speed(void) { pthread_mutex_lock(&g_lock); float v = g_speed; pthread_mutex_unlock(&g_lock); return v; }
 

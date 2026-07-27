@@ -168,8 +168,23 @@ static int read_volume_pct(void) {
     return pct;
 }
 
+#define VOL_FILE RESUME_DIR "/volume.txt"
+
 static void adjust_volume(int delta_pct) {
     char cmd[320];
+    if (!audio_using_bt()) {
+        /* Wired: the DAC's volume registers are not wired up, so the samples
+         * are scaled in software by the decoder instead. */
+        int v = audio_volume() + delta_pct;
+        if (v < 0) v = 0;
+        if (v > 100) v = 100;
+        audio_set_volume(v);
+        vol_pct = v;
+        vol_show_frames = 110;
+        FILE *f = fopen(VOL_FILE, "w");
+        if (f) { fprintf(f, "%d\n", v); fclose(f); }
+        return;
+    }
     if (bt_mixer_name[0]) {
         snprintf(cmd, sizeof(cmd), "amixer -D bluealsa sset '%s' %d%%%c >/dev/null 2>&1",
                  bt_mixer_name, delta_pct < 0 ? -delta_pct : delta_pct,
@@ -182,7 +197,7 @@ static void adjust_volume(int delta_pct) {
     }
     if (system(cmd) == -1) return;
     vol_pct = read_volume_pct();
-    vol_show_frames = 45;              /* ~1.5s at 30fps */
+    vol_show_frames = 110;             /* ~3.5s at 30fps */
 }
 
 static void set_locked(int on) {
@@ -811,13 +826,23 @@ static int podcast_entry(void *arg0, void *arg1) {
     if (tfd >= 0 && ioctl(tfd, EVIOCGRAB, 1) < 0)
         plog("[podcast] EVIOCGRAB failed: %s\n", strerror(errno));
 
-    /* Not grabbed: the player still needs its own key handling when we exit,
-     * and grabbing the power key risks leaving the device unresponsive. */
+    /* Grabbed for the duration: the player reads these nodes too and would
+     * otherwise consume the presses (and adjust its own volume behind us). The
+     * grab is released on exit, including the error paths below. */
     int kfds[2];
     kfds[0] = open("/dev/input/event0", O_RDONLY | O_NONBLOCK);
     kfds[1] = open("/dev/input/event2", O_RDONLY | O_NONBLOCK);
+    for (int i = 0; i < 2; i++) {
+        if (kfds[i] < 0) { plog("[podcast] key fd %d open failed\n", i); continue; }
+        if (ioctl(kfds[i], EVIOCGRAB, 1) < 0)
+            plog("[podcast] key grab %d failed: %s\n", i, strerror(errno));
+    }
     find_bt_mixer();
-    vol_pct = read_volume_pct();
+    {   /* Restore the saved software level for wired playback. */
+        FILE *f = fopen(VOL_FILE, "r");
+        if (f) { int v; if (fscanf(f, "%d", &v) == 1) audio_set_volume(v); fclose(f); }
+    }
+    vol_pct = audio_using_bt() ? read_volume_pct() : audio_volume();
 
     int page = 0, frames = 0, ticks = 0;
     for (;;) {
@@ -828,6 +853,7 @@ static int podcast_entry(void *arg0, void *arg1) {
                 set_locked(0);
                 continue;
             }
+            plog("[podcast] key %d\n", kc);
             if (kc == KEY_VOLUMEUP)        adjust_volume(+4);
             else if (kc == KEY_VOLUMEDOWN) adjust_volume(-4);
             else if (kc == KEY_POWER)      set_locked(1);
@@ -875,7 +901,8 @@ static int podcast_entry(void *arg0, void *arg1) {
     ioctl(fbfd, FBIOPAN_DISPLAY, &v);
     munmap(base, map_len);
     set_locked(0);                       /* never leave the panel dark */
-    for (int i = 0; i < 2; i++) if (kfds[i] >= 0) close(kfds[i]);
+    for (int i = 0; i < 2; i++)
+        if (kfds[i] >= 0) { ioctl(kfds[i], EVIOCGRAB, 0); close(kfds[i]); }
     if (tfd >= 0) { ioctl(tfd, EVIOCGRAB, 0); close(tfd); }
     close(fbfd);
     plog("[podcast] leaving app after %d frames\n", frames);
