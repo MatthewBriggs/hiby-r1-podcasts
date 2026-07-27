@@ -580,6 +580,12 @@ static int podcast_entry(void *arg0, void *arg1) {
         close(fbfd); return 0;
     }
 
+    /* Keep a copy of whatever the launcher had on screen. On exit we put it
+     * back, otherwise our last frame stays up until the player happens to
+     * repaint, which can be seconds. */
+    uint16_t *snapshot = malloc(page_px * 2);
+    if (snapshot) memcpy(snapshot, base + (size_t)v.yoffset * FB_W, page_px * 2);
+
     int tfd = open("/dev/input/event1", O_RDONLY | O_NONBLOCK);
     if (tfd >= 0 && ioctl(tfd, EVIOCGRAB, 1) < 0)
         plog("[podcast] EVIOCGRAB failed: %s\n", strerror(errno));
@@ -614,6 +620,11 @@ static int podcast_entry(void *arg0, void *arg1) {
     save_position();
     audio_stop();
 
+    if (snapshot) {
+        memcpy(base, snapshot, page_px * 2);
+        memcpy(base + page_px, snapshot, page_px * 2);
+        free(snapshot);
+    }
     v.yoffset = 0;
     ioctl(fbfd, FBIOPAN_DISPLAY, &v);
     munmap(base, map_len);
