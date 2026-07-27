@@ -1,10 +1,3 @@
 # Podcast subscriptions, one RSS URL per line.
 # Edit this file on the SD card at /data/mnt/sd_0/.podsync/feeds.txt,
 # then hit UPDATE FEEDS in the app.
-
-https://feeds.theincomparable.com/vulcanhello
-https://feeds.acast.com/public/shows/thebugle
-https://feeds.theincomparable.com/theincomparable
-https://www.ndr.de/nachrichten/info/podcast3012.xml
-https://www.fritz.de/programm/podcasts/talk-ohne-gast.xml/feed=podcast.xml
-https://api.sr.se/api/rss/pod/46690
