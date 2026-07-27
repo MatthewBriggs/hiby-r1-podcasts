@@ -5,11 +5,19 @@ in-process inside `hiby_player`. Working proof of concept as of 2026-07-27.
 
 ## What works
 
-Tap **About** on the launcher and a custom full-screen UI appears: purple header,
-`EXIT` affordance, and one row per folder under `/data/mnt/sd_0/Audiobooks`, drawn
-with a built-in 5x7 font. Tapping a row highlights it; tapping the header exits and
-hands the display back to the player. Verified on firmware 2.0.25 with screenshots
-in `tools/` (`app4.png`, `app_sel2.png`).
+Tap **About** on the launcher and the app opens. Three screens, all drawn with a
+built-in 5x7 font:
+
+- **Feeds** — one row per folder under `/data/mnt/sd_0/Audiobooks`.
+- **Episodes** — audio files in the selected feed, sorted.
+- **Now Playing** — feed and episode name, progress bar, elapsed/total, and
+  `-30 / PAUSE / +30` controls.
+
+Audio plays for real: MP3 decoded with minimp3_ex and written to ALSA on a worker
+thread. Pause holds the clock, ±30s seeks, and **resume positions persist** — backing
+out stores the offset to `.podsync/resume.txt` on the SD card and re-opening the
+episode continues from there. Verified end-to-end on firmware 2.0.25; screenshots in
+`tools/` (`v2_play.png`, `v2_paused2.png`, `final_resume.png`).
 
 ## How it hooks in
 
@@ -70,15 +78,28 @@ python3 tools/tap.py 360 640       # inject a tap (About tile)
 Both move data as base64 through `adb shell`: this adbd predates `exec-out`, and
 plain `shell` corrupts binary with LF translation.
 
+## Audio notes
+
+HiBy's `libmp3.so` is libmpg123 but unusable — its file readers are stubs and
+`mpg123_read` returns garbled PCM for 22050 Hz MPEG-2 files. minimp3_ex (CC0,
+vendored) is compiled in instead. Seeks use `MP3D_SEEK_TO_BYTE`: the sample-accurate
+mode indexes the whole file and OOMs a 56 MB device. Because that mode resyncs to a
+frame boundary rather than tracking an absolute sample index, `cur_sample` is not a
+usable clock — the player keeps its own `base_ms + decoded frames` counter. ALSA is
+`dlopen`'d and opened as `plughw:0,0` so it resamples to the hardware's rates; hw/sw
+params are set by hand because `snd_pcm_set_params` is unreliable here.
+
 ## Known gaps
 
-- **Nothing plays yet.** Rows are folders; selecting one only highlights it. No
-  episode list, no audio. Playback is the next real chunk of work — the audiobook
-  mod already does resume/speed/chapters for anything under `/Audiobooks`, so the
-  cheapest route may be to hand off to it rather than reimplement.
+- **No playback speed control.** The main thing podcasts want that this lacks.
+  Needs time-stretching (the audiobook mod uses WSOLA).
+- **No scrolling.** `scroll` exists but nothing moves it, so only the first ~13
+  rows of a list are reachable.
 - **Stale frame on exit.** After leaving, our last frame stays until the player
   next repaints. The audiobook mod solves this with a bounded "handoff watcher"
   that surfaces the player's first hidden redraws.
+- **MP3 only.** `.m4a/.m4b/.opus` are listed but will fail to decode.
+- No episode ordering by date, no played/unplayed state, no cover art.
 - **No feed fetching wired in.** `~/Git/hiby-podsync` downloads episodes and works,
   but its autostart was lost with the firmware change; point it at
   `/data/mnt/sd_0/Audiobooks/<feed>/` and start it from `/usr/data/init.sh`.

@@ -3,5 +3,5 @@
 set -e
 zig cc -target mipsel-linux-gnueabihf.2.22 \
   -shared -fPIC -Os -s -fvisibility=hidden -fno-common \
-  -o libpodcast_hook.so podcast_hook.c
+  -o libpodcast_hook.so podcast_hook.c audio.c -lpthread
 ls -la libpodcast_hook.so

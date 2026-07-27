@@ -1,20 +1,19 @@
 /* podcast_hook.c — a Podcasts app on the HiBy R1's About launcher tile.
  *
  * Preloaded into hiby_player by the supervisor (/usr/bin/hiby_player.sh), which
- * loads /usr/data/libpodcast_hook.so when present. Two hooks:
+ * loads /usr/data/libpodcast_hook.so when present.
  *
- *   Tile route — the launcher tile table lives in .data as 96-byte records, but
- *     a tile's name string and its callback belong to different records: for a
- *     name at S, the callback is at S + 0x48. The About tile's callback is at
- *     0x00892570. A callback may not point into this shared object — the
- *     launcher then fails to render — so it is aimed at an unused, zeroed cave
- *     in hiby_player's own .rodata, into which we write a MIPS trampoline.
+ *   Tile route — launcher tiles are 96-byte records in .data, but a tile's name
+ *     string and its callback belong to different records: for a name at S the
+ *     callback is at S + 0x48. The About tile's live callback is 0x00892570. A
+ *     callback may not point into this shared object (the launcher then fails to
+ *     render), so it is aimed at an unused zeroed cave in hiby_player's own
+ *     .rodata, into which we write a MIPS trampoline at load time.
  *
- *   Drawing — hiby_player pans the framebuffer via ioctl(FBIOPAN_DISPLAY). We
- *     interpose ioctl and paint the target buffer just before the pan, so the
- *     player's display loop and the touch controller keep running. This is the
- *     approach the audiobook mod arrived at; suppressing the pan instead kills
- *     the touch hardware.
+ *   Frames — the tile callback runs on the player's UI thread, so blocking there
+ *     stops the player's render loop and nothing is ever panned. While the app is
+ *     open it therefore owns the loop: mmap /dev/fb0, draw, FBIOPAN_DISPLAY, flip.
+ *     The touch node is grabbed so taps do not also reach the launcher beneath.
  *
  * Build: see build.sh
  */
@@ -29,27 +28,27 @@
 #include <dirent.h>
 #include <errno.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/ioctl.h>
 #include <linux/fb.h>
 #include <linux/input.h>
 
 #include "font5x7.h"
+#include "audio.h"
 
 /* ---- hiby_player addresses (firmware 2.0.25) ---------------------------- */
-#define ABOUT_CB_1      0x00892150u   /* second About record, not the live one */
-#define ABOUT_CB_2      0x00892570u   /* the live About tile callback          */
+#define ABOUT_CB_1      0x00892150u
+#define ABOUT_CB_2      0x00892570u   /* the live About tile callback */
 #define ABOUT_CB_ORIG   0x0053BC20u
 #define DATA_PAGE       0x00892000u
 #define CAVE_ADDR       0x0075E400u
 #define CAVE_PAGE       0x0075E000u
 #define PAGE_SPAN       0x2000u
-#define FB_MMAP_PTR     0x008B4C14u   /* .bss slot holding the fb mmap base */
 
 /* ---- panel -------------------------------------------------------------- */
 #define FB_W 480
 #define FB_H 800
-#define FB_PIXELS (FB_W * FB_H)
 
 #define RGB(r, g, b) ((uint16_t)((((r) & 0xF8) << 8) | (((g) & 0xFC) << 3) | ((b) >> 3)))
 #define COL_BG      RGB(16, 16, 20)
@@ -59,22 +58,38 @@
 #define COL_ROW_A   RGB(32, 32, 40)
 #define COL_ROW_B   RGB(26, 26, 33)
 #define COL_ACCENT  RGB(90, 200, 140)
+#define COL_BAR_BG  RGB(50, 50, 60)
+#define COL_BTN     RGB(45, 45, 58)
 
 #define PODCAST_DIR "/data/mnt/sd_0/Audiobooks"
+#define RESUME_DIR  "/data/mnt/sd_0/.podsync"
+#define RESUME_FILE RESUME_DIR "/resume.txt"
 #define LOG_PATH    "/tmp/.podcast_hook.log"
 
-#define MAX_FEEDS 32
-#define NAME_MAX_LEN 48
+#define MAX_ITEMS 64
+#define NAME_LEN  64
+#define PATH_LEN  384
 
 #define HEADER_H 64
 #define ROW_H    56
 #define LIST_TOP HEADER_H
+#define ROWS_VISIBLE ((FB_H - LIST_TOP) / ROW_H)
+
+enum { SCREEN_FEEDS = 0, SCREEN_EPISODES, SCREEN_PLAYING };
 
 static uint32_t orig_cb = 0;
 
-static char feeds[MAX_FEEDS][NAME_MAX_LEN];
-static int feed_count = 0;
-static int selected = -1;
+static char feeds[MAX_ITEMS][NAME_LEN];
+static int  feed_count;
+static char episodes[MAX_ITEMS][NAME_LEN];
+static int  episode_count;
+
+static int screen = SCREEN_FEEDS;
+static int feed_sel = -1;
+static int ep_sel = -1;
+static int scroll = 0;
+static char cur_feed[NAME_LEN];
+static char cur_path[PATH_LEN];
 
 /* ---- logging ------------------------------------------------------------ */
 static void plog(const char *fmt, ...) {
@@ -100,12 +115,65 @@ static int is_hiby_player(void) {
     return strstr(b, "hiby_player") || strstr(b, "system_main_thr");
 }
 
+/* ---- resume positions ---------------------------------------------------- */
+/* One line per episode: "<ms>\t<path>". Kept on the SD card so it survives the
+ * internal data partition filling up, which this device is prone to. */
+static int resume_lookup(const char *path) {
+    FILE *f = fopen(RESUME_FILE, "r");
+    if (!f) return 0;
+    char line[PATH_LEN + 32];
+    int ms = 0;
+    while (fgets(line, sizeof(line), f)) {
+        char *tab = strchr(line, '\t');
+        if (!tab) continue;
+        *tab = '\0';
+        char *p = tab + 1;
+        char *nl = strchr(p, '\n');
+        if (nl) *nl = '\0';
+        if (strcmp(p, path) == 0) { ms = atoi(line); break; }
+    }
+    fclose(f);
+    return ms;
+}
+
+static void resume_store(const char *path, int ms) {
+    mkdir(RESUME_DIR, 0755);
+    char (*keep)[PATH_LEN + 32] = malloc(sizeof(*keep) * 128);
+    if (!keep) return;
+    int n = 0;
+    FILE *f = fopen(RESUME_FILE, "r");
+    if (f) {
+        char line[PATH_LEN + 32];
+        while (n < 127 && fgets(line, sizeof(line), f)) {
+            char probe[PATH_LEN + 32];
+            snprintf(probe, sizeof(probe), "%s", line);
+            char *tab = strchr(probe, '\t');
+            if (tab) {
+                char *p = tab + 1;
+                char *nl = strchr(p, '\n');
+                if (nl) *nl = '\0';
+                if (strcmp(p, path) == 0) continue;   /* replaced below */
+            }
+            snprintf(keep[n++], PATH_LEN + 32, "%s", line);
+        }
+        fclose(f);
+    }
+    f = fopen(RESUME_FILE, "w");
+    if (f) {
+        if (ms > 3000) fprintf(f, "%d\t%s\n", ms, path);
+        for (int i = 0; i < n; i++) fputs(keep[i], f);
+        fclose(f);
+    }
+    free(keep);
+}
+
 /* ---- drawing ------------------------------------------------------------ */
 static void fill_rect(uint16_t *fb, int x, int y, int w, int h, uint16_t c) {
     if (x < 0) { w += x; x = 0; }
     if (y < 0) { h += y; y = 0; }
     if (x + w > FB_W) w = FB_W - x;
     if (y + h > FB_H) h = FB_H - y;
+    if (w <= 0 || h <= 0) return;
     for (int r = 0; r < h; r++) {
         uint16_t *p = fb + (y + r) * FB_W + x;
         for (int i = 0; i < w; i++) p[i] = c;
@@ -116,10 +184,9 @@ static void draw_char(uint16_t *fb, int x, int y, char ch, uint16_t c, int scale
     const uint8_t *g = glyph_for(ch);
     for (int row = 0; row < GLYPH_H; row++) {
         uint8_t bits = g[row];
-        for (int col = 0; col < GLYPH_W; col++) {
+        for (int col = 0; col < GLYPH_W; col++)
             if (bits & (1 << (GLYPH_W - 1 - col)))
                 fill_rect(fb, x + col * scale, y + row * scale, scale, scale, c);
-        }
     }
 }
 
@@ -134,54 +201,146 @@ static void draw_text(uint16_t *fb, int x, int y, const char *s,
     }
 }
 
-static void draw_ui(uint16_t *fb) {
-    fill_rect(fb, 0, 0, FB_W, FB_H, COL_BG);
+static void fmt_time(char *out, size_t n, int ms) {
+    if (ms < 0) ms = 0;
+    int s = ms / 1000, h = s / 3600, m = (s % 3600) / 60;
+    s %= 60;
+    if (h > 0) snprintf(out, n, "%d:%02d:%02d", h, m, s);
+    else       snprintf(out, n, "%d:%02d", m, s);
+}
 
+static void draw_header(uint16_t *fb, const char *title, const char *right) {
     fill_rect(fb, 0, 0, FB_W, HEADER_H, COL_HEADER);
-    draw_text(fb, 16, 22, "PODCASTS", COL_TEXT, 3, 0);
-    /* Back affordance, top right. */
-    draw_text(fb, FB_W - 70, 24, "EXIT", COL_TEXT, 2, 0);
+    draw_text(fb, 16, 22, title, COL_TEXT, 3, FB_W - 90);
+    if (right) draw_text(fb, FB_W - 70, 24, right, COL_TEXT, 2, 0);
+}
 
-    if (feed_count == 0) {
-        draw_text(fb, 16, LIST_TOP + 30, "NO FEEDS FOUND", COL_DIM, 2, 0);
-        draw_text(fb, 16, LIST_TOP + 60, &PODCAST_DIR[16], COL_DIM, 1, 0);
+static void draw_list(uint16_t *fb, char items[][NAME_LEN], int count, int sel) {
+    if (count == 0) {
+        draw_text(fb, 16, LIST_TOP + 30, "NOTHING HERE", COL_DIM, 2, 0);
         return;
     }
-
-    for (int i = 0; i < feed_count; i++) {
+    for (int i = 0; i < ROWS_VISIBLE; i++) {
+        int idx = scroll + i;
+        if (idx >= count) break;
         int y = LIST_TOP + i * ROW_H;
-        if (y + ROW_H > FB_H) break;
-        fill_rect(fb, 0, y, FB_W, ROW_H - 2, (i & 1) ? COL_ROW_B : COL_ROW_A);
-        if (i == selected)
-            fill_rect(fb, 0, y, 6, ROW_H - 2, COL_ACCENT);
-        draw_text(fb, 18, y + 18, feeds[i], COL_TEXT, 2, FB_W - 16);
+        fill_rect(fb, 0, y, FB_W, ROW_H - 2, (idx & 1) ? COL_ROW_B : COL_ROW_A);
+        if (idx == sel) fill_rect(fb, 0, y, 6, ROW_H - 2, COL_ACCENT);
+        draw_text(fb, 18, y + 18, items[idx], COL_TEXT, 2, FB_W - 16);
     }
 }
 
-/* ---- feed list ---------------------------------------------------------- */
+static void draw_playing(uint16_t *fb) {
+    draw_header(fb, "PLAYING", "BACK");
+
+    char t[NAME_LEN];
+    snprintf(t, sizeof(t), "%s", ep_sel >= 0 ? episodes[ep_sel] : "");
+    draw_text(fb, 16, LIST_TOP + 20, cur_feed, COL_DIM, 1, FB_W - 16);
+    draw_text(fb, 16, LIST_TOP + 44, t, COL_TEXT, 2, FB_W - 16);
+
+    int pos = audio_position_ms(), dur = audio_duration_ms();
+    int bar_y = LIST_TOP + 110, bar_h = 12;
+    fill_rect(fb, 16, bar_y, FB_W - 32, bar_h, COL_BAR_BG);
+    if (dur > 0) {
+        int w = (int)((int64_t)(FB_W - 32) * pos / dur);
+        fill_rect(fb, 16, bar_y, w, bar_h, COL_ACCENT);
+    }
+    char a[16], b[16];
+    fmt_time(a, sizeof(a), pos);
+    fmt_time(b, sizeof(b), dur);
+    draw_text(fb, 16, bar_y + 24, a, COL_DIM, 2, 0);
+    draw_text(fb, FB_W - 100, bar_y + 24, b, COL_DIM, 2, 0);
+
+    /* Controls: -30s | play/pause | +30s */
+    int by = bar_y + 70, bh = 76, bw = (FB_W - 48) / 3;
+    for (int i = 0; i < 3; i++)
+        fill_rect(fb, 16 + i * (bw + 8), by, bw, bh, COL_BTN);
+    draw_text(fb, 16 + 24, by + 28, "-30", COL_TEXT, 3, 0);
+    draw_text(fb, 16 + (bw + 8) + 20, by + 28,
+              audio_is_paused() ? "PLAY" : "PAUS", COL_TEXT, 2, 0);
+    draw_text(fb, 16 + 2 * (bw + 8) + 24, by + 28, "+30", COL_TEXT, 3, 0);
+
+    const char *err = audio_error();
+    if (err) draw_text(fb, 16, by + bh + 24, err, RGB(230, 120, 120), 2, FB_W - 16);
+    else if (!audio_is_active())
+        draw_text(fb, 16, by + bh + 24, "FINISHED", COL_DIM, 2, 0);
+}
+
+static void draw_ui(uint16_t *fb) {
+    fill_rect(fb, 0, 0, FB_W, FB_H, COL_BG);
+    if (screen == SCREEN_FEEDS) {
+        draw_header(fb, "PODCASTS", "EXIT");
+        draw_list(fb, feeds, feed_count, feed_sel);
+        if (feed_count == 0)
+            draw_text(fb, 16, LIST_TOP + 60, &PODCAST_DIR[16], COL_DIM, 1, 0);
+    } else if (screen == SCREEN_EPISODES) {
+        draw_header(fb, cur_feed, "BACK");
+        draw_list(fb, episodes, episode_count, ep_sel);
+    } else {
+        draw_playing(fb);
+    }
+}
+
+/* ---- listing ------------------------------------------------------------ */
+static int is_audio(const char *n) {
+    const char *d = strrchr(n, '.');
+    if (!d) return 0;
+    return !strcasecmp(d, ".mp3") || !strcasecmp(d, ".m4a") ||
+           !strcasecmp(d, ".m4b") || !strcasecmp(d, ".aac") ||
+           !strcasecmp(d, ".ogg") || !strcasecmp(d, ".opus") ||
+           !strcasecmp(d, ".wav") || !strcasecmp(d, ".flac");
+}
+
+static void sort_items(char items[][NAME_LEN], int n) {
+    for (int i = 1; i < n; i++) {
+        char tmp[NAME_LEN];
+        snprintf(tmp, sizeof(tmp), "%s", items[i]);
+        int j = i - 1;
+        while (j >= 0 && strcasecmp(items[j], tmp) > 0) {
+            snprintf(items[j + 1], NAME_LEN, "%s", items[j]);
+            j--;
+        }
+        snprintf(items[j + 1], NAME_LEN, "%s", tmp);
+    }
+}
+
 static void load_feeds(void) {
     feed_count = 0;
     DIR *d = opendir(PODCAST_DIR);
-    if (!d) { plog("[podcast] opendir failed: %s\n", strerror(errno)); return; }
+    if (!d) { plog("[podcast] opendir: %s\n", strerror(errno)); return; }
     struct dirent *e;
-    while ((e = readdir(d)) && feed_count < MAX_FEEDS) {
+    while ((e = readdir(d)) && feed_count < MAX_ITEMS) {
         if (e->d_name[0] == '.') continue;
-        /* Directories only; skip the app's own dotfiles and stray media. */
-        char path[512];
+        char path[PATH_LEN];
         snprintf(path, sizeof(path), "%s/%s", PODCAST_DIR, e->d_name);
         DIR *sub = opendir(path);
         if (!sub) continue;
         closedir(sub);
-        strncpy(feeds[feed_count], e->d_name, NAME_MAX_LEN - 1);
-        feeds[feed_count][NAME_MAX_LEN - 1] = '\0';
-        feed_count++;
+        snprintf(feeds[feed_count++], NAME_LEN, "%s", e->d_name);
     }
     closedir(d);
+    sort_items(feeds, feed_count);
     plog("[podcast] %d feeds\n", feed_count);
 }
 
+static void load_episodes(const char *feed) {
+    episode_count = 0;
+    char dir[PATH_LEN];
+    snprintf(dir, sizeof(dir), "%s/%s", PODCAST_DIR, feed);
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d)) && episode_count < MAX_ITEMS) {
+        if (e->d_name[0] == '.') continue;
+        if (!is_audio(e->d_name)) continue;
+        snprintf(episodes[episode_count++], NAME_LEN, "%s", e->d_name);
+    }
+    closedir(d);
+    sort_items(episodes, episode_count);
+    plog("[podcast] %d episodes in %s\n", episode_count, feed);
+}
+
 /* ---- touch -------------------------------------------------------------- */
-/* Returns 1 on a completed tap, filling the tx and ty outputs. */
 static int read_tap(int fd, int *tx, int *ty) {
     struct input_event ev;
     static int cx = -1, cy = -1, down = 0;
@@ -199,17 +358,73 @@ static int read_tap(int fd, int *tx, int *ty) {
     return 0;
 }
 
+static void save_position(void) {
+    if (cur_path[0] && audio_duration_ms() > 0) {
+        int pos = audio_position_ms();
+        /* Treat the last few seconds as finished so it restarts next time. */
+        if (pos > audio_duration_ms() - 5000) pos = 0;
+        resume_store(cur_path, pos);
+    }
+}
+
+/* Returns 1 to keep running, 0 to leave the app. */
+static int handle_tap(int x, int y) {
+    if (screen == SCREEN_PLAYING) {
+        int bar_y = LIST_TOP + 110, by = bar_y + 70, bh = 76;
+        int bw = (FB_W - 48) / 3;
+        if (y < HEADER_H) {
+            save_position();
+            audio_stop();
+            screen = SCREEN_EPISODES;
+            return 1;
+        }
+        if (y >= by - 8 && y <= by + bh + 8) {
+            if (x < 16 + bw) audio_seek_relative(-30000);
+            else if (x < 16 + 2 * (bw + 8)) audio_toggle_pause();
+            else audio_seek_relative(30000);
+        }
+        return 1;
+    }
+
+    if (y < HEADER_H) {
+        if (screen == SCREEN_EPISODES) { screen = SCREEN_FEEDS; scroll = 0; return 1; }
+        return 0;                                  /* EXIT from the feed list */
+    }
+
+    int idx = scroll + (y - LIST_TOP) / ROW_H;
+    if (screen == SCREEN_FEEDS) {
+        if (idx >= 0 && idx < feed_count) {
+            feed_sel = idx;
+            snprintf(cur_feed, sizeof(cur_feed), "%s", feeds[idx]);
+            load_episodes(cur_feed);
+            screen = SCREEN_EPISODES;
+            ep_sel = -1;
+            scroll = 0;
+        }
+    } else {
+        if (idx >= 0 && idx < episode_count) {
+            ep_sel = idx;
+            snprintf(cur_path, sizeof(cur_path), "%s/%s/%s",
+                     PODCAST_DIR, cur_feed, episodes[idx]);
+            int start = resume_lookup(cur_path);
+            plog("[podcast] play %s from %dms\n", cur_path, start);
+            audio_play(cur_path, start);
+            screen = SCREEN_PLAYING;
+        }
+    }
+    return 1;
+}
+
 /* ---- tile entry --------------------------------------------------------- */
-/* The tile callback runs on the player's UI thread, so blocking here stops the
- * player's own render loop — no more pans, frozen screen. The audiobook mod
- * solves this by driving the pan itself while the app is open, and so do we:
- * map the framebuffer, then draw and pan every frame from this loop. */
 static int podcast_entry(void *arg0, void *arg1) {
     (void)arg0; (void)arg1;
     plog("[podcast] entering app\n");
 
+    screen = SCREEN_FEEDS;
+    feed_sel = ep_sel = -1;
+    scroll = 0;
+    cur_path[0] = '\0';
     load_feeds();
-    selected = -1;
 
     int fbfd = open("/dev/fb0", O_RDWR);
     if (fbfd < 0) { plog("[podcast] no fb: %s\n", strerror(errno)); return 0; }
@@ -218,11 +433,9 @@ static int podcast_entry(void *arg0, void *arg1) {
     if (ioctl(fbfd, FBIOGET_VSCREENINFO, &v) < 0) {
         plog("[podcast] vinfo failed\n"); close(fbfd); return 0;
     }
-    plog("[podcast] fb %ux%u virt %ux%u bpp=%u\n",
-         v.xres, v.yres, v.xres_virtual, v.yres_virtual, v.bits_per_pixel);
 
     size_t page_px = (size_t)FB_W * FB_H;
-    size_t map_len = page_px * 2 /*bytes per px*/ * 2 /*pages*/;
+    size_t map_len = page_px * 2 * 2;
     uint16_t *base = mmap(NULL, map_len, PROT_READ | PROT_WRITE, MAP_SHARED, fbfd, 0);
     if (base == MAP_FAILED) {
         plog("[podcast] mmap failed: %s\n", strerror(errno));
@@ -230,22 +443,20 @@ static int podcast_entry(void *arg0, void *arg1) {
     }
 
     int tfd = open("/dev/input/event1", O_RDONLY | O_NONBLOCK);
-    if (tfd < 0) {
-        plog("[podcast] no touch: %s\n", strerror(errno));
-    } else if (ioctl(tfd, EVIOCGRAB, 1) < 0) {
-        /* Without an exclusive grab the launcher also sees our taps and
-         * navigates behind us. */
+    if (tfd >= 0 && ioctl(tfd, EVIOCGRAB, 1) < 0)
         plog("[podcast] EVIOCGRAB failed: %s\n", strerror(errno));
-    }
 
-    int page = 0, frames = 0;
+    int page = 0, frames = 0, ticks = 0;
     for (;;) {
         int x, y;
         if (tfd >= 0 && read_tap(tfd, &x, &y)) {
-            plog("[podcast] tap %d,%d\n", x, y);
-            if (y < HEADER_H) break;
-            int idx = (y - LIST_TOP) / ROW_H;
-            if (idx >= 0 && idx < feed_count) selected = idx;
+            if (!handle_tap(x, y)) break;
+        }
+
+        /* Checkpoint the resume position periodically while playing. */
+        if (screen == SCREEN_PLAYING && ++ticks >= 150) {
+            ticks = 0;
+            save_position();
         }
 
         draw_ui(base + (size_t)page * page_px);
@@ -253,12 +464,13 @@ static int podcast_entry(void *arg0, void *arg1) {
         if (ioctl(fbfd, FBIOPAN_DISPLAY, &v) < 0 && frames < 3)
             plog("[podcast] pan failed: %s\n", strerror(errno));
         page ^= 1;
-        if (frames < 2) plog("[podcast] frame %d drawn\n", frames);
         frames++;
         usleep(33000);
     }
 
-    /* Hand the display back: leave the player looking at page 0. */
+    save_position();
+    audio_stop();
+
     v.yoffset = 0;
     ioctl(fbfd, FBIOPAN_DISPLAY, &v);
     munmap(base, map_len);
@@ -270,10 +482,10 @@ static int podcast_entry(void *arg0, void *arg1) {
 
 /* ---- install ------------------------------------------------------------ */
 static void build_trampoline(uint32_t target, uint32_t *out) {
-    out[0] = 0x3C190000u | ((target + 0x8000) >> 16);  /* lui   t9, hi */
+    out[0] = 0x3C190000u | ((target + 0x8000) >> 16);  /* lui   t9, hi     */
     out[1] = 0x27390000u | (target & 0xFFFF);          /* addiu t9, t9, lo */
-    out[2] = 0x03200008u;                              /* jr    t9 */
-    out[3] = 0x00000000u;                              /* nop */
+    out[2] = 0x03200008u;                              /* jr    t9         */
+    out[3] = 0x00000000u;                              /* nop              */
 }
 
 #ifndef __NR_cacheflush
@@ -287,10 +499,8 @@ static void podcast_init(void) {
     plog("[podcast] init pid=%d entry=%p\n", (int)getpid(), &podcast_entry);
 
     volatile uint32_t *cave = (volatile uint32_t *)CAVE_ADDR;
-    if (cave[0] != 0 || cave[1] != 0) {
-        plog("[podcast] cave occupied\n");
-        return;
-    }
+    if (cave[0] != 0 || cave[1] != 0) { plog("[podcast] cave occupied\n"); return; }
+
     if (mprotect((void *)CAVE_PAGE, PAGE_SPAN,
                  PROT_READ | PROT_WRITE | PROT_EXEC) < 0) {
         plog("[podcast] cave mprotect failed\n");
