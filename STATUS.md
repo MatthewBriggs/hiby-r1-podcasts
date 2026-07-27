@@ -172,8 +172,12 @@ The label is `<about>` in **`str/english/settings.ini`** — not `<abo_dev>` in
 `launcher.ini`, which drives a different menu. The giveaway was that the System
 tile reads "System" while `launcher.ini` says "System settings".
 
-`icon/make_icon.py` draws the 140x140 RGBA microphone with 4x supersampling and
-writes the PNG via zlib, so there is no image-library dependency.
+`icon/make_icon.py` draws the 140x140 RGBA icon with 4x supersampling and writes
+the PNG via zlib, so there is no image-library dependency. The style is measured
+from the shipped theme2 icons rather than invented: an opaque black field, a grey
+disc (87,87,91) of radius 60, and one flat-coloured glyph — books pink, music
+orange, streaming green, so podcasts take violet. A first attempt used a solid
+purple rounded square and stood out badly against the rest of the launcher.
 
 ## Cover art
 
