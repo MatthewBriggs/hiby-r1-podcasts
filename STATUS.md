@@ -10,7 +10,8 @@ built-in 5x7 font:
 
 - **Feeds** — an `UPDATE FEEDS` bar, then one row per folder under
   `/data/mnt/sd_0/Audiobooks`.
-- **Episodes** — audio files in the selected feed, sorted.
+- **Episodes** — audio files in the selected feed, newest first, each with a
+  played marker (solid = finished, half bar = started).
 - **Now Playing** — feed and episode name, progress bar, elapsed/total,
   `-30 / PAUSE / +30`, and a speed control cycling 1.0/1.25/1.5/1.75/2.0x.
 
@@ -25,6 +26,12 @@ schedule. The fetcher stays a shell script because it needs the static `curl`
 on the card — busybox `wget` only offers legacy TLS ciphers and every modern
 podcast host rejects the handshake. Episode files are named from the RSS
 `<title>`, and the list hides the extension.
+
+Ordering is by publication date. The parser converts the RSS `pubDate` to a form
+busybox `touch -d` accepts and the fetcher stamps it onto each file, so the
+file's mtime *is* its publication date. Sorting by download time would be
+backwards: the fetcher walks the feed newest-first, so the newest episode is
+written first and would sort last.
 
 Audio plays for real: MP3 decoded with minimp3_ex and written to ALSA on a worker
 thread. Pause holds the clock, ±30s seeks, and **resume positions persist** — backing
@@ -121,7 +128,9 @@ doing so makes it accumulate and ran 1.75x when 1.25x was asked for.
   next repaints. The audiobook mod solves this with a bounded "handoff watcher"
   that surfaces the player's first hidden redraws.
 - **MP3 only.** `.m4a/.m4b/.opus` are listed but will fail to decode.
-- No episode ordering by date, no played/unplayed state, no cover art.
+- **No cover art.** The fetcher already downloads `cover.jpg` per feed, but
+  nothing displays it; `libjpeg.so.9` is on the device and the audiobook mod
+  `dlopen`s it, though its struct-based API is ABI-fragile that way.
 - Font is uppercase-only 5x7; lowercase folds to caps.
 
 ## Recovery

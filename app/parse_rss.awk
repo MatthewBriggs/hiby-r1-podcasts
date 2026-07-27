@@ -4,7 +4,7 @@
 #
 #   channel <TAB> <feed title>
 #   image   <TAB> <artwork url>
-#   episode <TAB> <episode title> <TAB> <enclosure url>
+#   episode <TAB> <episode title> <TAB> <enclosure url> <TAB> <YYYY-MM-DD HH:MM:SS>
 #
 # Episodes come out in document order, i.e. newest first.
 
@@ -13,7 +13,7 @@ BEGIN {
     chan = ""; img = ""
     in_item = 0
     want_text = ""          # which field the next CDATA/text record belongs to
-    ep_title = ""; ep_url = ""
+    ep_title = ""; ep_url = ""; ep_date = ""
 }
 
 function unescape(s) {
@@ -43,9 +43,9 @@ function strip_cdata(s) {
 # Emit a finished episode. Requires a URL; the title is optional.
 function flush_item() {
     if (ep_url != "") {
-        print "episode\t" ep_title "\t" ep_url
+        print "episode\t" ep_title "\t" ep_url "\t" ep_date
     }
-    ep_title = ""; ep_url = ""
+    ep_title = ""; ep_url = ""; ep_date = ""
 }
 
 /^item>/ {
@@ -127,4 +127,27 @@ END {
     if (in_item) flush_item()
     print "channel\t" (chan == "" ? "Unknown Podcast" : chan)
     if (img != "") print "image\t" img
+}
+
+# RFC-822 ("Mon, 21 Jul 2026 05:00:00 GMT") to a form busybox `touch -d` accepts.
+# The leading day name is optional and the zone is ignored; only ordering matters.
+function to_iso(v,   parts, n, i, mon, day, year, tm, mi) {
+    n = split(v, parts, /[ \t]+/)
+    mi = 0
+    for (i = 1; i <= n; i++)
+        if (parts[i] ~ /^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)$/) { mi = i; break }
+    if (mi < 2 || mi + 2 > n) return ""
+    mon = int(index("JanFebMarAprMayJunJulAugSepOctNovDec", parts[mi]) / 3) + 1
+    day  = parts[mi - 1] + 0
+    year = parts[mi + 1] + 0
+    tm   = parts[mi + 2]
+    if (tm !~ /^[0-9][0-9]:[0-9][0-9]/) tm = "00:00:00"
+    if (length(tm) == 5) tm = tm ":00"
+    if (year < 1970 || day < 1 || day > 31) return ""
+    return sprintf("%04d-%02d-%02d %s", year, mon, day, tm)
+}
+
+/^pubDate>/ {
+    if (in_item && ep_date == "") ep_date = to_iso(trim(substr($0, 9)))
+    next
 }

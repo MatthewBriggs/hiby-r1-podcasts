@@ -87,6 +87,7 @@ static char feeds[MAX_ITEMS][NAME_LEN];
 static int  feed_count;
 static char episodes[MAX_ITEMS][NAME_LEN];
 static char episode_paths[MAX_ITEMS][PATH_LEN];
+static long episode_mtime[MAX_ITEMS];
 static int  episode_resume[MAX_ITEMS];   /* ms, or POS_FINISHED, or 0 */
 static int  episode_count;
 
@@ -432,20 +433,25 @@ static void load_feeds(void) {
     plog("[podcast] %d feeds\n", feed_count);
 }
 
-/* Sort display names and their paths as one unit. */
+/* Newest first, by file mtime. Sorting by name only looks right when episode
+ * titles happen to start with a number; mtime reflects download order, which is
+ * what a podcast listener expects. Names and paths move together. */
 static void sort_episodes(void) {
     for (int i = 1; i < episode_count; i++) {
         char tn[NAME_LEN], tp[PATH_LEN];
+        long tm = episode_mtime[i];
         snprintf(tn, sizeof(tn), "%s", episodes[i]);
         snprintf(tp, sizeof(tp), "%s", episode_paths[i]);
         int j = i - 1;
-        while (j >= 0 && strcasecmp(episodes[j], tn) > 0) {
+        while (j >= 0 && episode_mtime[j] < tm) {
             snprintf(episodes[j + 1], NAME_LEN, "%s", episodes[j]);
             snprintf(episode_paths[j + 1], PATH_LEN, "%s", episode_paths[j]);
+            episode_mtime[j + 1] = episode_mtime[j];
             j--;
         }
         snprintf(episodes[j + 1], NAME_LEN, "%s", tn);
         snprintf(episode_paths[j + 1], PATH_LEN, "%s", tp);
+        episode_mtime[j + 1] = tm;
     }
 }
 
@@ -460,6 +466,9 @@ static void load_episodes(const char *feed) {
         if (e->d_name[0] == '.') continue;
         if (!is_audio(e->d_name)) continue;
         snprintf(episode_paths[episode_count], PATH_LEN, "%s/%s", dir, e->d_name);
+        struct stat st;
+        episode_mtime[episode_count] =
+            (stat(episode_paths[episode_count], &st) == 0) ? (long)st.st_mtime : 0;
         /* Show the title without its extension; the list is the only label. */
         snprintf(episodes[episode_count], NAME_LEN, "%s", e->d_name);
         char *dot = strrchr(episodes[episode_count], '.');

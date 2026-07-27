@@ -69,7 +69,7 @@ grep -v '^[[:space:]]*#' "$FEEDS" 2>/dev/null | grep -v '^[[:space:]]*$' | while
 
     grep '^episode	' "$TMP/parsed.txt" | head -"$EPISODES_PER_FEED" > "$TMP/eps.txt"
 
-    while IFS='	' read -r _tag title epurl; do
+    while IFS='	' read -r _tag title epurl pubdate; do
         [ -z "$epurl" ] && continue
 
         ext=$(echo "$epurl" | sed -e 's/[?#].*//' -e 's/.*\.//')
@@ -87,6 +87,10 @@ grep -v '^[[:space:]]*#' "$FEEDS" 2>/dev/null | grep -v '^[[:space:]]*$' | while
         log "  downloading $base"
         if get "$epurl" "$out.part" && [ -s "$out.part" ]; then
             mv "$out.part" "$out"
+            # Stamp the publication date onto the file so the app can sort by it.
+            # Download order is the reverse of publication order, so mtime would
+            # otherwise put the newest episode last.
+            [ -n "$pubdate" ] && touch -d "$pubdate" "$out" 2>/dev/null
             total_new=$((total_new + 1))
             log "  ok $base"
         else
