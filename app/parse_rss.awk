@@ -5,15 +5,22 @@
 #   channel <TAB> <feed title>
 #   image   <TAB> <artwork url>
 #   episode <TAB> <episode title> <TAB> <enclosure url> <TAB> <YYYY-MM-DD HH:MM:SS>
+#   notes   <TAB> <episode description, tags stripped, one line>
+#
+# A notes line follows the episode line it belongs to.
 #
 # Episodes come out in document order, i.e. newest first.
 
+# Pass -v max=N to stop after N episodes. Feeds routinely carry 500-800 items
+# and the caller only wants the newest few; parsing the rest costs minutes of
+# string work on this device.
 BEGIN {
     RS = "<"
+    emitted = 0
     chan = ""; img = ""
     in_item = 0
     want_text = ""          # which field the next CDATA/text record belongs to
-    ep_title = ""; ep_url = ""; ep_date = ""
+    ep_title = ""; ep_url = ""; ep_date = ""; ep_desc = ""
 }
 
 # Decodes once; see unescape_full for feeds that escape twice.
@@ -51,8 +58,16 @@ function strip_cdata(s) {
 function flush_item() {
     if (ep_url != "") {
         print "episode\t" ep_title "\t" ep_url "\t" ep_date
+        if (ep_desc != "") print "notes\t" ep_desc
+        emitted++
     }
-    ep_title = ""; ep_url = ""; ep_date = ""
+    ep_title = ""; ep_url = ""; ep_date = ""; ep_desc = ""
+    if (max > 0 && emitted >= max) {
+        # Channel details always precede the items, so they are known by now.
+        print "channel\t" (chan == "" ? "Unknown Podcast" : chan)
+        if (img != "") print "image\t" img
+        exit
+    }
 }
 
 /^item>/ {
@@ -87,6 +102,7 @@ function flush_item() {
     if (v != "") {
         if (want_text == "ep" && ep_title == "") ep_title = unescape_full(v)
         else if (want_text == "chan" && chan == "") chan = unescape_full(v)
+        else if (want_text == "desc" && ep_desc == "") ep_desc = clean_html(v)
     }
     want_text = ""
     next
@@ -131,7 +147,9 @@ function flush_item() {
 }
 
 END {
+    if (max > 0 && emitted >= max) exit      # already printed on the way out
     if (in_item) flush_item()
+    if (max > 0 && emitted >= max) exit
     print "channel\t" (chan == "" ? "Unknown Podcast" : chan)
     if (img != "") print "image\t" img
 }
@@ -156,5 +174,52 @@ function to_iso(v,   parts, n, i, mon, day, year, tm, mi) {
 
 /^pubDate>/ {
     if (in_item && ep_date == "") ep_date = to_iso(trim(substr($0, 9)))
+    next
+}
+
+# Show notes. Feeds put them in <description> or <itunes:summary>, usually as
+# escaped or CDATA-wrapped HTML, so strip tags and collapse whitespace.
+function clean_html(v) {
+    gsub(/\]\]>/, " ", v)          # CDATA terminator, left by the collector
+    gsub(/<!\[CDATA\[/, " ", v)
+    gsub(/<[^>]*>/, " ", v)
+    v = unescape_full(v)
+    gsub(/<[^>]*>/, " ", v)        # entities can reveal a second layer of tags
+    gsub(/[\r\n\t]+/, " ", v)
+    gsub(/  +/, " ", v)
+    return trim(v)
+}
+
+
+# Descriptions span several records: splitting on "<" cuts the CDATA marker away
+# from its content whenever the content itself starts with a tag, which is the
+# normal case (<![CDATA[<p>...). So accumulate from the opening tag to the
+# closing one and clean the lot at the end.
+collecting != "" {
+    # index() against a precomputed string, not a dynamic regex: RS="<" turns a
+    # 2 MB feed into ~100k records and recompiling a regex for each one is
+    # pathologically slow on this device.
+    if (index($0, close_tag) == 1) {
+        if (in_item && ep_desc == "") ep_desc = clean_html(desc_buf)
+        collecting = ""; close_tag = ""; desc_buf = ""
+    } else if (length(desc_buf) < 8000) {
+        desc_buf = desc_buf "<" $0
+    }
+    next
+}
+
+/^description>/ {
+    if (in_item && ep_desc == "") {
+        collecting = "description"; close_tag = "/description>"
+        desc_buf = substr($0, 13)
+    }
+    next
+}
+
+/^itunes:summary>/ {
+    if (in_item && ep_desc == "") {
+        collecting = "itunes:summary"; close_tag = "/itunes:summary>"
+        desc_buf = substr($0, 16)
+    }
     next
 }

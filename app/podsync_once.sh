@@ -68,7 +68,7 @@ grep -v '^[[:space:]]*#' "$FEEDS" 2>/dev/null | grep -v '^[[:space:]]*$' | while
         continue
     fi
 
-    awk -f "$PARSER" "$rss" > "$TMP/parsed.txt" 2>>"$LOG"
+    awk -v max="$EPISODES_PER_FEED" -f "$PARSER" "$rss" > "$TMP/parsed.txt" 2>>"$LOG"
 
     raw=$(grep '^channel	' "$TMP/parsed.txt" | head -1 | cut -f2-)
     name=$(sanitize "$raw")
@@ -83,9 +83,20 @@ grep -v '^[[:space:]]*#' "$FEEDS" 2>/dev/null | grep -v '^[[:space:]]*$' | while
         get "$img" "$dir/cover.jpg" || rm -f "$dir/cover.jpg"
     fi
 
-    grep '^episode	' "$TMP/parsed.txt" | head -"$EPISODES_PER_FEED" > "$TMP/eps.txt"
+    # Pair each episode with the notes line that follows it, so the download
+    # loop can write show notes alongside the audio.
+    awk -F'\t' -v n="$EPISODES_PER_FEED" '
+        /^episode\t/ {
+            if (have) { print title "\t" url "\t" date "\t" notes; have=0 }
+            if (count >= n) { done=1; exit }
+            title=$2; url=$3; date=$4; notes=""; have=1; count++
+            next
+        }
+        /^notes\t/ { if (have) notes=$2; next }
+        END { if (have) print title "\t" url "\t" date "\t" notes }
+    ' "$TMP/parsed.txt" > "$TMP/eps.txt"
 
-    while IFS='	' read -r _tag title epurl pubdate; do
+    while IFS='	' read -r title epurl pubdate notes; do
         [ -z "$epurl" ] && continue
 
         ext=$(echo "$epurl" | sed -e 's/[?#].*//' -e 's/.*\.//')
@@ -97,6 +108,12 @@ grep -v '^[[:space:]]*#' "$FEEDS" 2>/dev/null | grep -v '^[[:space:]]*$' | while
         base=$(sanitize "$title")
         [ -z "$base" ] && base=$(echo "$epurl" | sed -e 's/[?#].*//' -e 's/.*\///')
         out="$dir/$base.$ext"
+
+        # Write show notes even when the audio is already present, so episodes
+        # downloaded before this existed still get them.
+        if [ -n "$notes" ] && [ ! -f "$dir/$base.txt" ]; then
+            printf '%s\n' "$notes" > "$dir/$base.txt"
+        fi
 
         [ -f "$out" ] && continue
 

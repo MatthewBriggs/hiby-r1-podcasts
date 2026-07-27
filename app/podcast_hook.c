@@ -72,13 +72,20 @@
 #define SYNC_SCRIPT RESUME_DIR "/podsync_once.sh"
 #define SYNC_LOG    "/tmp/.podsync_run.log"
 #define UPDATE_BTN_H 52
+#define BTN_MARGIN   12
+#define BTN_GAP       6
 
 #define MAX_ITEMS 64
 #define NAME_LEN  64
 #define PATH_LEN  384
 
+#define TEXT_PX_SMALL  22
+#define TEXT_PX_BODY   36
+#define TEXT_PX_TITLE  40
+#define TEXT_PX_MED    30
+
 #define HEADER_H 64
-#define ROW_H    46
+#define ROW_H    54
 #define LIST_TOP HEADER_H
 #define ROWS_VISIBLE ((FB_H - LIST_TOP) / ROW_H)
 
@@ -104,6 +111,66 @@ static char cur_path[PATH_LEN];
 static int  update_running = 0;
 
 static void plog(const char *fmt, ...);
+
+#define NOTES_MAX_LINES 200
+#define NOTES_LINE_H    36
+static char notes_lines[NOTES_MAX_LINES][160];
+static int  notes_count;
+static int  notes_scroll;
+
+/* Wrap the episode's notes sidecar to the screen width. Written by the fetcher
+ * next to the audio, so it survives the card being read elsewhere. */
+static void load_notes(const char *audio_path) {
+    notes_count = 0;
+    notes_scroll = 0;
+
+    char p[PATH_LEN];
+    snprintf(p, sizeof(p), "%s", audio_path);
+    char *dot = strrchr(p, '.');
+    if (!dot) return;
+    snprintf(dot, sizeof(p) - (size_t)(dot - p), ".txt");
+
+    FILE *f = fopen(p, "r");
+    if (!f) return;
+    static char buf[8192];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    if (!n) return;
+    buf[n] = '\0';
+
+    const int width = FB_W - 32;
+    const int px = TEXT_PX_MED;
+    char line[160];
+    int len = 0;
+    const char *w = buf;
+
+    while (*w && notes_count < NOTES_MAX_LINES) {
+        /* Take one whitespace-delimited word at a time. */
+        while (*w == ' ' || *w == '\n' || *w == '\r' || *w == '\t') w++;
+        if (!*w) break;
+        const char *end = w;
+        while (*end && *end != ' ' && *end != '\n' && *end != '\r' && *end != '\t') end++;
+        int wl = (int)(end - w);
+        if (wl > (int)sizeof(line) - 2) wl = (int)sizeof(line) - 2;
+
+        char cand[160];
+        if (len) snprintf(cand, sizeof(cand), "%.*s %.*s", len, line, wl, w);
+        else     snprintf(cand, sizeof(cand), "%.*s", wl, w);
+
+        if (text_width(cand, px) > width && len) {
+            snprintf(notes_lines[notes_count++], sizeof(notes_lines[0]), "%.*s", len, line);
+            snprintf(line, sizeof(line), "%.*s", wl, w);
+            len = (int)strlen(line);
+        } else {
+            snprintf(line, sizeof(line), "%s", cand);
+            len = (int)strlen(line);
+        }
+        w = end;
+    }
+    if (len && notes_count < NOTES_MAX_LINES)
+        snprintf(notes_lines[notes_count++], sizeof(notes_lines[0]), "%s", line);
+    plog("[podcast] notes: %d lines\n", notes_count);
+}
 
 /* ---- volume + screen lock ------------------------------------------------ */
 #define BACKLIGHT "/sys/class/backlight/backlight_pwm0/brightness"
@@ -393,14 +460,11 @@ static void fill_rect(uint16_t *fb, int x, int y, int w, int h, uint16_t c) {
 
 /* The old bitmap font took a 1..3 "scale"; keep call sites unchanged by mapping
  * those onto pixel heights that match the previous layout closely. */
-#define TEXT_PX_SMALL  17
-#define TEXT_PX_BODY   27
-#define TEXT_PX_TITLE  32
-
 static int scale_px(int scale) {
     switch (scale) {
         case 1:  return TEXT_PX_SMALL;
         case 3:  return TEXT_PX_TITLE;
+        case 4:  return TEXT_PX_MED;
         default: return TEXT_PX_BODY;
     }
 }
@@ -411,6 +475,30 @@ static int scale_px(int scale) {
 static void draw_text(uint16_t *fb, int x, int y, const char *s,
                       uint16_t c, int scale, int right_edge) {
     text_draw(fb, FB_W, FB_H, x, y, s, c, scale_px(scale), right_edge);
+}
+
+static void draw_play_icon(uint16_t *fb, int cx, int cy, int h, uint16_t col) {
+    int w = h;                       /* apex sits w to the right of the edge */
+    int x0 = cx - w / 2;
+    for (int dy = -h; dy <= h; dy++) {
+        int d = dy < 0 ? -dy : dy;
+        int len = w * (h - d) / h;
+        if (len > 0) fill_rect(fb, x0, cy + dy, len, 1, col);
+    }
+}
+
+static void draw_pause_icon(uint16_t *fb, int cx, int cy, int h, uint16_t col) {
+    int bw = h / 2, gap = h / 2;
+    fill_rect(fb, cx - gap / 2 - bw, cy - h, bw, h * 2, col);
+    fill_rect(fb, cx + gap / 2,      cy - h, bw, h * 2, col);
+}
+
+/* Horizontally centred on cx. The old bitmap font had a fixed advance so
+ * labels were positioned by hand; real metrics make this exact. */
+static void draw_text_centre(uint16_t *fb, int cx, int y, const char *s,
+                             uint16_t c, int scale) {
+    int px = scale_px(scale);
+    text_draw(fb, FB_W, FB_H, cx - text_width(s, px) / 2, y, s, c, px, FB_W);
 }
 
 static void fmt_time(char *out, size_t n, int ms) {
@@ -489,8 +577,8 @@ static void draw_playing(uint16_t *fb) {
     int art = cur_cover ? 84 : 0;
     if (art) blit_cover(fb, 16, LIST_TOP + 12, art);
     int tx = 16 + (art ? art + 12 : 0);
-    draw_text(fb, tx, LIST_TOP + 20, cur_feed, COL_DIM, 1, FB_W - 16);
-    draw_text(fb, tx, LIST_TOP + 44, t, COL_TEXT, 2, FB_W - 16);
+    draw_text(fb, tx, LIST_TOP + 12, cur_feed, COL_TEXT, 4, FB_W - 16);
+    draw_text(fb, tx, LIST_TOP + 50, t, COL_DIM, 2, FB_W - 16);
 
     int pos = audio_position_ms(), dur = audio_duration_ms();
     int bar_y = LIST_TOP + 110, bar_h = 12;
@@ -505,29 +593,57 @@ static void draw_playing(uint16_t *fb) {
     draw_text(fb, 16, bar_y + 24, a, COL_DIM, 2, 0);
     draw_text(fb, FB_W - 100, bar_y + 24, b, COL_DIM, 2, 0);
 
-    /* Controls: -30s | play/pause | +30s */
-    int by = bar_y + 70, bh = 76, bw = (FB_W - 48) / 3;
-    for (int i = 0; i < 3; i++)
-        fill_rect(fb, 16 + i * (bw + 8), by, bw, bh, COL_BTN);
-    draw_text(fb, 16 + 24, by + 28, "-30", COL_TEXT, 3, 0);
-    draw_text(fb, 16 + (bw + 8) + 20, by + 28,
-              audio_is_paused() ? "PLAY" : "PAUS", COL_TEXT, 2, 0);
-    draw_text(fb, 16 + 2 * (bw + 8) + 24, by + 28, "+30", COL_TEXT, 3, 0);
+    /* Controls: -30 | -10 | play/pause | +10 | +30. The 10s nudges are what
+     * you reach for after missing a sentence; 30s is for skipping an ad. */
+    int by = bar_y + 70, bh = 76;
+    int bw = (FB_W - 2 * BTN_MARGIN - 4 * BTN_GAP) / 5;
+    const char *labels[5] = { "-30", "-10", NULL, "+10", "+30" };
+    int label_y = by + (bh - TEXT_PX_BODY) / 2;
+    for (int i = 0; i < 5; i++) {
+        int bx = BTN_MARGIN + i * (bw + BTN_GAP);
+        fill_rect(fb, bx, by, bw, bh, COL_BTN);
+        if (labels[i]) {
+            draw_text_centre(fb, bx + bw / 2, label_y, labels[i], COL_TEXT, 2);
+        } else if (audio_is_paused()) {
+            draw_play_icon(fb, bx + bw / 2, by + bh / 2, 16, COL_ACCENT);
+        } else {
+            draw_pause_icon(fb, bx + bw / 2, by + bh / 2, 16, COL_ACCENT);
+        }
+    }
 
     /* Speed control, full width under the transport row. */
     int sy = by + bh + 12;
-    fill_rect(fb, 16, sy, FB_W - 32, 60, COL_BTN);
+    int sh = 66;
+    fill_rect(fb, 16, sy, FB_W - 32, sh, COL_BTN);
     char sp[24];
     float v = audio_speed();
-    snprintf(sp, sizeof(sp), "SPEED %d.%02dX", (int)v, (int)((v - (int)v) * 100 + 0.5f));
-    draw_text(fb, 40, sy + 22, sp, COL_TEXT, 2, FB_W - 40);
+    snprintf(sp, sizeof(sp), "SPEED %d.%02dx", (int)v, (int)((v - (int)v) * 100 + 0.5f));
+    draw_text_centre(fb, FB_W / 2, sy + (sh - TEXT_PX_BODY) / 2, sp, COL_TEXT, 2);
 
     const char *err = audio_error();
-    if (err) draw_text(fb, 16, sy + 76, err, RGB(230, 120, 120), 2, FB_W - 16);
-    else if (audio_is_loading())
-        draw_text(fb, 16, sy + 76, "LOADING...", COL_ACCENT, 2, 0);
-    else if (!audio_is_active())
-        draw_text(fb, 16, sy + 76, "FINISHED", COL_DIM, 2, 0);
+    int notes_top = sy + sh + 10;
+    if (err) {
+        draw_text(fb, 16, notes_top, err, RGB(230, 120, 120), 2, FB_W - 16);
+    } else if (audio_is_loading()) {
+        draw_text(fb, 16, notes_top, "LOADING...", COL_ACCENT, 2, 0);
+    } else if (notes_count > 0) {
+        int rows = (FB_H - notes_top) / NOTES_LINE_H;
+        for (int i = 0; i < rows; i++) {
+            int idx = notes_scroll + i;
+            if (idx >= notes_count) break;
+            draw_text(fb, 16, notes_top + i * NOTES_LINE_H, notes_lines[idx],
+                      COL_TEXT, 4, FB_W - 16);
+        }
+        if (notes_count > rows) {
+            int track = FB_H - notes_top;
+            int th = track * rows / notes_count;
+            int ty = notes_top + track * notes_scroll / notes_count;
+            fill_rect(fb, FB_W - 5, notes_top, 4, track, COL_ROW_B);
+            fill_rect(fb, FB_W - 5, ty, 4, th < 20 ? 20 : th, COL_ROW_A);
+        }
+    } else if (!audio_is_active()) {
+        draw_text(fb, 16, notes_top, "FINISHED", COL_DIM, 2, 0);
+    }
 }
 
 static void draw_update(uint16_t *fb) {
@@ -724,7 +840,6 @@ static void save_position(void) {
 static int handle_tap(int x, int y) {
     if (screen == SCREEN_PLAYING) {
         int bar_y = LIST_TOP + 110, by = bar_y + 70, bh = 76;
-        int bw = (FB_W - 48) / 3;
         if (y < HEADER_H) {
             save_position();
             audio_stop();
@@ -735,13 +850,21 @@ static int handle_tap(int x, int y) {
             return 1;
         }
         if (y >= by - 8 && y <= by + bh + 8) {
-            if (x < 16 + bw) audio_seek_relative(-30000);
-            else if (x < 16 + 2 * (bw + 8)) audio_toggle_pause();
-            else audio_seek_relative(30000);
+            int bw5 = (FB_W - 2 * BTN_MARGIN - 4 * BTN_GAP) / 5;
+            int idx = (x - BTN_MARGIN) / (bw5 + BTN_GAP);
+            if (idx < 0) idx = 0;
+            if (idx > 4) idx = 4;
+            switch (idx) {
+                case 0: audio_seek_relative(-30000); break;
+                case 1: audio_seek_relative(-10000); break;
+                case 2: audio_toggle_pause();        break;
+                case 3: audio_seek_relative(10000);  break;
+                default: audio_seek_relative(30000); break;
+            }
             return 1;
         }
         int sy = by + bh + 12;
-        if (y >= sy && y <= sy + 60) audio_cycle_speed();
+        if (y >= sy && y <= sy + 66) audio_cycle_speed();
         return 1;
     }
 
@@ -780,6 +903,7 @@ static int handle_tap(int x, int y) {
         if (idx >= 0 && idx < episode_count) {
             ep_sel = idx;
             snprintf(cur_path, sizeof(cur_path), "%s", episode_paths[idx]);
+            load_notes(cur_path);
             int start = resume_lookup(cur_path);
             if (start < 0) start = 0;   /* finished: play again from the top */
             plog("[podcast] play %s from %dms\n", cur_path, start);
@@ -863,9 +987,14 @@ static int podcast_entry(void *arg0, void *arg1) {
         int x, y;
         int g = (tfd >= 0 && !locked) ? read_gesture(tfd, &x, &y) : 0;
         if (g == 2) {
-            /* Swipe up scrolls down. Playing screen has no list. */
+            /* Swipe up scrolls down. */
             if (screen == SCREEN_FEEDS)         scroll_by(-y / ROW_H, feed_count);
             else if (screen == SCREEN_EPISODES) scroll_by(-y / ROW_H, episode_count);
+            else if (screen == SCREEN_PLAYING && notes_count) {
+                notes_scroll += -y / NOTES_LINE_H;
+                if (notes_scroll > notes_count - 1) notes_scroll = notes_count - 1;
+                if (notes_scroll < 0) notes_scroll = 0;
+            }
         } else if (g == 1) {
             if (!handle_tap(x, y)) break;
         }

@@ -158,6 +158,7 @@ doing so makes it accumulate and ran 1.75x when 1.25x was asked for.
   that surfaces the player's first hidden redraws.
 - **MP3 only.** `.m4a/.m4b/.opus` are listed but will fail to decode.
 - Cover art shows only on Now Playing, not in the lists.
+- Long titles clip at the edge rather than ending in an ellipsis.
 
 ## Tile icon and label
 
@@ -183,6 +184,25 @@ because Homebrew ships version 80 (jpeg-turbo) and 100 (IJG) and both disagree
 with the device's 90. `jpeg_CreateDecompress` validates the struct size, so a
 mismatch fails safely rather than corrupting memory. Decoding uses `scale_denom`
 to downscale during decode and caches the result next to the cover as raw RGB565.
+
+## Show notes
+
+The fetcher writes each episode's description to a `.txt` beside the audio, and
+the player wraps it to the screen and scrolls it under the transport controls.
+
+Extracting descriptions is fiddlier than the other fields. With `RS="<"`, a
+`<description><![CDATA[<p>text` splits the CDATA marker away from its content
+whenever the content starts with a tag — which is the normal case — so the text
+has to be accumulated from the opening tag to the closing one rather than read
+from a single record.
+
+**Parsing must stop early.** The first version of this walked every item and
+matched the closing tag with a *dynamic* regex, recompiled per record. Feeds run
+to 500-800 episodes and `RS="<"` turns a 2 MB feed into ~100k records, so an
+update went from seconds to hanging the device for twenty minutes. Two fixes:
+`-v max=N` exits once the caller has the episodes it asked for, and the closing
+tag is a precomputed string compared with `index()`. A full update of six feeds
+now takes **10.8 s**; the 2.1 MB Bugle feed parses in under a second on-device.
 
 ## Text
 
