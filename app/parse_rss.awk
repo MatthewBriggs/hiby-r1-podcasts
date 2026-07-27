@@ -16,6 +16,7 @@ BEGIN {
     ep_title = ""; ep_url = ""; ep_date = ""
 }
 
+# Decodes once; see unescape_full for feeds that escape twice.
 function unescape(s) {
     gsub(/&quot;/,  "\"", s)
     gsub(/&apos;/,  "'",  s)
@@ -25,6 +26,12 @@ function unescape(s) {
     gsub(/&gt;/,    ")",  s)
     gsub(/&nbsp;/,  " ",  s)
     gsub(/&amp;/,   "\\&", s)   # last, so other entities decode first
+    return s
+}
+
+function unescape_full(s) {
+    s = unescape(s)
+    if (s ~ /&(amp|quot|apos|lt|gt|#3[49]);/) s = unescape(s)
     return s
 }
 
@@ -66,10 +73,10 @@ function flush_item() {
     v = trim(substr($0, 7))
     if (in_item) {
         if (ep_title == "") {
-            if (v != "") { ep_title = unescape(v) } else { want_text = "ep" }
+            if (v != "") { ep_title = unescape_full(v) } else { want_text = "ep" }
         }
     } else if (chan == "") {
-        if (v != "") { chan = unescape(v) } else { want_text = "chan" }
+        if (v != "") { chan = unescape_full(v) } else { want_text = "chan" }
     }
     next
 }
@@ -78,8 +85,8 @@ function flush_item() {
 /^!\[CDATA\[/ {
     v = trim(strip_cdata($0))
     if (v != "") {
-        if (want_text == "ep" && ep_title == "") ep_title = unescape(v)
-        else if (want_text == "chan" && chan == "") chan = unescape(v)
+        if (want_text == "ep" && ep_title == "") ep_title = unescape_full(v)
+        else if (want_text == "chan" && chan == "") chan = unescape_full(v)
     }
     want_text = ""
     next
@@ -91,7 +98,7 @@ function flush_item() {
         u = substr($0, RSTART, RLENGTH)
         sub(/^href[ \t]*=[ \t]*"/, "", u)
         sub(/"$/, "", u)
-        img = u
+        img = unescape(u)
     }
     next
 }
@@ -99,7 +106,7 @@ function flush_item() {
 /^url>/ {
     if (img == "" && !in_item) {
         v = trim(substr($0, 5))
-        if (v ~ /^https?:\/\/.*\.(jpg|jpeg|png)/) img = v
+        if (v ~ /^https?:\/\/.*\.(jpg|jpeg|png)/) img = unescape(v)
     }
     next
 }
