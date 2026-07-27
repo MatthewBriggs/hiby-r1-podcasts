@@ -178,6 +178,8 @@ static int  vol_show_frames;     /* countdown: draw the volume overlay */
 static int  vol_pct = -1;        /* last known, for the overlay */
 static int  locked;              /* screen off, touch ignored, audio keeps going */
 static int  saved_brightness = -1;
+static int  g_fbfd = -1;         /* set once the frame loop owns /dev/fb0 */
+#define DEFAULT_BRIGHTNESS 43    /* the panel's stock level */
 static char bt_mixer_name[64];   /* bluealsa element, named after the device */
 
 static int read_int_file(const char *path) {
@@ -267,14 +269,24 @@ static void adjust_volume(int delta_pct) {
     vol_show_frames = 110;             /* ~3.5s at 30fps */
 }
 
+/* Locking only drops the backlight, which keeps waking cheap and lets audio run
+ * on undisturbed. Waking has to do more: the player can power the framebuffer
+ * down underneath us on its own display timeout, and restoring brightness to a
+ * blanked panel leaves a black screen that no amount of pressing will bring
+ * back. So unblank unconditionally — it costs nothing when the panel was never
+ * blanked, and it is the difference between a dark screen and a dead one. */
 static void set_locked(int on) {
     if (on == locked) return;
     locked = on;
     if (on) {
         saved_brightness = read_int_file(BACKLIGHT);
         write_int_file(BACKLIGHT, 0);
-    } else if (saved_brightness > 0) {
-        write_int_file(BACKLIGHT, saved_brightness);
+    } else {
+        if (g_fbfd >= 0) ioctl(g_fbfd, FBIOBLANK, FB_BLANK_UNBLANK);
+        /* A brightness of 0 or an unreadable node would otherwise restore to
+         * darkness, which is indistinguishable from the failure above. */
+        write_int_file(BACKLIGHT,
+                       saved_brightness > 0 ? saved_brightness : DEFAULT_BRIGHTNESS);
     }
     plog("[podcast] %s\n", on ? "locked" : "unlocked");
 }
@@ -927,6 +939,7 @@ static int podcast_entry(void *arg0, void *arg1) {
 
     int fbfd = open("/dev/fb0", O_RDWR);
     if (fbfd < 0) { plog("[podcast] no fb: %s\n", strerror(errno)); return 0; }
+    g_fbfd = fbfd;                      /* so unlocking can unblank the panel */
 
     struct fb_var_screeninfo v;
     if (ioctl(fbfd, FBIOGET_VSCREENINFO, &v) < 0) {
