@@ -5,3 +5,5 @@
 https://feeds.theincomparable.com/vulcanhello
 https://feeds.acast.com/public/shows/thebugle
 https://feeds.theincomparable.com/theincomparable
+https://www.ndr.de/nachrichten/info/podcast3012.xml
+https://www.fritz.de/programm/podcasts/talk-ohne-gast.xml/feed=podcast.xml

@@ -31,6 +31,22 @@ chmod +x "$CURL" 2>/dev/null
 
 mkdir -p "$TMP" "$DEST"
 
+# Check connectivity up front. Without this every feed fails with a bare
+# "curl: (6) Could not resolve host", which looks like a curl problem rather
+# than "the radio is off".
+if ! ping -c1 -W3 1.1.1.1 >/dev/null 2>&1; then
+    log "NO NETWORK"
+    log "Turn on WiFi in Settings, then update again."
+    log "__DONE__"
+    exit 1
+fi
+if [ ! -s /etc/resolv.conf ]; then
+    log "NO DNS"
+    log "WiFi is up but has no DNS server yet. Wait a moment and retry."
+    log "__DONE__"
+    exit 1
+fi
+
 # Sanitise for FAT32 while staying readable: the app shows filenames verbatim.
 sanitize() {
     echo "$1" | sed -e 's/:/ -/g' -e 's/["<>|?*\/\\]//g' -e 's/[[:cntrl:]]//g' \
