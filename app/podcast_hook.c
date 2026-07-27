@@ -33,6 +33,7 @@
 #include <sys/ioctl.h>
 #include <linux/fb.h>
 #include <linux/input.h>
+#include <sys/wait.h>
 
 #include "font5x7.h"
 #include "audio.h"
@@ -65,6 +66,9 @@
 #define RESUME_DIR  "/data/mnt/sd_0/.podsync"
 #define RESUME_FILE RESUME_DIR "/resume.txt"
 #define LOG_PATH    "/tmp/.podcast_hook.log"
+#define SYNC_SCRIPT RESUME_DIR "/podsync_once.sh"
+#define SYNC_LOG    "/tmp/.podsync_run.log"
+#define UPDATE_BTN_H 52
 
 #define MAX_ITEMS 64
 #define NAME_LEN  64
@@ -75,7 +79,7 @@
 #define LIST_TOP HEADER_H
 #define ROWS_VISIBLE ((FB_H - LIST_TOP) / ROW_H)
 
-enum { SCREEN_FEEDS = 0, SCREEN_EPISODES, SCREEN_PLAYING };
+enum { SCREEN_FEEDS = 0, SCREEN_EPISODES, SCREEN_PLAYING, SCREEN_UPDATE };
 
 static uint32_t orig_cb = 0;
 
@@ -90,6 +94,7 @@ static int ep_sel = -1;
 static int scroll = 0;
 static char cur_feed[NAME_LEN];
 static char cur_path[PATH_LEN];
+static int  update_running = 0;
 
 /* ---- logging ------------------------------------------------------------ */
 static void plog(const char *fmt, ...) {
@@ -167,6 +172,48 @@ static void resume_store(const char *path, int ms) {
     free(keep);
 }
 
+/* ---- update ------------------------------------------------------------- */
+/* The fetcher is a shell script rather than C: it already existed, and it needs
+ * the static curl on the card because busybox wget's TLS is too old for any
+ * modern podcast host. Run it detached and follow its log. */
+static void update_start(void) {
+    if (update_running) return;
+    unlink(SYNC_LOG);
+    pid_t pid = fork();
+    if (pid == 0) {
+        execl("/bin/sh", "sh", SYNC_SCRIPT, (char *)NULL);
+        _exit(127);
+    }
+    if (pid > 0) {
+        update_running = 1;
+        screen = SCREEN_UPDATE;
+        plog("[podcast] update started pid=%d\n", (int)pid);
+    }
+}
+
+/* Last few lines of the updater's log, newest last. */
+static int update_tail(char out[][NAME_LEN], int max_lines) {
+    FILE *f = fopen(SYNC_LOG, "r");
+    if (!f) return 0;
+    char line[256];
+    int n = 0;
+    while (fgets(line, sizeof(line), f)) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+        if (!line[0]) continue;
+        if (strcmp(line, "__DONE__") == 0) { update_running = 0; continue; }
+        if (n < max_lines) {
+            snprintf(out[n++], NAME_LEN, "%s", line);
+        } else {
+            for (int i = 1; i < max_lines; i++)
+                memcpy(out[i - 1], out[i], NAME_LEN);
+            snprintf(out[max_lines - 1], NAME_LEN, "%s", line);
+        }
+    }
+    fclose(f);
+    return n;
+}
+
 /* ---- drawing ------------------------------------------------------------ */
 static void fill_rect(uint16_t *fb, int x, int y, int w, int h, uint16_t c) {
     if (x < 0) { w += x; x = 0; }
@@ -216,23 +263,25 @@ static void draw_header(uint16_t *fb, const char *title, const char *right) {
 }
 
 static void draw_list(uint16_t *fb, char items[][NAME_LEN], int count, int sel) {
+    int top = LIST_TOP + (screen == SCREEN_FEEDS ? UPDATE_BTN_H : 0);
     if (count == 0) {
-        draw_text(fb, 16, LIST_TOP + 30, "NOTHING HERE", COL_DIM, 2, 0);
+        draw_text(fb, 16, top + 30, "NOTHING HERE", COL_DIM, 2, 0);
         return;
     }
-    for (int i = 0; i < ROWS_VISIBLE; i++) {
+    int visible = (FB_H - top) / ROW_H;
+    for (int i = 0; i < visible; i++) {
         int idx = scroll + i;
         if (idx >= count) break;
-        int y = LIST_TOP + i * ROW_H;
+        int y = top + i * ROW_H;
         fill_rect(fb, 0, y, FB_W, ROW_H - 2, (idx & 1) ? COL_ROW_B : COL_ROW_A);
         if (idx == sel) fill_rect(fb, 0, y, 6, ROW_H - 2, COL_ACCENT);
         draw_text(fb, 18, y + 18, items[idx], COL_TEXT, 2, FB_W - 16);
     }
-    if (count > ROWS_VISIBLE) {
+    if (count > visible) {
         /* Scrollbar: proportional thumb down the right edge. */
-        int track = FB_H - LIST_TOP;
-        int th = track * ROWS_VISIBLE / count;
-        int ty = LIST_TOP + track * scroll / count;
+        int track = FB_H - top;
+        int th = track * visible / count;
+        int ty = top + track * scroll / count;
         fill_rect(fb, FB_W - 5, LIST_TOP, 4, track, COL_ROW_B);
         fill_rect(fb, FB_W - 5, ty, 4, th < 20 ? 20 : th, COL_DIM);
     }
@@ -282,13 +331,30 @@ static void draw_playing(uint16_t *fb) {
         draw_text(fb, 16, sy + 76, "FINISHED", COL_DIM, 2, 0);
 }
 
+static void draw_update(uint16_t *fb) {
+    draw_header(fb, "UPDATE", update_running ? NULL : "BACK");
+    static char lines[14][NAME_LEN];
+    int n = update_tail(lines, 14);
+    for (int i = 0; i < n; i++)
+        draw_text(fb, 16, LIST_TOP + 14 + i * 26, lines[i], COL_TEXT, 2, FB_W - 16);
+    if (update_running)
+        draw_text(fb, 16, FB_H - 40, "WORKING...", COL_ACCENT, 2, 0);
+    else
+        draw_text(fb, 16, FB_H - 40, "TAP BACK WHEN READY", COL_DIM, 2, 0);
+}
+
 static void draw_ui(uint16_t *fb) {
     fill_rect(fb, 0, 0, FB_W, FB_H, COL_BG);
     if (screen == SCREEN_FEEDS) {
         draw_header(fb, "PODCASTS", "EXIT");
+        /* Update bar sits directly under the header, above the list. */
+        fill_rect(fb, 0, LIST_TOP, FB_W, UPDATE_BTN_H, COL_BTN);
+        draw_text(fb, 16, LIST_TOP + 16, "UPDATE FEEDS", COL_ACCENT, 2, FB_W - 16);
         draw_list(fb, feeds, feed_count, feed_sel);
         if (feed_count == 0)
-            draw_text(fb, 16, LIST_TOP + 60, &PODCAST_DIR[16], COL_DIM, 1, 0);
+            draw_text(fb, 16, LIST_TOP + UPDATE_BTN_H + 60, &PODCAST_DIR[16], COL_DIM, 1, 0);
+    } else if (screen == SCREEN_UPDATE) {
+        draw_update(fb);
     } else if (screen == SCREEN_EPISODES) {
         draw_header(fb, cur_feed, "BACK");
         draw_list(fb, episodes, episode_count, ep_sel);
@@ -349,7 +415,11 @@ static void load_episodes(const char *feed) {
     while ((e = readdir(d)) && episode_count < MAX_ITEMS) {
         if (e->d_name[0] == '.') continue;
         if (!is_audio(e->d_name)) continue;
-        snprintf(episodes[episode_count++], NAME_LEN, "%s", e->d_name);
+        /* Show the title without its extension; the list is the only label. */
+        snprintf(episodes[episode_count], NAME_LEN, "%s", e->d_name);
+        char *dot = strrchr(episodes[episode_count], '.');
+        if (dot) *dot = '\0';
+        episode_count++;
     }
     closedir(d);
     sort_items(episodes, episode_count);
@@ -417,12 +487,27 @@ static int handle_tap(int x, int y) {
         return 1;
     }
 
+    if (screen == SCREEN_UPDATE) {
+        if (y < HEADER_H && !update_running) {
+            load_feeds();                 /* pick up anything just downloaded */
+            screen = SCREEN_FEEDS;
+            scroll = 0;
+        }
+        return 1;
+    }
+
     if (y < HEADER_H) {
         if (screen == SCREEN_EPISODES) { screen = SCREEN_FEEDS; scroll = 0; return 1; }
         return 0;                                  /* EXIT from the feed list */
     }
 
-    int idx = scroll + (y - LIST_TOP) / ROW_H;
+    if (screen == SCREEN_FEEDS && y < LIST_TOP + UPDATE_BTN_H) {
+        update_start();
+        return 1;
+    }
+
+    int top = LIST_TOP + (screen == SCREEN_FEEDS ? UPDATE_BTN_H : 0);
+    int idx = scroll + (y - top) / ROW_H;
     if (screen == SCREEN_FEEDS) {
         if (idx >= 0 && idx < feed_count) {
             feed_sel = idx;
@@ -435,8 +520,28 @@ static int handle_tap(int x, int y) {
     } else {
         if (idx >= 0 && idx < episode_count) {
             ep_sel = idx;
-            snprintf(cur_path, sizeof(cur_path), "%s/%s/%s",
-                     PODCAST_DIR, cur_feed, episodes[idx]);
+            /* episodes[] holds display names with the extension stripped, so
+             * find the real file rather than reconstructing the name. */
+            char dirp[PATH_LEN];
+            snprintf(dirp, sizeof(dirp), "%s/%s", PODCAST_DIR, cur_feed);
+            cur_path[0] = '\0';
+            DIR *dd = opendir(dirp);
+            if (dd) {
+                struct dirent *de;
+                while ((de = readdir(dd))) {
+                    if (de->d_name[0] == '.' || !is_audio(de->d_name)) continue;
+                    char stem[NAME_LEN];
+                    snprintf(stem, sizeof(stem), "%s", de->d_name);
+                    char *d2 = strrchr(stem, '.');
+                    if (d2) *d2 = '\0';
+                    if (strcmp(stem, episodes[idx]) == 0) {
+                        snprintf(cur_path, sizeof(cur_path), "%s/%s", dirp, de->d_name);
+                        break;
+                    }
+                }
+                closedir(dd);
+            }
+            if (!cur_path[0]) return 1;
             int start = resume_lookup(cur_path);
             plog("[podcast] play %s from %dms\n", cur_path, start);
             audio_play(cur_path, start);

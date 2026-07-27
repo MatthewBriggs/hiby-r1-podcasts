@@ -8,12 +8,23 @@ in-process inside `hiby_player`. Working proof of concept as of 2026-07-27.
 Tap **About** on the launcher and the app opens. Three screens, all drawn with a
 built-in 5x7 font:
 
-- **Feeds** — one row per folder under `/data/mnt/sd_0/Audiobooks`.
+- **Feeds** — an `UPDATE FEEDS` bar, then one row per folder under
+  `/data/mnt/sd_0/Audiobooks`.
 - **Episodes** — audio files in the selected feed, sorted.
 - **Now Playing** — feed and episode name, progress bar, elapsed/total,
   `-30 / PAUSE / +30`, and a speed control cycling 1.0/1.25/1.5/1.75/2.0x.
 
 Lists scroll by swiping, with a proportional scrollbar.
+
+**Updating** is manual and in-app: tap `UPDATE FEEDS` and the app forks
+`.podsync/podsync_once.sh`, streaming its log to an update screen until it
+reports done. Subscriptions are one RSS URL per line in
+`/data/mnt/sd_0/.podsync/feeds.txt`, editable by pulling the card or over the
+player's WiFi transfer mode. There is no background process and nothing to
+schedule. The fetcher stays a shell script because it needs the static `curl`
+on the card — busybox `wget` only offers legacy TLS ciphers and every modern
+podcast host rejects the handshake. Episode files are named from the RSS
+`<title>`, and the list hides the extension.
 
 Audio plays for real: MP3 decoded with minimp3_ex and written to ALSA on a worker
 thread. Pause holds the clock, ±30s seeks, and **resume positions persist** — backing
@@ -107,9 +118,6 @@ doing so makes it accumulate and ran 1.75x when 1.25x was asked for.
   FINISHED immediately). Seeking from a fresh start is fine; worth revisiting how
   `MP3D_SEEK_TO_BYTE` estimates far offsets on VBR files.
 - No episode ordering by date, no played/unplayed state, no cover art.
-- **No feed fetching wired in.** `~/Git/hiby-podsync` downloads episodes and works,
-  but its autostart was lost with the firmware change; point it at
-  `/data/mnt/sd_0/Audiobooks/<feed>/` and start it from `/usr/data/init.sh`.
 - Font is uppercase-only 5x7; lowercase folds to caps.
 
 ## Recovery
