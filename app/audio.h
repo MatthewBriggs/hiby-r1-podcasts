@@ -13,5 +13,7 @@ int  audio_is_paused(void);
 int  audio_position_ms(void);
 int  audio_duration_ms(void);
 const char *audio_error(void);      /* NULL when fine */
+float audio_speed(void);
+void  audio_cycle_speed(void);
 
 #endif /* AUDIO_H */

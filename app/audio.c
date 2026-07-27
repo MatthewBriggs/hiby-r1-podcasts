@@ -28,6 +28,7 @@
 #include <unistd.h>
 
 #include "audio.h"
+#include "wsola.h"
 
 /* ALSA constants, needed because we dlopen rather than include the headers. */
 #define SND_PCM_STREAM_PLAYBACK      0
@@ -73,6 +74,7 @@ static int   g_pos_ms;
 static int   g_dur_ms;
 static char  g_path[512];
 static int   g_start_ms;
+static float g_speed = 1.0f;
 
 #define SYM(p, name) do { \
     *(void **)(&p) = dlsym(g_alsa, name); \
@@ -168,8 +170,12 @@ static void *worker(void *unused) {
     g_dur_ms = (int)((dec.samples / (ch ? ch : 1)) * 1000ULL / (rate ? rate : 44100));
     pthread_mutex_unlock(&g_lock);
 
+    wsola_init(rate, ch);
+    wsola_set_speed(g_speed);
+
     void *pcm = pcm_open((unsigned)rate, ch);
     if (!pcm) {
+        wsola_free();
         mp3dec_ex_close(&dec);
         pthread_mutex_lock(&g_lock);
         g_active = 0; g_running = 0;
@@ -202,27 +208,44 @@ static void *worker(void *unused) {
             uint64_t target = (uint64_t)seek * rate / 1000 * ch;
             if (target > dec.samples) target = dec.samples;
             mp3dec_ex_seek(&dec, target);
+            wsola_reset();
             base_ms = seek;
             frames_since = 0;
         }
         if (paused) { usleep(60000); continue; }
 
+        pthread_mutex_lock(&g_lock);
+        float want_speed = g_speed;
+        pthread_mutex_unlock(&g_lock);
+        if (want_speed != wsola_speed()) wsola_set_speed(want_speed);
+
         size_t got = mp3dec_ex_read(&dec, buf, want);
         if (got == 0) break;                       /* end of file */
 
-        snd_pcm_uframes_t frames = got / (ch ? ch : 1);
-        const char *p = (const char *)buf;
-        while (frames > 0) {
-            snd_pcm_sframes_t n = x_writei(pcm, p, frames);
-            if (n < 0) {
-                if (x_recover(pcm, (int)n, 1) < 0) { frames = 0; break; }
-                continue;
+        size_t in_frames = got / (ch ? ch : 1);
+        wsola_feed(buf, in_frames);
+
+        /* Drain everything the stretcher will give us for this input. */
+        static mp3d_sample_t obuf[MINIMP3_MAX_SAMPLES_PER_FRAME * 8];
+        const size_t ocap = sizeof(obuf) / sizeof(obuf[0]) / 2;
+        for (;;) {
+            size_t out_frames = wsola_read(obuf, ocap);
+            if (out_frames == 0) break;
+            snd_pcm_uframes_t frames = out_frames;
+            const char *p = (const char *)obuf;
+            while (frames > 0) {
+                snd_pcm_sframes_t n = x_writei(pcm, p, frames);
+                if (n < 0) {
+                    if (x_recover(pcm, (int)n, 1) < 0) { frames = 0; break; }
+                    continue;
+                }
+                frames -= (snd_pcm_uframes_t)n;
+                p += (size_t)n * ch * sizeof(mp3d_sample_t);
             }
-            frames -= (snd_pcm_uframes_t)n;
-            p += (size_t)n * ch * sizeof(mp3d_sample_t);
+            if (out_frames < ocap) break;
         }
 
-        frames_since += got / (ch ? ch : 1);
+        frames_since += in_frames;
         pthread_mutex_lock(&g_lock);
         g_pos_ms = base_ms + (int)(frames_since * 1000ULL / (rate ? rate : 44100));
         pthread_mutex_unlock(&g_lock);
@@ -230,6 +253,7 @@ static void *worker(void *unused) {
 
     x_drop(pcm);
     x_close(pcm);
+    wsola_free();
     mp3dec_ex_close(&dec);
 
     pthread_mutex_lock(&g_lock);
@@ -296,3 +320,14 @@ int audio_is_paused(void)  { pthread_mutex_lock(&g_lock); int v = g_paused; pthr
 int audio_position_ms(void){ pthread_mutex_lock(&g_lock); int v = g_pos_ms; pthread_mutex_unlock(&g_lock); return v; }
 int audio_duration_ms(void){ pthread_mutex_lock(&g_lock); int v = g_dur_ms; pthread_mutex_unlock(&g_lock); return v; }
 const char *audio_error(void) { return g_err; }
+
+float audio_speed(void) { pthread_mutex_lock(&g_lock); float v = g_speed; pthread_mutex_unlock(&g_lock); return v; }
+
+void audio_cycle_speed(void) {
+    static const float steps[] = { 1.0f, 1.25f, 1.5f, 1.75f, 2.0f };
+    pthread_mutex_lock(&g_lock);
+    int i = 0;
+    for (int k = 0; k < 5; k++) if (steps[k] == g_speed) { i = k; break; }
+    g_speed = steps[(i + 1) % 5];
+    pthread_mutex_unlock(&g_lock);
+}

@@ -10,8 +10,10 @@ built-in 5x7 font:
 
 - **Feeds** — one row per folder under `/data/mnt/sd_0/Audiobooks`.
 - **Episodes** — audio files in the selected feed, sorted.
-- **Now Playing** — feed and episode name, progress bar, elapsed/total, and
-  `-30 / PAUSE / +30` controls.
+- **Now Playing** — feed and episode name, progress bar, elapsed/total,
+  `-30 / PAUSE / +30`, and a speed control cycling 1.0/1.25/1.5/1.75/2.0x.
+
+Lists scroll by swiping, with a proportional scrollbar.
 
 Audio plays for real: MP3 decoded with minimp3_ex and written to ALSA on a worker
 thread. Pause holds the clock, ±30s seeks, and **resume positions persist** — backing
@@ -89,22 +91,26 @@ usable clock — the player keeps its own `base_ms + decoded frames` counter. AL
 `dlopen`'d and opened as `plughw:0,0` so it resamples to the hardware's rates; hw/sw
 params are set by hand because `snd_pcm_set_params` is unreliable here.
 
+**Speed** is real time-stretching, not resampling, so pitch is preserved:
+`wsola.c` cross-fades between waveform-similar windows. Measured on device at
+1.25x: 35 s of audio in 28 s of wall clock. The subtle bug worth remembering is
+that the similarity-search offset must *not* be folded into the read pointer —
+doing so makes it accumulate and ran 1.75x when 1.25x was asked for.
+
 ## Known gaps
 
-- **No playback speed control.** The main thing podcasts want that this lacks.
-  Needs time-stretching (the audiobook mod uses WSOLA).
-- **No scrolling.** `scroll` exists but nothing moves it, so only the first ~13
-  rows of a list are reachable.
 - **Stale frame on exit.** After leaving, our last frame stays until the player
   next repaints. The audiobook mod solves this with a bounded "handoff watcher"
   that surfaces the player's first hidden redraws.
 - **MP3 only.** `.m4a/.m4b/.opus` are listed but will fail to decode.
+- **A long resume seek once landed at EOF** (~16 min into a 45 min file showed
+  FINISHED immediately). Seeking from a fresh start is fine; worth revisiting how
+  `MP3D_SEEK_TO_BYTE` estimates far offsets on VBR files.
 - No episode ordering by date, no played/unplayed state, no cover art.
 - **No feed fetching wired in.** `~/Git/hiby-podsync` downloads episodes and works,
   but its autostart was lost with the firmware change; point it at
   `/data/mnt/sd_0/Audiobooks/<feed>/` and start it from `/usr/data/init.sh`.
 - Font is uppercase-only 5x7; lowercase folds to caps.
-- Only the first ~13 feeds fit; no scrolling.
 
 ## Recovery
 

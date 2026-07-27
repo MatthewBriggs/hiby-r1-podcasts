@@ -228,6 +228,14 @@ static void draw_list(uint16_t *fb, char items[][NAME_LEN], int count, int sel) 
         if (idx == sel) fill_rect(fb, 0, y, 6, ROW_H - 2, COL_ACCENT);
         draw_text(fb, 18, y + 18, items[idx], COL_TEXT, 2, FB_W - 16);
     }
+    if (count > ROWS_VISIBLE) {
+        /* Scrollbar: proportional thumb down the right edge. */
+        int track = FB_H - LIST_TOP;
+        int th = track * ROWS_VISIBLE / count;
+        int ty = LIST_TOP + track * scroll / count;
+        fill_rect(fb, FB_W - 5, LIST_TOP, 4, track, COL_ROW_B);
+        fill_rect(fb, FB_W - 5, ty, 4, th < 20 ? 20 : th, COL_DIM);
+    }
 }
 
 static void draw_playing(uint16_t *fb) {
@@ -260,10 +268,18 @@ static void draw_playing(uint16_t *fb) {
               audio_is_paused() ? "PLAY" : "PAUS", COL_TEXT, 2, 0);
     draw_text(fb, 16 + 2 * (bw + 8) + 24, by + 28, "+30", COL_TEXT, 3, 0);
 
+    /* Speed control, full width under the transport row. */
+    int sy = by + bh + 12;
+    fill_rect(fb, 16, sy, FB_W - 32, 60, COL_BTN);
+    char sp[24];
+    float v = audio_speed();
+    snprintf(sp, sizeof(sp), "SPEED %d.%02dX", (int)v, (int)((v - (int)v) * 100 + 0.5f));
+    draw_text(fb, 40, sy + 22, sp, COL_TEXT, 2, FB_W - 40);
+
     const char *err = audio_error();
-    if (err) draw_text(fb, 16, by + bh + 24, err, RGB(230, 120, 120), 2, FB_W - 16);
+    if (err) draw_text(fb, 16, sy + 76, err, RGB(230, 120, 120), 2, FB_W - 16);
     else if (!audio_is_active())
-        draw_text(fb, 16, by + bh + 24, "FINISHED", COL_DIM, 2, 0);
+        draw_text(fb, 16, sy + 76, "FINISHED", COL_DIM, 2, 0);
 }
 
 static void draw_ui(uint16_t *fb) {
@@ -341,21 +357,33 @@ static void load_episodes(const char *feed) {
 }
 
 /* ---- touch -------------------------------------------------------------- */
-static int read_tap(int fd, int *tx, int *ty) {
+/* Returns 1 for a tap, 2 for a vertical swipe (dy in *ty). */
+static int read_gesture(int fd, int *tx, int *ty) {
     struct input_event ev;
-    static int cx = -1, cy = -1, down = 0;
+    static int cx = -1, cy = -1, down = 0, sx = 0, sy = 0;
     while (read(fd, &ev, sizeof(ev)) == (ssize_t)sizeof(ev)) {
         if (ev.type == EV_ABS && ev.code == ABS_MT_POSITION_X) cx = ev.value;
         else if (ev.type == EV_ABS && ev.code == ABS_MT_POSITION_Y) cy = ev.value;
         else if (ev.type == EV_KEY && ev.code == BTN_TOUCH) {
-            if (ev.value) down = 1;
+            if (ev.value) { down = 1; sx = cx; sy = cy; }
             else if (down) {
                 down = 0;
-                if (cx >= 0 && cy >= 0) { *tx = cx; *ty = cy; return 1; }
+                if (cx < 0 || cy < 0) continue;
+                int dy = cy - sy;
+                if (dy > 40 || dy < -40) { *ty = dy; return 2; }
+                *tx = cx; *ty = cy; return 1;
             }
         }
     }
     return 0;
+}
+
+static void scroll_by(int rows, int count) {
+    scroll += rows;
+    int max = count - ROWS_VISIBLE;
+    if (max < 0) max = 0;
+    if (scroll > max) scroll = max;
+    if (scroll < 0) scroll = 0;
 }
 
 static void save_position(void) {
@@ -382,7 +410,10 @@ static int handle_tap(int x, int y) {
             if (x < 16 + bw) audio_seek_relative(-30000);
             else if (x < 16 + 2 * (bw + 8)) audio_toggle_pause();
             else audio_seek_relative(30000);
+            return 1;
         }
+        int sy = by + bh + 12;
+        if (y >= sy && y <= sy + 60) audio_cycle_speed();
         return 1;
     }
 
@@ -449,7 +480,12 @@ static int podcast_entry(void *arg0, void *arg1) {
     int page = 0, frames = 0, ticks = 0;
     for (;;) {
         int x, y;
-        if (tfd >= 0 && read_tap(tfd, &x, &y)) {
+        int g = tfd >= 0 ? read_gesture(tfd, &x, &y) : 0;
+        if (g == 2) {
+            /* Swipe up scrolls down. Playing screen has no list. */
+            if (screen == SCREEN_FEEDS)         scroll_by(-y / ROW_H, feed_count);
+            else if (screen == SCREEN_EPISODES) scroll_by(-y / ROW_H, episode_count);
+        } else if (g == 1) {
             if (!handle_tap(x, y)) break;
         }
 
