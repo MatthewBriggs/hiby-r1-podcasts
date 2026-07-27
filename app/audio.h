@@ -9,6 +9,7 @@ void audio_stop(void);
 void audio_seek_relative(int delta_ms);
 
 int  audio_is_active(void);         /* a file is loaded */
+int  audio_is_loading(void);        /* building the seek index */
 int  audio_is_paused(void);
 int  audio_position_ms(void);
 int  audio_duration_ms(void);

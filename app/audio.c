@@ -29,6 +29,19 @@
 
 #include "audio.h"
 #include "wsola.h"
+#include <fcntl.h>
+#include <stdarg.h>
+#include <time.h>
+
+static void alog(const char *fmt, ...) {
+    char b[200];
+    va_list ap; va_start(ap, fmt);
+    int n = vsnprintf(b, sizeof(b), fmt, ap);
+    va_end(ap);
+    if (n <= 0) return;
+    int fd = open("/tmp/.podcast_hook.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd >= 0) { write(fd, b, n > (int)sizeof(b) ? (int)sizeof(b) : n); close(fd); }
+}
 
 /* ALSA constants, needed because we dlopen rather than include the headers. */
 #define SND_PCM_STREAM_PLAYBACK      0
@@ -75,6 +88,7 @@ static int   g_dur_ms;
 static char  g_path[512];
 static int   g_start_ms;
 static float g_speed = 1.0f;
+static int   g_loading;
 
 #define SYM(p, name) do { \
     *(void **)(&p) = dlsym(g_alsa, name); \
@@ -155,13 +169,25 @@ static void *worker(void *unused) {
 
     mp3dec_ex_t dec;
     memset(&dec, 0, sizeof(dec));
-    /* SEEK_TO_BYTE: the sample-accurate mode indexes the whole file and OOMs. */
-    if (mp3dec_ex_open(&dec, g_path, MP3D_SEEK_TO_BYTE) != 0) {
+    /* MP3D_SEEK_TO_BYTE reports success then reads EOF for far offsets (its
+     * byte estimate overshoots on VBR), which broke resume. SEEK_TO_SAMPLE is
+     * exact; the audiobook mod avoided it because indexing a 6.6h book costs
+     * ~14.5MB, but podcast episodes are an order of magnitude shorter. */
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    pthread_mutex_lock(&g_lock); g_loading = 1; pthread_mutex_unlock(&g_lock);
+    if (mp3dec_ex_open(&dec, g_path, MP3D_SEEK_TO_SAMPLE) != 0) {
+        pthread_mutex_lock(&g_lock); g_loading = 0; pthread_mutex_unlock(&g_lock);
         pthread_mutex_lock(&g_lock);
         g_err = "cannot decode file"; g_active = 0; g_running = 0;
         pthread_mutex_unlock(&g_lock);
         return NULL;
     }
+
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    pthread_mutex_lock(&g_lock); g_loading = 0; pthread_mutex_unlock(&g_lock);
+    alog("[audio] indexed in %ld ms\n",
+         (long)((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000));
 
     int rate = dec.info.hz ? dec.info.hz : 44100;
     int ch   = dec.info.channels ? dec.info.channels : 2;
@@ -274,6 +300,7 @@ int audio_play(const char *path, int start_ms) {
     g_paused = 0;
     g_active = 1;
     g_running = 1;
+    g_loading = 1;
     g_err = NULL;
     pthread_mutex_unlock(&g_lock);
 
@@ -315,6 +342,7 @@ void audio_seek_relative(int delta_ms) {
     pthread_mutex_unlock(&g_lock);
 }
 
+int audio_is_loading(void) { pthread_mutex_lock(&g_lock); int v = g_loading; pthread_mutex_unlock(&g_lock); return v; }
 int audio_is_active(void)  { pthread_mutex_lock(&g_lock); int v = g_active; pthread_mutex_unlock(&g_lock); return v; }
 int audio_is_paused(void)  { pthread_mutex_lock(&g_lock); int v = g_paused; pthread_mutex_unlock(&g_lock); return v; }
 int audio_position_ms(void){ pthread_mutex_lock(&g_lock); int v = g_pos_ms; pthread_mutex_unlock(&g_lock); return v; }

@@ -93,6 +93,13 @@ plain `shell` corrupts binary with LF translation.
 
 ## Audio notes
 
+Seeks use `MP3D_SEEK_TO_SAMPLE`. `MP3D_SEEK_TO_BYTE` starts instantly but its
+byte estimate overshoots on VBR: seeking 25 min into a 34 min episode returned
+success and then read EOF, so resume silently reported FINISHED. The audiobook
+mod avoided SEEK_TO_SAMPLE because indexing a 6.6 h book cost ~14.5 MB, but a
+podcast episode is an order of magnitude shorter — a 34 min file indexes in ~3 s
+and the UI shows `LOADING...` while it does. Very long episodes will feel slow.
+
 HiBy's `libmp3.so` is libmpg123 but unusable — its file readers are stubs and
 `mpg123_read` returns garbled PCM for 22050 Hz MPEG-2 files. minimp3_ex (CC0,
 vendored) is compiled in instead. Seeks use `MP3D_SEEK_TO_BYTE`: the sample-accurate
@@ -114,9 +121,6 @@ doing so makes it accumulate and ran 1.75x when 1.25x was asked for.
   next repaints. The audiobook mod solves this with a bounded "handoff watcher"
   that surfaces the player's first hidden redraws.
 - **MP3 only.** `.m4a/.m4b/.opus` are listed but will fail to decode.
-- **A long resume seek once landed at EOF** (~16 min into a 45 min file showed
-  FINISHED immediately). Seeking from a fresh start is fine; worth revisiting how
-  `MP3D_SEEK_TO_BYTE` estimates far offsets on VBR files.
 - No episode ordering by date, no played/unplayed state, no cover art.
 - Font is uppercase-only 5x7; lowercase folds to caps.
 

@@ -327,6 +327,8 @@ static void draw_playing(uint16_t *fb) {
 
     const char *err = audio_error();
     if (err) draw_text(fb, 16, sy + 76, err, RGB(230, 120, 120), 2, FB_W - 16);
+    else if (audio_is_loading())
+        draw_text(fb, 16, sy + 76, "LOADING...", COL_ACCENT, 2, 0);
     else if (!audio_is_active())
         draw_text(fb, 16, sy + 76, "FINISHED", COL_DIM, 2, 0);
 }
