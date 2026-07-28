@@ -257,6 +257,13 @@ static void adjust_volume(int delta_pct) {
         if (f) { fprintf(f, "%d\n", v); fclose(f); }
         return;
     }
+    /* The element is named after the connected device and is looked up once at
+     * entry, but a headset can pair later — and audio_using_bt() above has
+     * already told us this stream really is going out over Bluetooth. Without a
+     * re-look we would fall through to the wired mixer, whose registers do
+     * nothing on this device, and the volume keys would appear dead. */
+    if (!bt_mixer_name[0]) find_bt_mixer();
+
     if (bt_mixer_name[0]) {
         snprintf(cmd, sizeof(cmd), "amixer -D bluealsa sset '%s' %d%%%c >/dev/null 2>&1",
                  bt_mixer_name, delta_pct < 0 ? -delta_pct : delta_pct,
@@ -269,6 +276,9 @@ static void adjust_volume(int delta_pct) {
     }
     if (system(cmd) == -1) return;
     vol_pct = read_volume_pct();
+    /* No readable level means the element we asked for is not there — a
+     * different headset since last time. Forget it so the next press re-looks. */
+    if (vol_pct < 0) bt_mixer_name[0] = '\0';
     vol_show_frames = 110;             /* ~3.5s at 30fps */
 }
 
