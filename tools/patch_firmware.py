@@ -167,13 +167,26 @@ def read_images(iso):
 
 
 def write_upt(out_path, images, manifest, meta, version_blob, version_num):
+    """Rebuild the .upt, matching the original's directory extensions exactly.
+
+    The stock images carry both Joliet (level 3) and Rock Ridge 1.09. Omitting
+    them still produces a valid ISO 9660 image that reads back perfectly on a
+    host — every digest verifies — but the device's updater cannot navigate it:
+    it displays "Upgrading..." and never progresses. The extensions shift where
+    the payload starts (first chunk at extent 51 rather than 33), so this is not
+    cosmetic. Anything changed here must be checked against a stock image with
+    verify_firmware.py --against, not merely by confirming checksums.
+    """
     import pycdlib
     iso = pycdlib.PyCdlib()
-    iso.new(interchange_level=1, vol_ident="CDROM")
-    iso.add_directory("/D0000001")
+    iso.new(interchange_level=1, vol_ident="CDROM",
+            joliet=3, rock_ridge="1.09")
+    iso.add_directory("/D0000001", joliet_path="/D0000001", rr_name="D0000001")
 
     def add(data, path):
-        iso.add_fp(io.BytesIO(data), len(data), path)
+        name = path.rsplit("/", 1)[1]
+        iso.add_fp(io.BytesIO(data), len(data), path,
+                   joliet_path=path.replace(";1", ""), rr_name=name.replace(";1", ""))
 
     def chunks(d):
         return [d[i:i + CHUNK] for i in range(0, len(d), CHUNK)]
