@@ -61,6 +61,7 @@
 #define COL_ROW_A   RGB(32, 32, 40)
 #define COL_ROW_B   RGB(26, 26, 33)
 #define COL_ACCENT  RGB(90, 200, 140)
+#define COL_WARN    RGB(230, 140, 90)
 #define COL_BAR_BG  RGB(50, 50, 60)
 #define COL_BTN     RGB(45, 45, 58)
 
@@ -109,6 +110,8 @@ static int scroll = 0;
 static char cur_feed[NAME_LEN];
 static char cur_path[PATH_LEN];
 static int  update_running = 0;
+static pid_t update_pid = -1;
+static int  update_died = 0;     /* exited without writing __DONE__ */
 
 static void plog(const char *fmt, ...);
 
@@ -426,9 +429,33 @@ static void update_start(void) {
         _exit(127);
     }
     if (pid > 0) {
+        update_pid = pid;
+        update_died = 0;
         update_running = 1;
         screen = SCREEN_UPDATE;
         plog("[podcast] update started pid=%d\n", (int)pid);
+    }
+}
+
+/* Reap the fetcher and notice if it never finished.
+ *
+ * Completion was inferred only from __DONE__ appearing in the log, so a script
+ * that was killed — or that /bin/sh could not exec at all — left update_running
+ * set for good. The UPDATE screen hides its own BACK button while that is set,
+ * so the only way out was rebooting the player. Call this *after* update_tail
+ * has had a chance to see __DONE__: the script writes it as its last act, so if
+ * the child is gone and the marker still is not there, it did not get to finish.
+ * Without the wait the child would also stay a zombie for the life of the
+ * player, one per update. */
+static void update_reap(void) {
+    if (update_pid <= 0) return;
+    int status;
+    if (waitpid(update_pid, &status, WNOHANG) != update_pid) return;
+    update_pid = -1;
+    if (update_running) {
+        update_running = 0;
+        update_died = 1;
+        plog("[podcast] fetcher exited without finishing (status %d)\n", status);
     }
 }
 
@@ -659,13 +686,17 @@ static void draw_playing(uint16_t *fb) {
 }
 
 static void draw_update(uint16_t *fb) {
-    draw_header(fb, "UPDATE", update_running ? NULL : "BACK");
     static char lines[14][NAME_LEN];
-    int n = update_tail(lines, 14);
+    int n = update_tail(lines, 14);   /* clears update_running on __DONE__ */
+    update_reap();                    /* ...so anything left is a real failure */
+
+    draw_header(fb, "UPDATE", update_running ? NULL : "BACK");
     for (int i = 0; i < n; i++)
         draw_text(fb, 16, LIST_TOP + 12 + i * 30, lines[i], COL_TEXT, 2, FB_W - 16);
     if (update_running)
         draw_text(fb, 16, FB_H - 40, "WORKING...", COL_ACCENT, 2, 0);
+    else if (update_died)
+        draw_text(fb, 16, FB_H - 40, "UPDATE STOPPED - TAP BACK", COL_WARN, 2, 0);
     else
         draw_text(fb, 16, FB_H - 40, "TAP BACK WHEN READY", COL_DIM, 2, 0);
 }
