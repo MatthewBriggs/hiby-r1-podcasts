@@ -24,11 +24,55 @@ BEGIN {
 }
 
 # Decodes once; see unescape_full for feeds that escape twice.
+# Numeric character references, which some feeds use for nearly all punctuation
+# — The Incomparable emits &#8217; several thousand times in one feed. Left alone
+# they reach the screen verbatim. The renderer already carries the Latin and
+# General Punctuation glyphs these decode to, so this was the missing half.
+function cp_to_utf8(c) {
+    if (c < 128)  return sprintf("%c", c)
+    if (c < 2048) return sprintf("%c%c", 192 + int(c / 64), 128 + (c % 64))
+    return sprintf("%c%c%c", 224 + int(c / 4096), 128 + int(c / 64) % 64, 128 + (c % 64))
+}
+
+function entity_value(e,   t, v, i, ch, d) {
+    t = substr(e, 3, length(e) - 3)          # strip the leading &# and the ;
+    if (t ~ /^[xX]/) {
+        t = substr(t, 2)
+        if (t == "") return 0
+        v = 0
+        for (i = 1; i <= length(t); i++) {
+            ch = tolower(substr(t, i, 1))
+            d = index("0123456789abcdef", ch) - 1
+            if (d < 0) return 0
+            v = v * 16 + d
+        }
+        return v
+    }
+    if (t ~ /^[0-9]+$/) return t + 0
+    return 0
+}
+
+function decode_numeric(s,   out, pre, body, c) {
+    out = ""
+    while (match(s, /&#[0-9]+;|&#[xX][0-9a-fA-F]+;/)) {
+        pre  = substr(s, 1, RSTART - 1)
+        body = substr(s, RSTART, RLENGTH)
+        s    = substr(s, RSTART + RLENGTH)
+        c = entity_value(body)
+        # Control characters get stripped downstream anyway, and anything past
+        # the BMP needs a fourth byte this does not emit. Leave both as they
+        # came rather than writing something malformed into a filename.
+        out = out pre ((c >= 32 && c <= 65535) ? cp_to_utf8(c) : body)
+    }
+    return out s
+}
+
 function unescape(s) {
     gsub(/&quot;/,  "\"", s)
     gsub(/&apos;/,  "'",  s)
-    gsub(/&#39;/,   "'",  s)
-    gsub(/&#34;/,   "\"", s)
+    gsub(/&#39;/,   "'",  s)     # kept explicit so the two commonest survive
+    gsub(/&#34;/,   "\"", s)     # even where sprintf("%c") cannot be trusted
+    s = decode_numeric(s)
     gsub(/&lt;/,    "(",  s)
     gsub(/&gt;/,    ")",  s)
     gsub(/&nbsp;/,  " ",  s)
@@ -38,7 +82,7 @@ function unescape(s) {
 
 function unescape_full(s) {
     s = unescape(s)
-    if (s ~ /&(amp|quot|apos|lt|gt|#3[49]);/) s = unescape(s)
+    if (s ~ /&(amp|quot|apos|lt|gt|nbsp);|&#[0-9xX]/) s = unescape(s)
     return s
 }
 
