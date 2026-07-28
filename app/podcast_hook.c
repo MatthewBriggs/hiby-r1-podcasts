@@ -775,18 +775,36 @@ static void load_episodes(const char *feed) {
     DIR *d = opendir(dir);
     if (!d) return;
     struct dirent *e;
-    while ((e = readdir(d)) && episode_count < MAX_ITEMS) {
+    /* Nothing is ever deleted automatically, so a long-running feed will exceed
+     * MAX_ITEMS. Stopping at the first MAX_ITEMS the directory happens to list
+     * would then hide new episodes behind old ones — readdir order on FAT32 is
+     * roughly creation order, not date order, and the sort below only reorders
+     * whatever survived. So once full, displace the oldest entry instead. */
+    while ((e = readdir(d))) {
         if (e->d_name[0] == '.') continue;
         if (!is_audio(e->d_name)) continue;
-        snprintf(episode_paths[episode_count], PATH_LEN, "%s/%s", dir, e->d_name);
+
+        char path[PATH_LEN];
+        snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
         struct stat st;
-        episode_mtime[episode_count] =
-            (stat(episode_paths[episode_count], &st) == 0) ? (long)st.st_mtime : 0;
+        long mt = (stat(path, &st) == 0) ? (long)st.st_mtime : 0;
+
+        int slot;
+        if (episode_count < MAX_ITEMS) {
+            slot = episode_count++;
+        } else {
+            slot = 0;
+            for (int i = 1; i < MAX_ITEMS; i++)
+                if (episode_mtime[i] < episode_mtime[slot]) slot = i;
+            if (mt <= episode_mtime[slot]) continue;   /* older than all we hold */
+        }
+
+        snprintf(episode_paths[slot], PATH_LEN, "%s", path);
+        episode_mtime[slot] = mt;
         /* Show the title without its extension; the list is the only label. */
-        snprintf(episodes[episode_count], NAME_LEN, "%s", e->d_name);
-        char *dot = strrchr(episodes[episode_count], '.');
+        snprintf(episodes[slot], NAME_LEN, "%s", e->d_name);
+        char *dot = strrchr(episodes[slot], '.');
         if (dot) *dot = '\0';
-        episode_count++;
     }
     closedir(d);
     sort_episodes();
