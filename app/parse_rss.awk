@@ -62,7 +62,12 @@ function decode_numeric(s,   out, pre, body, c) {
         # Control characters get stripped downstream anyway, and anything past
         # the BMP needs a fourth byte this does not emit. Leave both as they
         # came rather than writing something malformed into a filename.
-        out = out pre ((c >= 32 && c <= 65535) ? cp_to_utf8(c) : body)
+        #
+        # Spelled out rather than folded into a ternary inside the concatenation:
+        # busybox awk fails to resolve a user function called from there and
+        # aborts the whole feed with "Call to undefined function".
+        if (c >= 32 && c <= 65535) body = cp_to_utf8(c)
+        out = out pre body
     }
     return out s
 }
