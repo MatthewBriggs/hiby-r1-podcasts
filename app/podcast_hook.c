@@ -1002,9 +1002,45 @@ static int handle_tap(int x, int y) {
 }
 
 /* ---- tile entry --------------------------------------------------------- */
+/* Ask the stock player to stop before we take over.
+ *
+ * Taking the framebuffer and the input nodes does not touch its decode thread,
+ * so opening this app while music was playing left two streams running at once:
+ * audible together, and twice the decode, resampling and buffering on a device
+ * that already OOMs under one. This has to happen before the EVIOCGRABs below,
+ * because once the key nodes are grabbed the player can no longer see a press.
+ *
+ * Only when something really is playing. The key is a toggle, so sending it
+ * blind would *start* the music of anyone who opened the app from idle. */
+static void pause_stock_playback(void) {
+    FILE *f = fopen("/proc/asound/card0/pcm0p/sub0/status", "r");
+    if (!f) return;
+    char line[128];
+    int running = 0;
+    while (fgets(line, sizeof(line), f))
+        if (strstr(line, "RUNNING")) { running = 1; break; }
+    fclose(f);
+    if (!running) return;
+
+    int fd = open("/dev/input/event2", O_WRONLY);
+    if (fd < 0) return;
+    struct input_event ev[4];
+    memset(ev, 0, sizeof(ev));
+    ev[0].type = EV_KEY; ev[0].code = KEY_PLAYPAUSE; ev[0].value = 1;
+    ev[1].type = EV_SYN; ev[1].code = SYN_REPORT;  ev[1].value = 0;
+    ev[2].type = EV_KEY; ev[2].code = KEY_PLAYPAUSE; ev[2].value = 0;
+    ev[3].type = EV_SYN; ev[3].code = SYN_REPORT;  ev[3].value = 0;
+    if (write(fd, ev, sizeof(ev)) != (ssize_t)sizeof(ev))
+        plog("[podcast] pause key write failed: %s\n", strerror(errno));
+    else
+        plog("[podcast] stock playback was running; sent pause\n");
+    close(fd);
+}
+
 static int podcast_entry(void *arg0, void *arg1) {
     (void)arg0; (void)arg1;
     plog("[podcast] entering app\n");
+    pause_stock_playback();
 
     screen = SCREEN_FEEDS;
     feed_sel = ep_sel = -1;

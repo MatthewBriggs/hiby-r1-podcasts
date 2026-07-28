@@ -148,18 +148,52 @@ static int bt_sink_connected(void) {
     return found;
 }
 
+/* A USB DAC enumerates as its own ALSA card, so "plughw:0,0" — the internal
+ * CS43131 — would keep playing out of the headphone jack while the stock player
+ * correctly follows the USB output. Find the first card that is not card 0 and
+ * prefer it, which is the same rule the Bluetooth check above applies. */
+static int usb_card(void) {
+    FILE *f = fopen("/proc/asound/cards", "r");
+    if (!f) return -1;
+    char line[256];
+    int card = -1;
+    while (fgets(line, sizeof(line), f)) {
+        int n;
+        /* Entries look like " 1 [Audio          ]: USB-Audio - ..." */
+        if (sscanf(line, " %d [", &n) == 1 && n > 0 &&
+            (strstr(line, "USB") || strstr(line, "usb"))) {
+            card = n;
+            break;
+        }
+    }
+    fclose(f);
+    return card;
+}
+
 static void *pcm_open(unsigned int rate, int channels) {
     void *pcm = NULL;
     /* Route to Bluetooth when a sink is connected, otherwise the wired DAC.
      * "bluealsa" is the predefined plug device and auto-selects the most recent
      * sink, converting rate/format as needed. */
+    char usb[24];
     const char *wired[] = { "plughw:0,0", "default", "hw:0,0" };
+    const char *usbdev[] = { usb, "default" };
     const char *bt[]    = { "bluealsa" };
+
     int use_bt = bt_sink_connected();
+    int ucard  = use_bt ? -1 : usb_card();
     g_using_bt = use_bt;
-    const char **names = use_bt ? bt : wired;
-    unsigned count = use_bt ? 1 : 3;
-    alog("[audio] output: %s\n", use_bt ? "bluetooth" : "wired");
+
+    const char **names = wired;
+    unsigned count = 3;
+    if (use_bt) {
+        names = bt; count = 1;
+    } else if (ucard > 0) {
+        snprintf(usb, sizeof(usb), "plughw:%d,0", ucard);
+        names = usbdev; count = 2;
+    }
+    alog("[audio] output: %s\n",
+         use_bt ? "bluetooth" : (ucard > 0 ? usb : "wired"));
 
     for (unsigned i = 0; i < count; i++) {
         int rc = x_open(&pcm, names[i], SND_PCM_STREAM_PLAYBACK, 0);
