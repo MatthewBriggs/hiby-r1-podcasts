@@ -169,19 +169,21 @@ int text_width(const char *s, int px) {
     return w;
 }
 
-int text_draw(uint16_t *fb, int fb_w, int fb_h, int x, int y,
-              const char *s, uint16_t colour, int px, int right_edge) {
-    if (!g_ready && text_init() != 0) return x;
-    size_cache_t *c = cache_for(px);
-    if (!c) return x;
-    if (right_edge <= 0 || right_edge > fb_w) right_edge = fb_w;
-
+/* Draws until the next glyph would cross `limit`. Sets *stopped when it ran out
+ * of room rather than out of string, which is what tells the caller a marker is
+ * needed. `s` is only advanced once a glyph is committed, so a run that stops on
+ * the very last character is still reported as truncated. */
+static int draw_run(uint16_t *fb, int fb_w, int fb_h, int x, int y,
+                    const char *s, uint16_t colour, size_cache_t *c,
+                    int limit, int *stopped) {
     unsigned cp;
+    if (stopped) *stopped = 0;
     while (*s) {
-        s = utf8_next(s, &cp);
+        const char *next = utf8_next(s, &cp);
         glyph_t *g = glyph_for(c, cp);
-        if (!g) continue;
-        if (x + g->adv > right_edge) break;
+        if (!g) { s = next; continue; }
+        if (x + g->adv > limit) { if (stopped) *stopped = 1; break; }
+        s = next;
 
         if (g->bitmap) {
             int gx = x + g->xoff;
@@ -193,7 +195,7 @@ int text_draw(uint16_t *fb, int fb_w, int fb_h, int x, int y,
                 uint16_t *dst = fb + (size_t)py * fb_w;
                 for (int col = 0; col < g->w; col++) {
                     int pxx = gx + col;
-                    if (pxx < 0 || pxx >= right_edge) continue;
+                    if (pxx < 0 || pxx >= limit) continue;
                     unsigned a = src[col];
                     if (a) dst[pxx] = blend(dst[pxx], colour, a);
                 }
@@ -201,5 +203,32 @@ int text_draw(uint16_t *fb, int fb_w, int fb_h, int x, int y,
         }
         x += g->adv;
     }
+    return x;
+}
+
+/* Three ASCII dots rather than U+2026: the only usable face on this device is a
+ * CJK font, where the real ellipsis is full-width and would sit oddly — the same
+ * reason the feed parser folds curly quotes to their straight forms. */
+#define ELLIPSIS "..."
+
+int text_draw(uint16_t *fb, int fb_w, int fb_h, int x, int y,
+              const char *s, uint16_t colour, int px, int right_edge) {
+    if (!g_ready && text_init() != 0) return x;
+    size_cache_t *c = cache_for(px);
+    if (!c) return x;
+    if (right_edge <= 0 || right_edge > fb_w) right_edge = fb_w;
+
+    /* Reserve room for the marker only when the string actually overflows, so
+     * text that fits is laid out exactly as before. */
+    int ell_w = 0;
+    if (text_width(s, px) > right_edge - x) {
+        ell_w = text_width(ELLIPSIS, px);
+        if (ell_w > right_edge - x) ell_w = 0;   /* not even room for dots */
+    }
+
+    int stopped = 0;
+    x = draw_run(fb, fb_w, fb_h, x, y, s, colour, c, right_edge - ell_w, &stopped);
+    if (stopped && ell_w)
+        x = draw_run(fb, fb_w, fb_h, x, y, ELLIPSIS, colour, c, right_edge, NULL);
     return x;
 }

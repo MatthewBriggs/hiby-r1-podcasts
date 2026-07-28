@@ -571,8 +571,14 @@ static void draw_progress_marker(uint16_t *fb, int x, int y, int idx) {
     if (idx < 0 || idx >= episode_count) return;
     int ms = episode_resume[idx];
     if (ms == 0) return;                       /* untouched */
+    /* Right-align by measuring, not by guessing. The offsets here were once
+     * fixed pixel counts carried over from the 5x7 bitmap font, which no longer
+     * match the TrueType metrics — the text overflowed FB_W and was silently
+     * clipped, and became visible only once truncation started drawing an
+     * ellipsis. */
     if (ms < 0) {
-        draw_text(fb, x - 26, y - 4, "DONE", COL_ACCENT, 2, FB_W);
+        int w = text_width("DONE", scale_px(2));
+        draw_text(fb, x + 14 - w, y - 4, "DONE", COL_ACCENT, 2, FB_W);
         return;
     }
     int dur = episode_dur[idx];
@@ -581,7 +587,8 @@ static void draw_progress_marker(uint16_t *fb, int x, int y, int idx) {
         if (pct > 99) pct = 99;
         char t[8];
         snprintf(t, sizeof(t), "%d%%", pct);
-        draw_text(fb, x - (pct >= 10 ? 26 : 14), y - 4, t, COL_ACCENT, 2, FB_W);
+        int w = text_width(t, scale_px(2));
+        draw_text(fb, x + 14 - w, y - 4, t, COL_ACCENT, 2, FB_W);
     } else {
         fill_rect(fb, x, y, 14, 14, COL_BAR_BG);
         fill_rect(fb, x, y + 7, 14, 7, COL_ACCENT);
