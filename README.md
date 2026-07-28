@@ -112,9 +112,22 @@ annoying thing about this device:
 adb shell mkdir -p /data/mnt/sd_0/.podsync && adb push app/podsync_once.sh app/parse_rss.awk /data/mnt/sd_0/.podsync/
 ```
 
+The device has **no CA store at all** and `/etc` is read-only, so curl needs a
+bundle on the card. Take Mozilla's, as published by the curl project — it is
+dated, maintained, and freely redistributable, which a system trust store copied
+off your own machine is not:
+
+```bash
+curl -fLo cacert.pem https://curl.se/ca/cacert.pem
+```
+
 ```bash
 adb push curl cacert.pem /data/mnt/sd_0/.podsync/ && adb shell chmod 755 /data/mnt/sd_0/.podsync/curl
 ```
+
+Refresh it once in a while. Root certificates get rotated and a stale bundle
+fails as a TLS error against one feed at a time, which reads like a broken feed
+rather than an expired trust store.
 
 Then write your subscriptions and reboot:
 
