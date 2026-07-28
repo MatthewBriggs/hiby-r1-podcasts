@@ -52,9 +52,20 @@ fi
 # up in filenames, where it looks like a space but breaks matching and quoting.
 NBSP=$(printf '\302\240')
 
+# busybox `cut -c` counts bytes, not characters — verified on the device — so a
+# 70-byte cut can land inside a multi-byte character and leave a dangling
+# fragment in the filename, which then draws as a stray '?'. These two rules
+# remove only an *incomplete* trailing sequence: a lone lead byte, or a
+# three-byte sequence that lost its final continuation. A complete character
+# matches neither, because a continuation byte is never in the lead range.
+UTF8_LEAD=$(printf '[\300-\377]')
+UTF8_PART=$(printf '[\340-\377][\200-\277]')
+
 sanitize() {
     echo "$1" | sed -e "s/$NBSP/ /g" -e 's/:/ -/g' -e 's/["<>|?*\/\\]//g' -e 's/[[:cntrl:]]//g' \
-                    -e 's/  */ /g' -e 's/^[ .-]*//' -e 's/[ .]*$//' | cut -c1-70
+                    -e 's/  */ /g' -e 's/^[ .-]*//' -e 's/[ .]*$//' \
+        | cut -c1-70 \
+        | sed -e "s/$UTF8_PART\$//" -e "s/$UTF8_LEAD\$//" -e 's/[ .]*$//'
 }
 
 get() { "$CURL" -fsSL --cacert "$CA" --connect-timeout 20 --max-time 900 -o "$2" "$1" 2>>"$LOG"; }
