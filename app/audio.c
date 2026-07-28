@@ -81,6 +81,7 @@ static const char *g_err;
 
 /* Playback state, guarded by g_lock. */
 static pthread_t       g_thread;
+static int             g_thread_valid;  /* g_thread names a thread still to be joined */
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static int   g_running;      /* worker should keep going */
 static int   g_active;       /* a file is loaded */
@@ -393,15 +394,27 @@ int audio_play(const char *path, int start_ms) {
         pthread_mutex_unlock(&g_lock);
         return -1;
     }
+    pthread_mutex_lock(&g_lock);
+    g_thread_valid = 1;
+    pthread_mutex_unlock(&g_lock);
     return 0;
 }
 
 void audio_stop(void) {
+    /* Join on "a thread exists", not on "it is still running". The worker
+     * clears g_running itself when it reaches the end of a file or bails out
+     * early, so keying the join off that flag skipped it exactly when the
+     * thread had finished on its own — and audio_play then overwrote g_thread,
+     * losing the id for good. An exited-but-unjoined thread keeps its stack
+     * reservation until the process ends, and this process is hiby_player,
+     * which stays up for as long as the device does and runs everything else
+     * on it. */
     pthread_mutex_lock(&g_lock);
-    int was = g_running;
     g_running = 0;
+    int join = g_thread_valid;
+    g_thread_valid = 0;
     pthread_mutex_unlock(&g_lock);
-    if (was) pthread_join(g_thread, NULL);
+    if (join) pthread_join(g_thread, NULL);
     pthread_mutex_lock(&g_lock);
     g_active = 0; g_paused = 0; g_pos_ms = 0; g_dur_ms = 0;
     pthread_mutex_unlock(&g_lock);
