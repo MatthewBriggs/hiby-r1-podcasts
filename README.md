@@ -40,10 +40,12 @@ patched on disk; the stock binary is untouched.
 
 - A HiBy R1 running
   [yetisoldier's Audiobook Mod](https://github.com/yetisoldier/Hiby-R1-Audiobook-Mod)
-  (developed against **2.0.25**). That mod provides the `LD_PRELOAD` supervisor
-  in `/usr/bin/hiby_player.sh` that this app hooks into.
+  — verified against **2.0.25** and **2.0.26**. That mod provides the
+  `LD_PRELOAD` supervisor this app hooks into, and its `.upt` is the input to
+  the patcher below. You need the `.upt` file itself, not just a modded device.
 - An SD card.
-- ADB over USB for installation.
+- ADB over USB, and **willingness to reflash** — see [Install](#install).
+- On the host: Python with `pycdlib`, and `squashfs-tools`, to patch the image.
 
 > The tile addresses are specific to the `hiby_player` binary they were read
 > out of. On a different firmware build they will point somewhere else, and the
@@ -51,6 +53,45 @@ patched on disk; the stock binary is untouched.
 > [Porting](#porting-to-another-firmware-build).
 
 ## Install
+
+There are two halves to this, and the first one is a firmware flash. The app is
+an `LD_PRELOAD` library, and what loads it is `/usr/bin/hiby_player.sh` — which
+lives on a read-only squashfs and **cannot be pushed to the device**. It has to
+go in through a firmware image.
+
+### 1. Patch your firmware
+
+Take the `.upt` for whichever Audiobook Mod release you run and patch it. The
+tool never redistributes anyone's firmware; it reads yours and writes a new one:
+
+```bash
+pip install pycdlib && brew install squashfs   # or your distro's squashfs-tools
+```
+
+```bash
+./tools/patch_firmware.py r1-audiobooks-2.0.26.upt r1-podcast-2.0.26.upt
+```
+
+Check it before you flash anything. This verifies every digest the updater
+checks, and diffs the rootfs against the original so you can see that exactly
+one file changed:
+
+```bash
+./tools/verify_firmware.py r1-podcast-2.0.26.upt --against r1-audiobooks-2.0.26.upt
+```
+
+It must end with `RESULT: image verifies`. The one changed file is
+`usr/bin/hiby_player.sh`; the patch applied is
+[`app/hiby_player.sh`](app/hiby_player.sh), kept in the repo for reference.
+
+Flash it the same way you flashed the mod — copy it to the SD card and use the
+player's firmware update — then come back for the second half.
+
+> The patcher matches the mod's supervisor exactly and stops if it does not
+> recognise it, rather than guessing. If a future release changes that script,
+> patch it by hand from `app/hiby_player.sh`.
+
+### 2. Install the app
 
 Build (or take `libpodcast_hook.so` from a release), then:
 

@@ -19,7 +19,7 @@ HOOK_LIB="/usr/lib/libaudiobook_hook.so"
 CRASH_COUNT=0
 MAX_CRASHES=5
 
-# --- local additions -------------------------------------------------------
+# --- podcast app additions -------------------------------------------------
 # The rootfs is read-only squashfs, so there is otherwise no way to start user
 # code at boot or to load a second preload without reflashing. Both hooks below
 # read from /usr/data, which is writable and survives a firmware update.
@@ -63,7 +63,6 @@ while true; do
     else
         CRASH_COUNT=$((CRASH_COUNT + 1))
     fi
-
     if [ "$CRASH_COUNT" -ge "$MAX_CRASHES" ]; then
         reboot
     fi
