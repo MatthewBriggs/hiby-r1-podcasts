@@ -60,12 +60,40 @@ NBSP=$(printf '\302\240')
 # matches neither, because a continuation byte is never in the lead range.
 UTF8_LEAD=$(printf '[\300-\377]')
 UTF8_PART=$(printf '[\340-\377][\200-\277]')
+# Same curly-quote folding the parser does, repeated here so that sanitize() is
+# the single normaliser: running it over an already-sanitised name must be a
+# no-op, which is what lets adopt_existing below recognise a renamed episode.
+SQ=$(printf '\342\200\230\|\342\200\231')
+DQ=$(printf '\342\200\234\|\342\200\235')
 
 sanitize() {
-    echo "$1" | sed -e "s/$NBSP/ /g" -e 's/:/ -/g' -e 's/["<>|?*\/\\]//g' -e 's/[[:cntrl:]]//g' \
+    echo "$1" | sed -e "s/$NBSP/ /g" -e "s/$SQ/'/g" -e "s/$DQ/\"/g" \
+                    -e 's/:/ -/g' -e 's/["<>|?*\/\\]//g' -e 's/[[:cntrl:]]//g' \
                     -e 's/  */ /g' -e 's/^[ .-]*//' -e 's/[ .]*$//' \
         | cut -c1-70 \
         | sed -e "s/$UTF8_PART\$//" -e "s/$UTF8_LEAD\$//" -e 's/[ .]*$//'
+}
+
+# Every change to sanitize() renames what future downloads are called, and an
+# episode already on the card then stops being recognised and is fetched a
+# second time under the new name — which is exactly what the NBSP fix did to
+# Språket. If a file already here normalises to the name we are about to use,
+# adopt it instead of downloading it again.
+adopt_existing() {
+    _dir=$1; _base=$2; _ext=$3
+    for _old in "$_dir"/*."$_ext"; do
+        [ -f "$_old" ] || continue
+        _oldname=${_old##*/}
+        _oldbase=${_oldname%.*}
+        [ "$_oldbase" = "$_base" ] && return 1
+        if [ "$(sanitize "$_oldbase")" = "$_base" ]; then
+            mv "$_old" "$_dir/$_base.$_ext"
+            [ -f "$_dir/$_oldbase.txt" ] && mv "$_dir/$_oldbase.txt" "$_dir/$_base.txt"
+            log "  renamed: $_oldbase"
+            return 0
+        fi
+    done
+    return 1
 }
 
 get() { "$CURL" -fsSL --cacert "$CA" --connect-timeout 20 --max-time 900 -o "$2" "$1" 2>>"$LOG"; }
@@ -140,6 +168,7 @@ while read -r url; do
         fi
 
         [ -f "$out" ] && continue
+        adopt_existing "$dir" "$base" "$ext" && continue
 
         log "  downloading $base"
         if get "$epurl" "$out.part" && [ -s "$out.part" ]; then

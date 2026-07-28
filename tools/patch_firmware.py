@@ -181,32 +181,41 @@ def write_upt(out_path, images, manifest, meta, version_blob, version_num):
     iso = pycdlib.PyCdlib()
     iso.new(interchange_level=1, vol_ident="CDROM",
             joliet=3, rock_ridge="1.09")
-    iso.add_directory("/D0000001", joliet_path="/D0000001", rr_name="D0000001")
+    iso.add_directory("/D0000001", joliet_path="/ota_v0", rr_name="ota_v0")
 
-    def add(data, path):
-        name = path.rsplit("/", 1)[1]
-        iso.add_fp(io.BytesIO(data), len(data), path,
-                   joliet_path=path.replace(";1", ""), rr_name=name.replace(";1", ""))
+    def add(data, iso_path, real):
+        """Every file carries an 8.3 ISO name plus its real name in Joliet/RR."""
+        iso.add_fp(io.BytesIO(data), len(data), iso_path,
+                   joliet_path="/ota_v0/" + real if "/D0000001/" in iso_path
+                   else "/" + real,
+                   rr_name=real)
 
     def chunks(d):
         return [d[i:i + CHUNK] for i in range(0, len(d), CHUNK)]
 
-    digests = []
+    per_chunk, whole = [], []
     for img in images:
-        digests.append("".join(hashlib.md5(c).hexdigest() + "\n"
-                               for c in chunks(img["data"])).encode())
+        per_chunk.append([hashlib.md5(c).hexdigest() for c in chunks(img["data"])])
+        whole.append(hashlib.md5(img["data"]).hexdigest())
 
-    add(digests[0], "/D0000001/F0000002.BIN;1")
-    add(digests[1], "/D0000001/F0000003.BIN;1")
-    add(manifest.encode(), "/D0000001/F0000004.TXT;1")
-    add(meta, "/D0000001/F0000005.TXT;1")
+    add("".join(h + "\n" for h in per_chunk[0]).encode(), "/D0000001/F0000002.BIN;1",
+        f"ota_md5_{images[0]['name']}.{whole[0]}")
+    add("".join(h + "\n" for h in per_chunk[1]).encode(), "/D0000001/F0000003.BIN;1",
+        f"ota_md5_{images[1]['name']}.{whole[1]}")
+    add(manifest.encode(), "/D0000001/F0000004.TXT;1", "ota_update.in")
+    add(meta, "/D0000001/F0000005.TXT;1", "ota_v0.ok")
 
     n = 6
-    for img in images:
-        for c in chunks(img["data"]):
-            add(c, f"/D0000001/F{n:07d}.BIN;1")
+    for i, img in enumerate(images):
+        for k, c in enumerate(chunks(img["data"])):
+            # The chunk names form a verification chain: index 0 carries the
+            # digest of the whole image, and every later index carries the
+            # digest of the chunk before it. Getting this wrong is invisible to
+            # a checksum test and leaves the updater stuck on "Upgrading...".
+            digest = whole[i] if k == 0 else per_chunk[i][k - 1]
+            add(c, f"/D0000001/F{n:07d}.BIN;1", f"{img['name']}.{k:04d}.{digest}")
             n += 1
-    add(version_blob, f"/F{n:07d}.TXT;1")
+    add(version_blob, f"/F{n:07d}.TXT;1", "ota_config.in")
     iso.write(out_path)
     iso.close()
     return n

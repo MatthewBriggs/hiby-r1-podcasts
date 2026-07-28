@@ -61,6 +61,65 @@ def load(path):
     return images, chunk_digests, listed, version, n
 
 
+def check_structure(path, images, chunk_digests):
+    """Validate the parts a checksum test cannot see.
+
+    An image can have every digest correct and still be unreadable to the
+    device. The stock images carry Joliet and Rock Ridge, and those extensions
+    hold the *real* filenames — the F00000NN.BIN names are 8.3 fallbacks. Those
+    real names encode a chain: index 0000 carries the digest of the whole image
+    and each later index carries the digest of the chunk before it. An image
+    built without any of this verifies perfectly here and then hangs the
+    updater on "Upgrading..." forever, which is exactly what happened once.
+    """
+    import pycdlib
+    iso = pycdlib.PyCdlib(); iso.open(path)
+    problems = []
+
+    if not iso.has_joliet():
+        problems.append("no Joliet extension")
+    if not iso.has_rock_ridge():
+        problems.append("no Rock Ridge extension")
+
+    def rr(rec):
+        return rec.rock_ridge.name().decode() if rec.rock_ridge and rec.rock_ridge.name() else ""
+
+    root = {}
+    for c in iso.list_children(iso_path="/"):
+        n = c.file_identifier().decode(errors="replace")
+        if n not in (".", ".."):
+            root[n] = rr(c)
+    if root.get("D0000001") != "ota_v0":
+        problems.append(f"payload dir is {root.get('D0000001')!r}, expected 'ota_v0'")
+    if "ota_config.in" not in root.values():
+        problems.append("no ota_config.in at the root")
+
+    names = []
+    for c in iso.list_children(iso_path="/D0000001"):
+        n = c.file_identifier().decode(errors="replace")
+        if n not in (".", ".."):
+            names.append(rr(c))
+    for want in ("ota_update.in", "ota_v0.ok"):
+        if want not in names:
+            problems.append(f"missing {want}")
+
+    # The chain: <image>.<index>.<digest of the previous item>.
+    chunk_names = [n for n in names if re.match(r".+\.\d{4}\.[0-9a-f]{32}$", n)]
+    expected = []
+    for i, img in enumerate(images):
+        whole = hashlib.md5(img["data"]).hexdigest()
+        for k in range(len(chunk_digests[i])):
+            digest = whole if k == 0 else chunk_digests[i][k - 1]
+            expected.append(f"{img['name']}.{k:04d}.{digest}")
+    if chunk_names != expected:
+        bad = next((a for a, b in zip(chunk_names, expected) if a != b), None)
+        problems.append(f"chunk name chain wrong (first bad: {bad or 'count mismatch'})")
+
+    first = iso.get_record(iso_path="/D0000001/F0000006.BIN;1").extent_location()
+    iso.close()
+    return problems, first
+
+
 def unpack_rootfs(data, dest):
     sq = os.path.join(dest, "r.squashfs")
     with open(sq, "wb") as fh:
@@ -111,6 +170,17 @@ def main():
         print(f"    chunk digests {'OK' if chunks_ok else 'MISMATCH'} "
               f"({len(chunk_digests[i])} chunks from F{img['first']:07d})")
     print(f"\n  version entry   F{last:07d}.TXT = {version!r}")
+
+    problems, first_extent = check_structure(args.image, images, chunk_digests)
+    print(f"\n  structure       Joliet + Rock Ridge, chunk-name chain")
+    print(f"    first chunk extent {first_extent}"
+          f"{'' if first_extent == 51 else '  (stock images use 51)'}")
+    if problems:
+        ok = False
+        for p in problems:
+            print(f"    PROBLEM: {p}")
+    else:
+        print("    OK - matches the layout the updater expects")
 
     rootfs = next(i for i in images if i["type"] == "rootfs")
     with tempfile.TemporaryDirectory(prefix="r1verify-") as tmp:
