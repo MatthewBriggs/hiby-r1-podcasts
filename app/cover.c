@@ -28,6 +28,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "vendor/jpeg9/jpeglib.h"
 #include "cover.h"
@@ -100,6 +102,16 @@ static void cache_path(const char *jpg, int px, char *out, size_t n) {
 static uint16_t *load_cache(const char *jpg, int px) {
     char p[512];
     cache_path(jpg, px, p, sizeof(p));
+
+    /* Replacing cover.jpg by hand is the documented way to give a feed art the
+     * decoder refuses (see the progressive-JPEG limit), so a cache older than
+     * the file it came from has to lose. */
+    struct stat cs, js;
+    if (stat(p, &cs) == 0 && stat(jpg, &js) == 0 && js.st_mtime > cs.st_mtime) {
+        unlink(p);
+        return NULL;
+    }
+
     FILE *f = fopen(p, "rb");
     if (!f) return NULL;
     size_t want = (size_t)px * px;

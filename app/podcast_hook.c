@@ -839,13 +839,22 @@ static void scroll_by(int rows, int count) {
 
 
 static void save_position(void) {
-    if (cur_path[0] && audio_duration_ms() > 0) {
-        int pos = audio_position_ms();
-        /* A sentinel rather than 0, so "finished" and "never started" stay
-         * distinguishable in the episode list. */
-        if (pos > audio_duration_ms() - 5000) pos = POS_FINISHED;
-        resume_store(cur_path, pos, audio_duration_ms());
-    }
+    if (!cur_path[0] || audio_duration_ms() <= 0) return;
+    int pos = audio_position_ms();
+    /* A sentinel rather than 0, so "finished" and "never started" stay
+     * distinguishable in the episode list. */
+    if (pos > audio_duration_ms() - 5000) pos = POS_FINISHED;
+
+    /* Checkpointing runs on a timer, not on movement, so a paused episode left
+     * on this screen would rewrite the whole file to the card every few seconds
+     * with a value that never changes. */
+    static int  last_ms = -1;
+    static char last_path[PATH_LEN];
+    if (pos == last_ms && strcmp(last_path, cur_path) == 0) return;
+
+    resume_store(cur_path, pos, audio_duration_ms());
+    last_ms = pos;
+    snprintf(last_path, sizeof(last_path), "%s", cur_path);
 }
 
 /* Returns 1 to keep running, 0 to leave the app. */

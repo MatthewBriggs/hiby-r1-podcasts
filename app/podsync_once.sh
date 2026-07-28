@@ -61,7 +61,12 @@ get() { "$CURL" -fsSL --cacert "$CA" --connect-timeout 20 --max-time 900 -o "$2"
 
 total_new=0
 
-grep -v '^[[:space:]]*#' "$FEEDS" 2>/dev/null | grep -v '^[[:space:]]*$' | while read -r url; do
+# Read the feed list from a file rather than a pipe. `... | while read` runs the
+# loop in a subshell, so every count it kept was discarded when the loop ended
+# and the run could never report what it had done.
+grep -v '^[[:space:]]*#' "$FEEDS" 2>/dev/null | grep -v '^[[:space:]]*$' > "$TMP/feeds.list"
+
+while read -r url; do
     url=$(echo "$url" | tr -d '\r')
     [ -z "$url" ] && continue
 
@@ -130,12 +135,22 @@ grep -v '^[[:space:]]*#' "$FEEDS" 2>/dev/null | grep -v '^[[:space:]]*$' | while
             [ -n "$pubdate" ] && touch -d "$pubdate" "$out" 2>/dev/null
             total_new=$((total_new + 1))
             log "  ok $base"
+            # The player decodes MP3 only. Downloading anything else is still
+            # worth doing — it can be copied off the card — but silently listing
+            # an episode that will never play is worse than saying so.
+            [ "$ext" = mp3 ] || log "  note - .$ext will not play, MP3 only"
         else
             rm -f "$out.part"
             log "  FAILED $base"
         fi
     done < "$TMP/eps.txt"
-done
+done < "$TMP/feeds.list"
 
-log "update complete"
+if [ "$total_new" -eq 0 ]; then
+    log "update complete - no new episodes"
+elif [ "$total_new" -eq 1 ]; then
+    log "update complete - 1 new episode"
+else
+    log "update complete - $total_new new episodes"
+fi
 log "__DONE__"
