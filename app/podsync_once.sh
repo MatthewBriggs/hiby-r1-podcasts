@@ -130,8 +130,12 @@ while read -r url; do
         out="$dir/$base.$ext"
 
         # Write show notes even when the audio is already present, so episodes
-        # downloaded before this existed still get them.
-        if [ -n "$notes" ] && [ ! -f "$dir/$base.txt" ]; then
+        # downloaded before this existed still get them. Rewrite rather than
+        # skip when the file exists: the feed is the source of truth, and only
+        # overwriting lets an episode fetched by an older, worse parser pick up
+        # the corrected text — otherwise a library keeps its mangled entities
+        # for as long as the episodes stay on the card.
+        if [ -n "$notes" ]; then
             printf '%s\n' "$notes" > "$dir/$base.txt"
         fi
 

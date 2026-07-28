@@ -85,10 +85,23 @@ function unescape(s) {
     return s
 }
 
+# The only usable TrueType face on the device is msyh.ttf, a CJK font, and in it
+# U+2018/2019/201C/201D are full-width: a curly apostrophe mid-word draws with a
+# visible gap either side ("Nolan’ s"). The straight forms carry the same meaning
+# and are the right width, which matters more on a 480px screen. Dashes and
+# ellipses are left alone — they are meant to be wide.
+function narrow_quotes(s) {
+    gsub(cp_to_utf8(8216), "'", s)
+    gsub(cp_to_utf8(8217), "'", s)
+    gsub(cp_to_utf8(8220), "\"", s)
+    gsub(cp_to_utf8(8221), "\"", s)
+    return s
+}
+
 function unescape_full(s) {
     s = unescape(s)
     if (s ~ /&(amp|quot|apos|lt|gt|nbsp);|&#[0-9xX]/) s = unescape(s)
-    return s
+    return narrow_quotes(s)
 }
 
 function trim(s) {
