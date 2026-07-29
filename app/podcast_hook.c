@@ -1108,8 +1108,13 @@ static int podcast_entry(void *arg0, void *arg1) {
             else if (kc == KEY_POWER)      set_locked(1);
         }
 
+        /* Keep draining the touch node while locked, and discard what it gives.
+         * Skipping the read instead left events queueing up against our grab —
+         * a pocketful of taps would sit there and then all replay the moment the
+         * screen came back, acting on whatever screen happened to be up. */
         int x, y;
-        int g = (tfd >= 0 && !locked) ? read_gesture(tfd, &x, &y) : 0;
+        int g = (tfd >= 0) ? read_gesture(tfd, &x, &y) : 0;
+        if (locked) g = 0;
         if (g == 2) {
             /* Swipe up scrolls down. */
             if (screen == SCREEN_FEEDS)         scroll_by(-y / ROW_H, feed_count);
