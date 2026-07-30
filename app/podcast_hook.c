@@ -417,11 +417,27 @@ static void resume_store(const char *path, int ms, int dur) {
         }
         fclose(f);
     }
-    f = fopen(RESUME_FILE, "w");
+    /* Write a replacement and rename it over the original rather than
+     * truncating in place. This runs every few seconds while playing, and
+     * opening the real file "w" empties it before a single line is written — so
+     * being killed anywhere in that window left a truncated resume.txt and lost
+     * every saved position, not just the current one. This device does get its
+     * player OOM-killed, so that window was being entered thousands of times a
+     * day.
+     *
+     * No fsync: the failure actually seen is the process dying, and the kernel
+     * still holds the data in that case, so the rename is enough. An fsync here
+     * would put a synchronous SD write in the playback path every five seconds
+     * to buy protection only against power loss, which is the rarer event. */
+    char tmp[sizeof(RESUME_FILE) + 8];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", RESUME_FILE);
+    f = fopen(tmp, "w");
     if (f) {
         if (ms > 3000 || ms == POS_FINISHED) fprintf(f, "%d\t%d\t%s\n", ms, dur, path);
         for (int i = 0; i < n; i++) fputs(keep[i], f);
+        int ok = (fflush(f) == 0);
         fclose(f);
+        if (!ok || rename(tmp, RESUME_FILE) != 0) unlink(tmp);
     }
     free(keep);
 }
