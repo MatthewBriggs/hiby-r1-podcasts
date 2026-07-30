@@ -52,6 +52,36 @@ DEFAULT_ROM_VERSION = "pod1.0"
 CONFIG_JSON = "usr/resource/config.json"
 ABOUT_VERSION_MAX = 7
 
+# Internet radio is already in the firmware — the strings are localised in every
+# settings.ini and the icons ship in every theme — but the Stream media screen
+# only lists it in HiBy's China-region layout. The plain layout has Tidal and
+# Qobuz; the _cn one has those plus net_radio. So "unlocking" it is just using
+# the layout HiBy already wrote, with no invented assets.
+STREAM_LAYOUT_DIRS = (
+    "usr/resource/layout/theme1",
+    "usr/resource/layout/theme2",
+    "usr/resource/layout/midi/theme1",
+)
+
+
+def enable_internet_radio(root):
+    """Point each theme's Stream media screen at the layout with the radio tile."""
+    changed = []
+    for d in STREAM_LAYOUT_DIRS:
+        plain = os.path.join(root, d, "hiby_stream_media.view")
+        cn = os.path.join(root, d, "hiby_stream_media_cn.view")
+        if not (os.path.exists(plain) and os.path.exists(cn)):
+            continue
+        with open(cn, "rb") as fh:
+            want = fh.read()
+        with open(plain, "rb") as fh:
+            if fh.read() == want:
+                continue                 # already swapped
+        with open(plain, "wb") as fh:
+            fh.write(want)
+        changed.append(d)
+    return changed
+
 
 def stamp_config_json(text, rom_rev):
     """Append a one-character revision to the version About displays."""
@@ -310,6 +340,9 @@ def main():
                     help=f"full build string recorded in "
                          f"etc/r1_audiobook_version (default "
                          f"{DEFAULT_ROM_VERSION})")
+    ap.add_argument("--no-radio", action="store_true",
+                    help="do not surface the Internet radio tile on the "
+                         "Stream media screen")
     ap.add_argument("--rom-rev", default="a", metavar="LETTER",
                     help="one character appended to the version shown in "
                          "System -> About; the field is cut to 7 chars and "
@@ -387,6 +420,13 @@ def main():
                 print(f"patched {MOUNT_SCRIPT} (/usr/data: sync -> noatime)")
 
         # Version stamp, so the build is identifiable from the device itself.
+        if not args.no_radio:
+            radio = enable_internet_radio(root)
+            if radio:
+                print(f"enabled Internet radio in {len(radio)} theme layout(s)")
+            else:
+                print("note: Internet radio already enabled, or layouts missing")
+
         ctarget = os.path.join(root, CONFIG_JSON)
         if os.path.exists(ctarget):
             with open(ctarget) as fh:

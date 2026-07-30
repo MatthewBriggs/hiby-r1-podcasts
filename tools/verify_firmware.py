@@ -227,6 +227,12 @@ def main():
                 for k in removed:
                     print(f"    - {k}")
                 expected = {SCRIPT, MOUNT_SCRIPT, CONFIG_JSON, VERSION_FILE}
+                # Internet radio swaps each theme's Stream media layout for
+                # HiBy's own CN variant, which is the one carrying the tile.
+                expected |= {f"{d}/hiby_stream_media.view" for d in (
+                    "usr/resource/layout/theme1",
+                    "usr/resource/layout/theme2",
+                    "usr/resource/layout/midi/theme1")}
                 if set(changed) <= expected and not added and not removed:
                     print(f"    only expected files changed ({len(changed)}), "
                           f"as intended")

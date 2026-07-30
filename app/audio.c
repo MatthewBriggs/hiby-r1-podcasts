@@ -150,24 +150,29 @@ static int bt_sink_connected(void) {
 
 /* A USB DAC enumerates as its own ALSA card, so "plughw:0,0" — the internal
  * CS43131 — would keep playing out of the headphone jack while the stock player
- * correctly follows the USB output. Find the first card that is not card 0 and
- * prefer it, which is the same rule the Bluetooth check above applies. */
+ * correctly follows the USB output. Find that card and prefer it, which is the
+ * same rule the Bluetooth check above applies.
+ *
+ * This reads /sys/class/sound rather than /proc/asound/cards: this kernel is
+ * built without ALSA's procfs, so /proc/asound does not exist at all and the
+ * first version of this check silently never fired. Each card is a symlink to
+ * its device, and the built-in one lands under platform/hiby-hifi-board while
+ * anything on USB has "usb" in the path — which is the discriminator, since the
+ * card number alone is not guaranteed. */
 static int usb_card(void) {
-    FILE *f = fopen("/proc/asound/cards", "r");
-    if (!f) return -1;
-    char line[256];
-    int card = -1;
-    while (fgets(line, sizeof(line), f)) {
-        int n;
-        /* Entries look like " 1 [Audio          ]: USB-Audio - ..." */
-        if (sscanf(line, " %d [", &n) == 1 && n > 0 &&
-            (strstr(line, "USB") || strstr(line, "usb"))) {
-            card = n;
-            break;
-        }
+    for (int n = 0; n <= 8; n++) {
+        char path[64], link[512], pcm[64];
+        snprintf(path, sizeof(path), "/sys/class/sound/card%d", n);
+        ssize_t k = readlink(path, link, sizeof(link) - 1);
+        if (k <= 0) continue;
+        link[k] = '\0';
+        if (!strstr(link, "usb") && !strstr(link, "USB")) continue;
+        /* Only useful if it actually has a playback device. */
+        snprintf(pcm, sizeof(pcm), "/sys/class/sound/pcmC%dD0p", n);
+        if (access(pcm, F_OK) != 0) continue;
+        return n;
     }
-    fclose(f);
-    return card;
+    return -1;
 }
 
 static void *pcm_open(unsigned int rate, int channels) {
