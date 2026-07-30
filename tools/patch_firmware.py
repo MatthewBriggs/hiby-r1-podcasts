@@ -36,6 +36,70 @@ import tempfile
 
 CHUNK = 524288
 SCRIPT = "usr/bin/hiby_player.sh"
+MOUNT_SCRIPT = "usr/bin/mount_ubifs.sh"
+VERSION_FILE = "etc/r1_audiobook_version"
+
+# Default stamp for a build. Override with --rom-version. It ends up in
+# System -> About so a device can be identified without a laptop, which
+# matters once several builds exist that differ only in what was patched in.
+DEFAULT_ROM_VERSION = "pod1.0"
+
+# System -> About renders config.json's `version`, and the field is cut to
+# SEVEN characters — "2.0.26ABCDEFGHIJ" displays as "2.0.26A". The stock string
+# is already six, so exactly one is left. A revision letter is what fits: a, b,
+# c... The full build string goes in etc/r1_audiobook_version, which adb can
+# read, but the letter is what identifies a device you are holding.
+CONFIG_JSON = "usr/resource/config.json"
+ABOUT_VERSION_MAX = 7
+
+
+def stamp_config_json(text, rom_rev):
+    """Append a one-character revision to the version About displays."""
+    m = re.search(r'("version"\s*:\s*")([^"]+)(")', text)
+    if not m:
+        return None
+    cur = m.group(2)
+    if len(cur) >= ABOUT_VERSION_MAX:
+        return None                      # already stamped, or no room left
+    new = (cur + rom_rev)[:ABOUT_VERSION_MAX]
+    return text[:m.start(2)] + new + text[m.end(2):]
+
+
+def stamp_version_file(text, rom_version):
+    """Stamp the build into the string System -> About displays.
+
+    Neither about_dev.ini's <model> nor config.json's version drives that text —
+    both were tried and neither showed. The Audiobook Mod renders `label` from
+    this file, which is why About reads exactly "HiBy R1 2.0.26". Appending here
+    is what actually reaches the screen. The extra keys are for scripts and adb.
+    """
+    if "podcast_rom=" in text:
+        return None
+    out = []
+    for line in text.splitlines():
+        if line.startswith("label=") and rom_version not in line:
+            line = f"{line} {rom_version}"
+        out.append(line)
+    out.append(f"podcast_rom={rom_version}")
+    out.append(f"podcast_rom_built="
+               f"{__import__('datetime').date.today().isoformat()}")
+    return "\n".join(out) + "\n"
+
+# /usr/data — the writable UBIFS holding the library database, settings and the
+# preload libraries — is mounted with -o sync, which makes every write hit NAND
+# synchronously. That is a large part of why saving settings and progress feels
+# slow, and it wears the flash unnecessarily. SQLite still calls fsync at commit
+# on its own, so durability for the database does not depend on this flag.
+# noatime additionally stops a metadata write every time a file is merely read.
+ANCHOR_MOUNT = 'mount -o sync -t ubifs /dev/${ubi_name}_0 $mount_path'
+INSERT_MOUNT = 'mount -o noatime -t ubifs /dev/${ubi_name}_0 $mount_path'
+
+
+def patch_mount_script(text):
+    """Return the patched mount script, or None if it needs no change."""
+    if ANCHOR_MOUNT not in text:
+        return None
+    return text.replace(ANCHOR_MOUNT, INSERT_MOUNT)
 
 # Applied to the mod's stock supervisor. Each anchor is matched exactly; if one
 # is missing the script has changed and we stop rather than guess, because a
@@ -56,6 +120,22 @@ HEALTHY_RUN=60          # seconds up before a run counts as a success
 USER_INIT="/usr/data/init.sh"
 
 [ -f "$USER_INIT" ] && sh "$USER_INIT" >/dev/null 2>&1 &
+
+# Performance tuning, applied once at startup.
+#
+# Read-ahead: the card ships at 128 KB. Library scans and large FLAC reads are
+# sequential, and on a slow SD card a bigger window is most of the difference
+# between smooth and stuttering. 2 MB costs a little RAM for a lot of
+# throughput.
+for q in /sys/block/mmcblk*/queue/read_ahead_kb; do
+    [ -w "$q" ] && echo 2048 > "$q"
+done
+
+# vfs_cache_pressure: at the default 100 the kernel reclaims dentries and
+# inodes as eagerly as page cache. With 56 MB of RAM that means the library UI
+# keeps re-reading the same directory metadata and cover paths. Halving it
+# keeps them resident longer without pinning them outright.
+[ -w /proc/sys/vm/vfs_cache_pressure ] && echo 50 > /proc/sys/vm/vfs_cache_pressure
 # ---------------------------------------------------------------------------
 '''
 
@@ -226,6 +306,14 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("input", help="the mod's .upt, e.g. r1-audiobooks-2.0.26.upt")
     ap.add_argument("output", help="where to write the patched .upt")
+    ap.add_argument("--rom-version", default=DEFAULT_ROM_VERSION,
+                    help=f"full build string recorded in "
+                         f"etc/r1_audiobook_version (default "
+                         f"{DEFAULT_ROM_VERSION})")
+    ap.add_argument("--rom-rev", default="a", metavar="LETTER",
+                    help="one character appended to the version shown in "
+                         "System -> About; the field is cut to 7 chars and "
+                         "'2.0.26' already uses 6 (default: a)")
     args = ap.parse_args()
 
     try:
@@ -284,6 +372,44 @@ def main():
             fh.write(patched)
         print(f"patched {SCRIPT} "
               f"({len(original.splitlines())} -> {len(patched.splitlines())} lines)")
+
+        mtarget = os.path.join(root, MOUNT_SCRIPT)
+        if os.path.exists(mtarget):
+            with open(mtarget, "r") as fh:
+                mtext = fh.read()
+            mpatched = patch_mount_script(mtext)
+            if mpatched is None:
+                print(f"note: {MOUNT_SCRIPT} not patched — no '-o sync' mount "
+                      f"found, leaving it alone")
+            else:
+                with open(mtarget, "w") as fh:
+                    fh.write(mpatched)
+                print(f"patched {MOUNT_SCRIPT} (/usr/data: sync -> noatime)")
+
+        # Version stamp, so the build is identifiable from the device itself.
+        ctarget = os.path.join(root, CONFIG_JSON)
+        if os.path.exists(ctarget):
+            with open(ctarget) as fh:
+                ctext = fh.read()
+            stamped = stamp_config_json(ctext, args.rom_rev[:1])
+            if stamped is None:
+                print(f"note: {CONFIG_JSON} version not stamped (already "
+                      f"stamped, or no room in {ABOUT_VERSION_MAX} chars)")
+            else:
+                with open(ctarget, "w") as fh:
+                    fh.write(stamped)
+                shown = re.search(r'"version"\s*:\s*"([^"]+)"', stamped).group(1)
+                print(f"stamped About version -> '{shown}'")
+
+        vtarget = os.path.join(root, VERSION_FILE)
+        if os.path.exists(vtarget):
+            with open(vtarget) as fh:
+                vtext = fh.read()
+            vnew = stamp_version_file(vtext, args.rom_version)
+            if vnew is not None:
+                with open(vtarget, "w") as fh:
+                    fh.write(vnew)
+                print(f"stamped {VERSION_FILE} with podcast_rom={args.rom_version}")
 
         print("repacking rootfs...")
         newsq = os.path.join(tmp, "rootfs.new.squashfs")

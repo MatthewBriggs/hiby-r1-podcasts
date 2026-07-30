@@ -23,6 +23,9 @@ import tempfile
 
 CHUNK = 524288
 SCRIPT = "usr/bin/hiby_player.sh"
+MOUNT_SCRIPT = "usr/bin/mount_ubifs.sh"
+CONFIG_JSON = "usr/resource/config.json"
+VERSION_FILE = "etc/r1_audiobook_version"
 
 
 def load(path):
@@ -199,6 +202,13 @@ def main():
             print(f"\n  {SCRIPT} MISSING")
             ok = False
 
+        vf = os.path.join(root, VERSION_FILE)
+        if os.path.exists(vf):
+            with open(vf) as fh:
+                for line in fh:
+                    if line.startswith(("podcast_rom", "label=", "version=")):
+                        print(f"    {line.strip()}")
+
         if args.against:
             other, *_ = load(args.against)
             other_rootfs = next(i for i in other if i["type"] == "rootfs")
@@ -216,10 +226,13 @@ def main():
                     print(f"    + {k}")
                 for k in removed:
                     print(f"    - {k}")
-                if changed == [SCRIPT] and not added and not removed:
-                    print("    exactly one file changed, as intended")
+                expected = {SCRIPT, MOUNT_SCRIPT, CONFIG_JSON, VERSION_FILE}
+                if set(changed) <= expected and not added and not removed:
+                    print(f"    only expected files changed ({len(changed)}), "
+                          f"as intended")
                 else:
-                    print("    UNEXPECTED: more than the supervisor differs")
+                    print("    UNEXPECTED: something other than the supervisor "
+                          "and mount script differs")
                     ok = False
 
     print("\nRESULT:", "image verifies" if ok else "PROBLEM — do not flash")
