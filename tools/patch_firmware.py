@@ -38,6 +38,7 @@ CHUNK = 524288
 SCRIPT = "usr/bin/hiby_player.sh"
 MOUNT_SCRIPT = "usr/bin/mount_ubifs.sh"
 VERSION_FILE = "etc/r1_audiobook_version"
+BT_INIT = "usr/bin/bt_init"
 
 # Default stamp for a build. Override with --rom-version. It ends up in
 # System -> About so a device can be identified without a laptop, which
@@ -121,6 +122,26 @@ def stamp_version_file(text, rom_version):
 # slow, and it wears the flash unnecessarily. SQLite still calls fsync at commit
 # on its own, so durability for the database does not depend on this flag.
 # noatime additionally stops a metadata write every time a file is merely read.
+# BlueALSA is started with A2DP only, which is all that playback needs — but it
+# also means there is no RFCOMM link, and a headset's battery level arrives over
+# HFP. Adding the Hands-Free Audio Gateway profile gives bluealsa-rfcomm
+# something to report. XAPL is Apple's extension for exactly this and costs
+# nothing to answer.
+ANCHOR_BT = ('/usr/bin/bluealsa -p a2dp-source '
+             '--a2dp-volume --sbc-quality=xq &')
+INSERT_BT = ('/usr/bin/bluealsa -p a2dp-source -p hfp-ag '
+             '--a2dp-volume --sbc-quality=xq --xapl-resp-name=HiBy &')
+
+
+def patch_bt_init(text):
+    """Add the HFP profile so a headset can report its battery."""
+    if "hfp-ag" in text:
+        return None                      # already done
+    if ANCHOR_BT not in text:
+        return None
+    return text.replace(ANCHOR_BT, INSERT_BT, 1)
+
+
 ANCHOR_MOUNT = 'mount -o sync -t ubifs /dev/${ubi_name}_0 $mount_path'
 INSERT_MOUNT = 'mount -o noatime -t ubifs /dev/${ubi_name}_0 $mount_path'
 
@@ -418,6 +439,19 @@ def main():
                 with open(mtarget, "w") as fh:
                     fh.write(mpatched)
                 print(f"patched {MOUNT_SCRIPT} (/usr/data: sync -> noatime)")
+
+        btarget = os.path.join(root, BT_INIT)
+        if os.path.exists(btarget):
+            with open(btarget, "r") as fh:
+                btext = fh.read()
+            bpatched = patch_bt_init(btext)
+            if bpatched is None:
+                print(f"note: {BT_INIT} not patched — HFP already on, or the "
+                      f"bluealsa line has moved")
+            else:
+                with open(btarget, "w") as fh:
+                    fh.write(bpatched)
+                print(f"patched {BT_INIT} (bluealsa: +hfp-ag for battery reporting)")
 
         # Version stamp, so the build is identifiable from the device itself.
         if not args.no_radio:

@@ -24,6 +24,7 @@ import tempfile
 CHUNK = 524288
 SCRIPT = "usr/bin/hiby_player.sh"
 MOUNT_SCRIPT = "usr/bin/mount_ubifs.sh"
+BT_INIT = "usr/bin/bt_init"
 CONFIG_JSON = "usr/resource/config.json"
 VERSION_FILE = "etc/r1_audiobook_version"
 
@@ -226,7 +227,8 @@ def main():
                     print(f"    + {k}")
                 for k in removed:
                     print(f"    - {k}")
-                expected = {SCRIPT, MOUNT_SCRIPT, CONFIG_JSON, VERSION_FILE}
+                expected = {SCRIPT, MOUNT_SCRIPT, CONFIG_JSON, VERSION_FILE,
+                            BT_INIT}
                 # Internet radio swaps each theme's Stream media layout for
                 # HiBy's own CN variant, which is the one carrying the tile.
                 expected |= {f"{d}/hiby_stream_media.view" for d in (
