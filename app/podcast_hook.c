@@ -316,7 +316,7 @@ static void cover_for_feed(const char *feed) {
     snprintf(cover_feed, sizeof(cover_feed), "%s", feed);
     char p[PATH_LEN];
     snprintf(p, sizeof(p), "%s/%s/cover.jpg", PODCAST_DIR, feed);
-    cur_cover = cover_load(p, COVER_PX);
+    cur_cover = cover_load(p, feed, COVER_PX);
     plog("[podcast] cover %s: %s\n", feed, cur_cover ? "ok" : "none");
 }
 
