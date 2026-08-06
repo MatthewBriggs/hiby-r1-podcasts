@@ -36,6 +36,8 @@
 #include <sys/wait.h>
 #include <sys/mount.h>
 #include <time.h>
+#include <utime.h>
+#include <ctype.h>
 
 #include "text.h"
 #include "audio.h"
@@ -72,6 +74,11 @@
 #define LOG_PATH    "/tmp/.podcast_hook.log"
 #define RES_DIR     "/usr/data/podcast_res"
 #define SYNC_SCRIPT RESUME_DIR "/podsync_once.sh"
+/* Same static curl and CA bundle podsync_once.sh uses -- busybox wget's TLS
+ * is too old for any modern podcast host. */
+#define PODSYNC_CURL RESUME_DIR "/curl"
+#define PODSYNC_CA   RESUME_DIR "/cacert.pem"
+#define DL_HDR_PATH  "/tmp/.podcast_dl_headers"
 #define SYNC_LOG    "/tmp/.podsync_run.log"
 #define UPDATE_BTN_H 52
 #define BTN_MARGIN   12
@@ -103,6 +110,20 @@ static long episode_mtime[MAX_ITEMS];
 static int  episode_resume[MAX_ITEMS];   /* ms, or POS_FINISHED, or 0 */
 static int  episode_dur[MAX_ITEMS];
 static char episode_downloaded[MAX_ITEMS];  /* R18: manifest-only entries are 0 */
+static char episode_url[MAX_ITEMS][PATH_LEN];   /* only populated for !downloaded */
+static char cur_episode_dir[PATH_LEN];  /* the feed folder load_episodes() last scanned */
+
+/* R18 on-demand download: one at a time, run detached the same way
+ * update_start() runs the sync script -- fork+exec, tracked by pid, polled
+ * non-blockingly from the main loop. No thread, no lock: this is a
+ * single-threaded app and that pattern already exists for exactly this
+ * shape of problem. */
+static pid_t dl_pid = -1;
+static int   dl_slot = -1;      /* episode index downloading, -1 = none */
+static long  dl_bytes;          /* bytes written to the .part file so far */
+static long  dl_total;          /* from Content-Length, 0 = not known yet */
+static char  dl_part_path[PATH_LEN];
+static char  dl_final_path[PATH_LEN];
 static int  episode_count;
 
 static int screen = SCREEN_FEEDS;
@@ -585,8 +606,33 @@ static void draw_header(uint16_t *fb, const char *title, const char *right) {
 /* Progress marker for an episode row: solid = finished, partial bar = started.
  * Reads the cache filled by load_episodes; doing the lookup here would mean a
  * directory scan and a file read per row per frame. */
+/* Compact "1.2MB" / "340KB", right-aligned the same way the resume % and
+ * DONE markers are -- reusing this one corner rather than adding a second
+ * label lets a downloading row and a played-partway row look like the same
+ * kind of fact in different units, instead of two unrelated UI elements. */
+static void draw_download_marker(uint16_t *fb, int x, int y, long bytes, long total) {
+    char t[16];
+    if (total > 0) {
+        int pct = (int)(bytes * 100 / total);
+        if (pct > 99) pct = 99;
+        snprintf(t, sizeof(t), "%d%%", pct);
+    } else if (bytes >= 1024 * 1024) {
+        snprintf(t, sizeof(t), "%ldMB", bytes / (1024 * 1024));
+    } else if (bytes >= 1024) {
+        snprintf(t, sizeof(t), "%ldKB", bytes / 1024);
+    } else {
+        snprintf(t, sizeof(t), "%s", "...");   /* nothing on disk yet */
+    }
+    int w = text_width(t, scale_px(2));
+    draw_text(fb, x + 14 - w, y - 4, t, COL_ACCENT, 2, FB_W);
+}
+
 static void draw_progress_marker(uint16_t *fb, int x, int y, int idx) {
     if (idx < 0 || idx >= episode_count) return;
+    if (dl_pid > 0 && idx == dl_slot) {
+        draw_download_marker(fb, x, y, dl_bytes, dl_total);
+        return;
+    }
     int ms = episode_resume[idx];
     if (ms == 0) return;                       /* untouched */
     /* Right-align by measuring, not by guessing. The offsets here were once
@@ -629,10 +675,13 @@ static void draw_list(uint16_t *fb, char items[][NAME_LEN], int count, int sel) 
         int right = FB_W - 16;
         uint16_t col = COL_TEXT;
         if (screen == SCREEN_EPISODES) {
-            /* R18: not downloaded yet -- dimmed and, per the tap handler,
-             * inert. draw_progress_marker already no-ops for these (their
-             * episode_resume is 0), so no separate guard is needed there. */
-            if (!episode_downloaded[idx]) col = COL_DIM;
+            /* R18: not downloaded yet -- dimmed, and a tap starts a download
+             * rather than playback. The one row actually downloading stays
+             * full brightness so it reads as "in progress", not "inert like
+             * its neighbours"; draw_progress_marker's own dl_slot check
+             * shows a live percentage there instead of the usual play%. */
+            int is_downloading = (dl_pid > 0 && idx == dl_slot);
+            if (!episode_downloaded[idx] && !is_downloading) col = COL_DIM;
             draw_progress_marker(fb, FB_W - 20, y + ROW_TEXT_Y + 4, idx);
             right = FB_W - 70;
         }
@@ -822,21 +871,24 @@ static void load_feeds(void) {
  * what a podcast listener expects. Names and paths move together. */
 static void sort_episodes(void) {
     for (int i = 1; i < episode_count; i++) {
-        char tn[NAME_LEN], tp[PATH_LEN];
+        char tn[NAME_LEN], tp[PATH_LEN], tu[PATH_LEN];
         long tm = episode_mtime[i];
         char td = episode_downloaded[i];
         snprintf(tn, sizeof(tn), "%s", episodes[i]);
         snprintf(tp, sizeof(tp), "%s", episode_paths[i]);
+        snprintf(tu, sizeof(tu), "%s", episode_url[i]);
         int j = i - 1;
         while (j >= 0 && episode_mtime[j] < tm) {
             snprintf(episodes[j + 1], NAME_LEN, "%s", episodes[j]);
             snprintf(episode_paths[j + 1], PATH_LEN, "%s", episode_paths[j]);
+            snprintf(episode_url[j + 1], PATH_LEN, "%s", episode_url[j]);
             episode_mtime[j + 1] = episode_mtime[j];
             episode_downloaded[j + 1] = episode_downloaded[j];
             j--;
         }
         snprintf(episodes[j + 1], NAME_LEN, "%s", tn);
         snprintf(episode_paths[j + 1], PATH_LEN, "%s", tp);
+        snprintf(episode_url[j + 1], PATH_LEN, "%s", tu);
         episode_mtime[j + 1] = tm;
         episode_downloaded[j + 1] = td;
     }
@@ -864,6 +916,7 @@ static void load_episodes(const char *feed) {
     episode_count = 0;
     char dir[PATH_LEN];
     snprintf(dir, sizeof(dir), "%s/%s", PODCAST_DIR, feed);
+    snprintf(cur_episode_dir, sizeof(cur_episode_dir), "%s", dir);
     DIR *d = opendir(dir);
     if (!d) return;
     struct dirent *e;
@@ -898,6 +951,7 @@ static void load_episodes(const char *feed) {
         char *dot = strrchr(episodes[slot], '.');
         if (dot) *dot = '\0';
         episode_downloaded[slot] = 1;
+        episode_url[slot][0] = '\0';   /* not needed once local; clears any stale value from a slot reuse */
     }
     closedir(d);
 
@@ -934,6 +988,7 @@ static void load_episodes(const char *feed) {
             episode_paths[slot][0] = '\0';   /* no local file: this is the "undownloaded" marker */
             episode_mtime[slot] = date ? parse_iso_date(date) : 0;
             episode_downloaded[slot] = 0;
+            snprintf(episode_url[slot], PATH_LEN, "%s", url);
         }
         fclose(mf);
     }
@@ -946,6 +1001,120 @@ static void load_episodes(const char *feed) {
             episode_resume[i] = 0, episode_dur[i] = 0;   /* can't know either without the file */
     }
     plog("[podcast] %d episodes in %s\n", episode_count, feed);
+}
+
+/* ---- on-demand download (R18) -------------------------------------------- */
+
+/* Same whitelist and fallback as podsync_once.sh's own extension check --
+ * keep the two in sync if either changes. */
+static const char *ext_for_url(const char *url) {
+    static char ext[8];
+    ext[0] = '\0';
+    const char *q = strpbrk(url, "?#");
+    const char *end = q ? q : url + strlen(url);
+    const char *dot = NULL;
+    for (const char *p = url; p < end; p++) if (*p == '.') dot = p;
+    if (dot) {
+        size_t n = 0;
+        for (const char *p = dot + 1; p < end && n < sizeof(ext) - 1; p++, n++)
+            ext[n] = (char)tolower((unsigned char)*p);
+        ext[n] = '\0';
+    }
+    static const char *ok[] = { "mp3", "m4a", "m4b", "aac", "ogg", "oga",
+                                 "opus", "wav", "flac", NULL };
+    for (int i = 0; ok[i]; i++) if (!strcmp(ext, ok[i])) return ext;
+    return "mp3";
+}
+
+/* Starts a curl child fetching episode `idx`, detached and non-blocking --
+ * the same shape as update_start() below, run for one episode instead of
+ * the whole subscription list. Progress comes from watching the .part file
+ * grow and, once curl has written it, the Content-Length header; neither
+ * needs curl's own progress meter parsed. */
+static void download_start(int idx) {
+    if (dl_pid > 0) return;                              /* one at a time */
+    if (idx < 0 || idx >= episode_count) return;
+    if (episode_downloaded[idx] || !episode_url[idx][0]) return;
+
+    const char *ext = ext_for_url(episode_url[idx]);
+    snprintf(dl_final_path, sizeof(dl_final_path), "%s/%s.%s",
+             cur_episode_dir, episodes[idx], ext);
+    snprintf(dl_part_path, sizeof(dl_part_path), "%s.part", dl_final_path);
+    unlink(dl_part_path);
+    unlink(DL_HDR_PATH);
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        execl(PODSYNC_CURL, PODSYNC_CURL, "-fsSL", "--cacert", PODSYNC_CA,
+              "--connect-timeout", "20", "--max-time", "900",
+              "-D", DL_HDR_PATH, "-o", dl_part_path, episode_url[idx],
+              (char *)NULL);
+        _exit(127);
+    }
+    if (pid > 0) {
+        dl_pid = pid;
+        dl_slot = idx;
+        dl_bytes = 0;
+        dl_total = 0;
+        plog("[podcast] downloading %s\n", episodes[idx]);
+    }
+}
+
+/* Polled every main-loop tick, same as update_reap()/update_tail() are for
+ * the sync script. Cheap when nothing is downloading: one pid check. */
+static void download_poll(void) {
+    if (dl_pid <= 0) return;
+
+    if (dl_total <= 0) {
+        FILE *hf = fopen(DL_HDR_PATH, "r");
+        if (hf) {
+            char line[256];
+            while (fgets(line, sizeof(line), hf)) {
+                long v;
+                if (sscanf(line, "Content-Length: %ld", &v) == 1 ||
+                    sscanf(line, "content-length: %ld", &v) == 1) {
+                    dl_total = v;
+                    break;
+                }
+            }
+            fclose(hf);
+        }
+    }
+    struct stat pst;
+    if (stat(dl_part_path, &pst) == 0) dl_bytes = (long)pst.st_size;
+
+    int status;
+    pid_t r = waitpid(dl_pid, &status, WNOHANG);
+    if (r == 0) return;                                  /* still running */
+
+    int ok = (r == dl_pid) && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    struct stat fst;
+    if (ok && (stat(dl_part_path, &fst) != 0 || fst.st_size <= 0)) ok = 0;
+
+    if (ok) {
+        rename(dl_part_path, dl_final_path);
+        if (dl_slot >= 0 && dl_slot < episode_count) {
+            /* Stamp mtime to the parsed pubdate, matching what
+             * podsync_once.sh does for its own downloads -- otherwise this
+             * episode would sort as "now" instead of its real date until
+             * the feed is synced again. */
+            if (episode_mtime[dl_slot] > 0) {
+                struct utimbuf ub;
+                ub.actime = ub.modtime = (time_t)episode_mtime[dl_slot];
+                utime(dl_final_path, &ub);
+            }
+            episode_downloaded[dl_slot] = 1;
+            snprintf(episode_paths[dl_slot], PATH_LEN, "%s", dl_final_path);
+            episode_resume[dl_slot] = resume_lookup2(episode_paths[dl_slot],
+                                                      &episode_dur[dl_slot]);
+        }
+        plog("[podcast] download ok: %s\n", dl_final_path);
+    } else {
+        unlink(dl_part_path);
+        plog("[podcast] download FAILED: %s\n", episode_url[dl_slot]);
+    }
+    dl_pid = -1;
+    dl_slot = -1;
 }
 
 /* ---- touch -------------------------------------------------------------- */
@@ -1074,10 +1243,13 @@ static int handle_tap(int x, int y) {
             scroll = 0;
         }
     } else {
-        /* R18: greyed-out rows are inert, not just visually dimmed -- there
-         * is no local file at episode_paths[idx] to play. On-demand download
-         * from a tap here is future work, not this pass. */
-        if (idx >= 0 && idx < episode_count && episode_downloaded[idx]) {
+        /* R18: a greyed-out row has no local file to play, so a tap starts
+         * the download instead. draw_progress_marker takes over that row's
+         * marker while it runs; the row itself turns normal (undimmed,
+         * playable) the moment download_poll() reaps a completed fetch. */
+        if (idx >= 0 && idx < episode_count && !episode_downloaded[idx]) {
+            download_start(idx);
+        } else if (idx >= 0 && idx < episode_count && episode_downloaded[idx]) {
             ep_sel = idx;
             snprintf(cur_path, sizeof(cur_path), "%s", episode_paths[idx]);
             load_notes(cur_path);
@@ -1226,6 +1398,7 @@ static int podcast_entry(void *arg0, void *arg1) {
 
         if (locked) { usleep(120000); continue; }
 
+        download_poll();
         draw_ui(base + (size_t)page * page_px);
         v.yoffset = (uint32_t)(page * FB_H);
         if (ioctl(fbfd, FBIOPAN_DISPLAY, &v) < 0 && frames < 3)
