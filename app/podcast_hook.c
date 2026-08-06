@@ -84,7 +84,13 @@
 #define BTN_MARGIN   12
 #define BTN_GAP       6
 
-#define MAX_ITEMS 64
+/* BG14: raising podsync_once.sh's MANIFEST_EPISODES (40 -> 200) to stop
+ * clipping feeds with a real backlog only helps if there's room to hold
+ * what it writes -- this shares MAX_ITEMS with feed_count too, but that one
+ * was never close to the limit, so the extra headroom there is free. ~140KB
+ * more static memory (episode_paths/episode_url are 384 bytes each,
+ * dominating the per-item cost), trivial next to this device's RAM. */
+#define MAX_ITEMS 220
 #define NAME_LEN  64
 #define PATH_LEN  384
 
@@ -613,7 +619,11 @@ static void draw_header(uint16_t *fb, const char *title, const char *right) {
 static void draw_download_marker(uint16_t *fb, int x, int y, long bytes, long total) {
     char t[16];
     if (total > 0) {
-        int pct = (int)(bytes * 100 / total);
+        /* BG13: bytes/total are plain `long`, 32-bit signed on this MIPS32
+         * target -- bytes*100 overflowed past ~21.4MB and wrapped negative,
+         * matching the exact -25%->0%->25% sequence reported. Same fix as
+         * draw_progress_marker's playback-% below: widen before multiplying. */
+        int pct = (int)((int64_t)bytes * 100 / total);
         if (pct > 99) pct = 99;
         snprintf(t, sizeof(t), "%d%%", pct);
     } else if (bytes >= 1024 * 1024) {

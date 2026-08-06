@@ -23,10 +23,17 @@ EPISODES_PER_FEED=3
 # Separate from the download count: the manifest (episodes.tsv) lists this
 # many recent episodes per feed so the app can show them greyed out even
 # before they're downloaded (R18). Parsing costs real time on this CPU
-# (parse_rss.awk's own comment: minutes for a 500-800 item feed), so this
-# stays a bounded "recent window", not the whole archive, and is well short
-# of the point where that cost would be felt.
-MANIFEST_EPISODES=40
+# (parse_rss.awk's own comment: minutes for a 500-800 item feed).
+#
+# BG14: 40 clipped feeds with a real backlog (The Bugle has hundreds) well
+# short of what R18 asked for -- "browsing the full episode archive". 200 is
+# a deliberate middle ground, not a fix for the underlying limit: still a
+# bounded recent window, not the whole archive, but the added parse time
+# (rough estimate: 30-60s for a feed that actually has 200+ items, worst
+# case) is tolerable for a manual Update press in a way "minutes" is not.
+# Reaching true full-archive browsing needs lazy/paged loading instead of a
+# bigger fixed number -- see BG14's own note for that.
+MANIFEST_EPISODES=200
 
 echo "" > "$LOG"
 log() { echo "$*" >> "$LOG"; }
