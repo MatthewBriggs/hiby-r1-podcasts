@@ -35,6 +35,7 @@
 #include <linux/input.h>
 #include <sys/wait.h>
 #include <sys/mount.h>
+#include <time.h>
 
 #include "text.h"
 #include "audio.h"
@@ -101,6 +102,7 @@ static char episode_paths[MAX_ITEMS][PATH_LEN];
 static long episode_mtime[MAX_ITEMS];
 static int  episode_resume[MAX_ITEMS];   /* ms, or POS_FINISHED, or 0 */
 static int  episode_dur[MAX_ITEMS];
+static char episode_downloaded[MAX_ITEMS];  /* R18: manifest-only entries are 0 */
 static int  episode_count;
 
 static int screen = SCREEN_FEEDS;
@@ -625,11 +627,16 @@ static void draw_list(uint16_t *fb, char items[][NAME_LEN], int count, int sel) 
         fill_rect(fb, 0, y, FB_W, ROW_H - 2, (idx & 1) ? COL_ROW_B : COL_ROW_A);
         if (idx == sel) fill_rect(fb, 0, y, 6, ROW_H - 2, COL_ACCENT);
         int right = FB_W - 16;
+        uint16_t col = COL_TEXT;
         if (screen == SCREEN_EPISODES) {
+            /* R18: not downloaded yet -- dimmed and, per the tap handler,
+             * inert. draw_progress_marker already no-ops for these (their
+             * episode_resume is 0), so no separate guard is needed there. */
+            if (!episode_downloaded[idx]) col = COL_DIM;
             draw_progress_marker(fb, FB_W - 20, y + ROW_TEXT_Y + 4, idx);
             right = FB_W - 70;
         }
-        draw_text(fb, 18, y + ROW_TEXT_Y, items[idx], COL_TEXT, 2, right);
+        draw_text(fb, 18, y + ROW_TEXT_Y, items[idx], col, 2, right);
     }
     if (count > visible) {
         /* Scrollbar: proportional thumb down the right edge. */
@@ -817,6 +824,7 @@ static void sort_episodes(void) {
     for (int i = 1; i < episode_count; i++) {
         char tn[NAME_LEN], tp[PATH_LEN];
         long tm = episode_mtime[i];
+        char td = episode_downloaded[i];
         snprintf(tn, sizeof(tn), "%s", episodes[i]);
         snprintf(tp, sizeof(tp), "%s", episode_paths[i]);
         int j = i - 1;
@@ -824,12 +832,32 @@ static void sort_episodes(void) {
             snprintf(episodes[j + 1], NAME_LEN, "%s", episodes[j]);
             snprintf(episode_paths[j + 1], PATH_LEN, "%s", episode_paths[j]);
             episode_mtime[j + 1] = episode_mtime[j];
+            episode_downloaded[j + 1] = episode_downloaded[j];
             j--;
         }
         snprintf(episodes[j + 1], NAME_LEN, "%s", tn);
         snprintf(episode_paths[j + 1], PATH_LEN, "%s", tp);
         episode_mtime[j + 1] = tm;
+        episode_downloaded[j + 1] = td;
     }
+}
+
+/* "YYYY-MM-DD HH:MM:SS" -- parse_rss.awk's own documented contract for the
+ * date field, the same string `touch -d` stamps onto a downloaded file's
+ * mtime. Parsed as local time, same as mtime itself, so a manifest-only
+ * entry sorts correctly against a downloaded one even though nothing here
+ * ever calls out to the network to double check a timezone. */
+static long parse_iso_date(const char *s) {
+    struct tm tmv;
+    memset(&tmv, 0, sizeof(tmv));
+    if (sscanf(s, "%d-%d-%d %d:%d:%d", &tmv.tm_year, &tmv.tm_mon, &tmv.tm_mday,
+               &tmv.tm_hour, &tmv.tm_min, &tmv.tm_sec) != 6)
+        return 0;
+    tmv.tm_year -= 1900;
+    tmv.tm_mon  -= 1;
+    tmv.tm_isdst = -1;
+    time_t t = mktime(&tmv);
+    return (t == (time_t)-1) ? 0 : (long)t;
 }
 
 static void load_episodes(const char *feed) {
@@ -869,11 +897,54 @@ static void load_episodes(const char *feed) {
         snprintf(episodes[slot], NAME_LEN, "%s", e->d_name);
         char *dot = strrchr(episodes[slot], '.');
         if (dot) *dot = '\0';
+        episode_downloaded[slot] = 1;
     }
     closedir(d);
+
+    /* R18: fold in episodes.tsv, the manifest podsync_once.sh writes of every
+     * episode currently in the feed's recent window, not just the ones
+     * fetched. Its `base` field is the same sanitize(title) the download
+     * filename uses, so a manifest entry that already has a local file needs
+     * no reimplementation of sanitize() in C to detect -- a plain strcmp
+     * against the name each local file was just given above is exact. */
+    char manifest[PATH_LEN];
+    snprintf(manifest, sizeof(manifest), "%s/episodes.tsv", dir);
+    FILE *mf = fopen(manifest, "r");
+    if (mf) {
+        char line[1024];
+        while (episode_count < MAX_ITEMS && fgets(line, sizeof(line), mf)) {
+            char *nl = strchr(line, '\n');
+            if (nl) *nl = '\0';
+            char *base = line;
+            char *url = strchr(base, '\t');
+            if (!url) continue;
+            *url++ = '\0';
+            char *date = strchr(url, '\t');
+            if (date) *date++ = '\0';
+            /* notes field, if present, is unused here -- load_notes() reads
+             * the downloaded .txt sidecar once an episode has one. */
+
+            int known = 0;
+            for (int i = 0; i < episode_count; i++)
+                if (!strcmp(episodes[i], base)) { known = 1; break; }
+            if (known) continue;
+
+            int slot = episode_count++;
+            snprintf(episodes[slot], NAME_LEN, "%s", base);
+            episode_paths[slot][0] = '\0';   /* no local file: this is the "undownloaded" marker */
+            episode_mtime[slot] = date ? parse_iso_date(date) : 0;
+            episode_downloaded[slot] = 0;
+        }
+        fclose(mf);
+    }
+
     sort_episodes();
-    for (int i = 0; i < episode_count; i++)
-        episode_resume[i] = resume_lookup2(episode_paths[i], &episode_dur[i]);
+    for (int i = 0; i < episode_count; i++) {
+        if (episode_downloaded[i])
+            episode_resume[i] = resume_lookup2(episode_paths[i], &episode_dur[i]);
+        else
+            episode_resume[i] = 0, episode_dur[i] = 0;   /* can't know either without the file */
+    }
     plog("[podcast] %d episodes in %s\n", episode_count, feed);
 }
 
@@ -1003,7 +1074,10 @@ static int handle_tap(int x, int y) {
             scroll = 0;
         }
     } else {
-        if (idx >= 0 && idx < episode_count) {
+        /* R18: greyed-out rows are inert, not just visually dimmed -- there
+         * is no local file at episode_paths[idx] to play. On-demand download
+         * from a tap here is future work, not this pass. */
+        if (idx >= 0 && idx < episode_count && episode_downloaded[idx]) {
             ep_sel = idx;
             snprintf(cur_path, sizeof(cur_path), "%s", episode_paths[idx]);
             load_notes(cur_path);

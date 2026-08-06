@@ -125,12 +125,19 @@ def stamp_version_file(text, rom_version):
 # BlueALSA is started with A2DP only, which is all that playback needs — but it
 # also means there is no RFCOMM link, and a headset's battery level arrives over
 # HFP. Adding the Hands-Free Audio Gateway profile gives bluealsa-rfcomm
-# something to report. XAPL is Apple's extension for exactly this and costs
-# nothing to answer.
+# something to report.
+#
+# The XAPL name is "iPhone" deliberately, and it is the difference between a
+# battery reading and none. Apple's handshake has the headset send
+# AT+XAPL=<vendor>-<product>-<version> and the gateway answer with an
+# identifier and its feature bits. Answering "HiBy" was captured on the wire
+# being accepted and then ignored — the WH-1000XM4 simply never sent the
+# IPHONEACCEV that carries the level. Answering "iPhone" produced it
+# immediately.
 ANCHOR_BT = ('/usr/bin/bluealsa -p a2dp-source '
              '--a2dp-volume --sbc-quality=xq &')
 INSERT_BT = ('/usr/bin/bluealsa -p a2dp-source -p hfp-ag '
-             '--a2dp-volume --sbc-quality=xq --xapl-resp-name=HiBy &')
+             '--a2dp-volume --sbc-quality=xq --xapl-resp-name=iPhone &')
 
 
 def patch_bt_init(text):

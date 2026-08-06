@@ -20,6 +20,14 @@ TMP=/tmp/podsync
 
 EPISODES_PER_FEED=3
 
+# Separate from the download count: the manifest (episodes.tsv) lists this
+# many recent episodes per feed so the app can show them greyed out even
+# before they're downloaded (R18). Parsing costs real time on this CPU
+# (parse_rss.awk's own comment: minutes for a 500-800 item feed), so this
+# stays a bounded "recent window", not the whole archive, and is well short
+# of the point where that cost would be felt.
+MANIFEST_EPISODES=40
+
 echo "" > "$LOG"
 log() { echo "$*" >> "$LOG"; }
 
@@ -116,7 +124,7 @@ while read -r url; do
         continue
     fi
 
-    awk -v max="$EPISODES_PER_FEED" -f "$PARSER" "$rss" > "$TMP/parsed.txt" 2>>"$LOG"
+    awk -v max="$MANIFEST_EPISODES" -f "$PARSER" "$rss" > "$TMP/parsed.txt" 2>>"$LOG"
 
     raw=$(grep '^channel	' "$TMP/parsed.txt" | head -1 | cut -f2-)
     name=$(sanitize "$raw")
@@ -131,9 +139,12 @@ while read -r url; do
         get "$img" "$dir/cover.jpg" || rm -f "$dir/cover.jpg"
     fi
 
-    # Pair each episode with the notes line that follows it, so the download
-    # loop can write show notes alongside the audio.
-    awk -F'\t' -v n="$EPISODES_PER_FEED" '
+    # Pair each episode with the notes line that follows it, and sanitize the
+    # title into `base` right here -- the same value both the manifest and the
+    # download filename use, so the app can tell "in the feed" from
+    # "downloaded" by a plain filename comparison instead of reimplementing
+    # sanitize() in C.
+    awk -F'\t' -v n="$MANIFEST_EPISODES" '
         /^episode\t/ {
             if (have) { print title "\t" url "\t" date "\t" notes; have=0 }
             if (count >= n) { done=1; exit }
@@ -142,7 +153,26 @@ while read -r url; do
         }
         /^notes\t/ { if (have) notes=$2; next }
         END { if (have) print title "\t" url "\t" date "\t" notes }
-    ' "$TMP/parsed.txt" > "$TMP/eps.txt"
+    ' "$TMP/parsed.txt" > "$TMP/eps_all.txt"
+
+    # The manifest lists everything in the window above (R18: browse before
+    # downloading); only the newest EPISODES_PER_FEED get fetched below, same
+    # as before. Rewritten in full every sync -- the feed is the source of
+    # truth for what is *available*, same principle as the show-notes
+    # overwrite a few lines down for what they *say*.
+    : > "$dir/episodes.tsv"
+    : > "$TMP/eps.txt"
+    n=0
+    while IFS='	' read -r title epurl pubdate notes; do
+        [ -z "$epurl" ] && continue
+        base=$(sanitize "$title")
+        [ -z "$base" ] && base=$(echo "$epurl" | sed -e 's/[?#].*//' -e 's/.*\///')
+        printf '%s\t%s\t%s\t%s\n' "$base" "$epurl" "$pubdate" "$notes" >> "$dir/episodes.tsv"
+        if [ "$n" -lt "$EPISODES_PER_FEED" ]; then
+            printf '%s\t%s\t%s\t%s\n' "$title" "$epurl" "$pubdate" "$notes" >> "$TMP/eps.txt"
+        fi
+        n=$((n + 1))
+    done < "$TMP/eps_all.txt"
 
     while IFS='	' read -r title epurl pubdate notes; do
         [ -z "$epurl" ] && continue
