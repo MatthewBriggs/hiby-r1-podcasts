@@ -46,7 +46,6 @@
 #include "eqprofile.h"
 #include "cover.h"
 #include "art.h"
-#include "wps.h"
 #include "status.h"
 #include "radio.h"
 #include "playlist.h"
@@ -676,30 +675,6 @@ static int deep_sleep_enabled;
  * fragility for a "left alone for hours" scenario. Off by default, same as
  * deep sleep: a feature that ends the process is not one to default on
  * before it has been run for real. */
-/* Rockbox themes for the Now Playing screen. Themes are dropped onto the card
- * in their own distribution layout -- unzip a theme into /.rockbox/ and it is
- * found, no renaming or repacking -- and picked in Settings. Only the player
- * screen is themed; every list screen keeps the app's own look. */
-#define THEME_ROOT "/data/mnt/sd_0"
-#define THEME_DIR  THEME_ROOT "/.rockbox/themes"
-#define THEME_MAX  24
-static char       theme_name[64];        /* "" = the app's built-in player */
-static wps_theme *g_theme;               /* NULL unless a theme is loaded */
-
-/* (Re)loads whatever theme_name names. Called on startup and whenever the
- * setting changes -- never per frame: parsing a .wps and decoding its BMPs is
- * file I/O, and doing that on the draw thread is exactly the stall BG27 is
- * about. A theme that fails to load leaves g_theme NULL, which simply falls
- * back to the built-in player screen rather than showing nothing. */
-static void theme_apply(void) {
-    if (g_theme) { wps_free(g_theme); g_theme = NULL; }
-    if (!theme_name[0]) return;
-    char cfg[512];
-    snprintf(cfg, sizeof(cfg), "%s/%s.cfg", THEME_DIR, theme_name);
-    g_theme = wps_load(cfg, THEME_ROOT);
-    mlog("[music] theme \"%s\": %s\n", theme_name, g_theme ? "loaded" : "FAILED");
-}
-
 static const int AUTO_OFF_CHOICES[] = { 0, 5, 15, 30, 60, 120 };
 #define AUTO_OFF_CHOICE_N ((int)(sizeof(AUTO_OFF_CHOICES) / sizeof(AUTO_OFF_CHOICES[0])))
 static int auto_off_idx;                        /* index into AUTO_OFF_CHOICES */
@@ -726,9 +701,7 @@ static int set_lock_desc_y(void) { return set_row_lock_y() + ROW_H; }
  * shipped answer to the same problem. */
 static int set_row_autooff_y(void)  { return set_lock_desc_y() + 64; }
 static int set_autooff_desc_y(void) { return set_row_autooff_y() + ROW_H; }
-static int set_row_wpstheme_y(void) { return set_autooff_desc_y() + 64; }
-static int set_wpstheme_desc_y(void){ return set_row_wpstheme_y() + ROW_H; }
-static int set_row_theme_y(void) { return set_wpstheme_desc_y() + 64; }
+static int set_row_theme_y(void) { return set_autooff_desc_y() + 64; }
 
 /* One line, dragged sideways rather than wrapped.
  *
@@ -1980,47 +1953,6 @@ static void draw_screen(uint16_t *fb) {
         lib_track_t *t = (cur_track >= 0 && cur_track < queue_n) ? &queue[cur_track] : NULL;
         if (!t) return;
 
-        /* A Rockbox theme replaces this whole screen when one is selected.
-         * Only here: the audiobook and radio players above have their own
-         * controls that no music theme knows about, and the list screens keep
-         * the app's own look by design. */
-        if (g_theme) {
-            int pos = audio_pos_ms(), dur = audio_dur_ms();
-            if (dur <= 0) dur = t->dur_ms;
-            wps_state ws = {
-                .title       = t->name,
-                .artist      = q_artist[0] ? q_artist : t->artist,
-                .album       = q_album,
-                /* The library row carries no album-artist, genre or year --
-                 * the scanner's schema has them but lib_track_t does not, so
-                 * a theme asking for them gets nothing rather than a wrong
-                 * value. q_artist is the closest honest stand-in for the
-                 * album artist, since it is the artist the queue was built
-                 * from. Worth widening lib_track_t later if themes lean on
-                 * these. */
-                .albumartist = q_artist[0] ? q_artist : NULL,
-                .genre       = NULL,
-                .year        = NULL,
-                .filename    = t->path,
-                .codec       = track_format_name(t),
-                .pos_ms      = pos,
-                .dur_ms      = dur,
-                .track_no    = cur_track + 1,
-                .track_count = queue_n,
-                .volume_pct  = audio_volume(),
-                .playing     = !audio_is_paused(),
-                .shuffle     = 0,
-                .bitrate_kbps = t->bitrate / 1000,
-                .art_px      = ART_PX,
-            };
-            pthread_mutex_lock(&art_lock);
-            ws.art = art_bits;
-            wps_render(g_theme, fb, FB_W, FB_H, &ws);
-            pthread_mutex_unlock(&art_lock);
-            if (mini_visible()) { /* the theme owns the whole screen */ }
-            return;
-        }
-
         int cy = 0, cx = (FB_W - ART_PX) / 2;
         fill_rect(fb, cx, cy, ART_PX, ART_PX, COL_ROW);
         blit_art(fb, cx, cy);
@@ -2340,15 +2272,6 @@ static void draw_screen(uint16_t *fb) {
         int ay = set_autooff_desc_y();
         draw_text(fb, 24, ay, "Powers the device off when locked with", COL_DIM, TEXT_PX_SMALL, FB_W - 48);
         draw_text(fb, 24, ay + 26, "nothing playing. Tap to change.", COL_DIM, TEXT_PX_SMALL, FB_W - 48);
-
-        ry = set_row_wpstheme_y();
-        fill_rect(fb, 0, ry - 1, FB_W, 1, COL_LINE);
-        draw_text(fb, 24, ry + 20, "Player theme", COL_TEXT, TEXT_PX_BODY, FB_W - 200);
-        draw_right(fb, ry + 20, theme_name[0] ? theme_name : "Built-in");
-
-        int wy = set_wpstheme_desc_y();
-        draw_text(fb, 24, wy, "Rockbox theme for Now Playing. Unzip into", COL_DIM, TEXT_PX_SMALL, FB_W - 48);
-        draw_text(fb, 24, wy + 26, "/.rockbox on the card. Tap to change.", COL_DIM, TEXT_PX_SMALL, FB_W - 48);
 
         ry = set_row_theme_y();
         fill_rect(fb, 0, ry - 1, FB_W, 1, COL_LINE);
@@ -2967,15 +2890,6 @@ static void load_conf(void) {
                    sscanf(line, "auto_off_minutes=%d", &v) == 1) {
             for (int i = 0; i < AUTO_OFF_CHOICE_N; i++)
                 if (AUTO_OFF_CHOICES[i] == v) { auto_off_idx = i; break; }
-        } else if (!strncmp(line, "theme", 5)) {
-            const char *eq = strchr(line, '=');
-            if (eq) {
-                eq++;
-                while (*eq == ' ' || *eq == '\t') eq++;
-                snprintf(theme_name, sizeof(theme_name), "%s", eq);
-                char *nl = strpbrk(theme_name, "\r\n");
-                if (nl) *nl = '\0';
-            }
         }
     }
     fclose(f);
@@ -3005,8 +2919,7 @@ static void save_conf(void) {
                 !conf_line_is(lines[n], "button_lock_enabled") &&
                 !conf_line_is(lines[n], "deep_sleep") &&
                 !conf_line_is(lines[n], "sleep_minutes") &&
-                !conf_line_is(lines[n], "auto_off_minutes") &&
-                !conf_line_is(lines[n], "theme"))
+                !conf_line_is(lines[n], "auto_off_minutes"))
                 n++;
         }
         fclose(f);
@@ -3019,7 +2932,6 @@ static void save_conf(void) {
     fprintf(f, "sleep_minutes = %d\n", sleep_minutes());
     fprintf(f, "deep_sleep = %d\n", deep_sleep_enabled);
     fprintf(f, "auto_off_minutes = %d\n", auto_off_minutes());
-    fprintf(f, "theme = %s\n", theme_name);
     fclose(f);
 }
 
@@ -3454,7 +3366,6 @@ static int music_entry(void *a0, void *a1) {
     (void)a0; (void)a1;
     mlog("[music] entering app\n");
     load_conf();
-    theme_apply();          /* file I/O, so once at entry -- never per frame */
     screen = SC_MENU; reset_scroll();
     if (lib_open() != 0) mlog("[music] library open failed\n");
 
@@ -3870,20 +3781,6 @@ static int music_entry(void *a0, void *a1) {
                 int ry_autooff = set_row_autooff_y();
                 if (y >= ry_lock && y < ry_lock + ROW_H) {
                     button_lock_enabled = !button_lock_enabled;
-                    save_conf();
-                } else if (y >= set_row_wpstheme_y() && y < set_row_wpstheme_y() + ROW_H) {
-                    /* Cycles "Built-in" then whatever .cfg files are on the
-                     * card, rescanned on every tap so a theme copied across
-                     * while the app is running is picked up without a restart. */
-                    static char names[THEME_MAX][64];
-                    int n = wps_scan_themes(THEME_DIR, names, THEME_MAX);
-                    int cur = -1;                       /* -1 = built-in */
-                    for (int i = 0; i < n; i++)
-                        if (!strcmp(names[i], theme_name)) { cur = i; break; }
-                    cur++;
-                    if (cur >= n) theme_name[0] = '\0';
-                    else snprintf(theme_name, sizeof(theme_name), "%s", names[cur]);
-                    theme_apply();
                     save_conf();
                 } else if (y >= ry_autooff && y < ry_autooff + ROW_H) {
                     /* Cycles rather than opening a picker: six short values,

@@ -34,11 +34,6 @@ on demand; MP3 playback with real transport (±10s/±30s, play/pause); speed
 0.5–2.0× with pitch preserved (WSOLA); per-episode resume across reboots;
 scrollable show notes; cover art per feed; full Latin text rendering.
 
-> Rockbox-style theme support exists in Library's source but is **not enabled
-> in this release** — it doesn't render correctly yet and isn't ready to
-> promote. If you find `theme_name` in Library's settings, leave it unset;
-> stock rendering ("Built-in") is what's tested.
-
 ## Requirements
 
 - A HiBy R1. This release targets **vanilla stock firmware 1.6**, unmodified
@@ -242,8 +237,6 @@ full account for Podcasts.
 ## Known limitations
 
 - Podcasts plays **MP3 only** — no AAC, M4A/M4B, Opus or FLAC episodes.
-- Rockbox theme support in Library is present in source but disabled — see
-  the note under [What you get](#what-you-get).
 - Long titles clip at the right edge instead of ellipsing.
 - English UI only; other languages fall back to stock labels where a string
   had to be rewritten (Podcasts' tile label).
