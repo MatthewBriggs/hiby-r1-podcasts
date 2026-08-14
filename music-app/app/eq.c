@@ -150,6 +150,28 @@ static void take_snapshot(snapshot_t *s) {
     pthread_mutex_unlock(&g_lock);
 }
 
+/* Defensive: an IIR filter's own state can in principle run away (a marginal
+ * pole from an extreme gain/Q combination, or -- this core is soft-float, see
+ * audio.c's own CPU-measurement comment -- an edge case in denormal
+ * handling), and z1/z2 carry over between calls indefinitely with nothing
+ * that would otherwise ever reset a bad value short of a format change.
+ * Checked once per buffer, not per sample: negligible cost, and normal audio
+ * in this +/-1.0 domain never comes remotely close to this magnitude.
+ * BG32 (an occasional loud tone in one channel that pausing and resuming
+ * cleared) is the suspected symptom -- not confirmed, but state with nothing
+ * to catch a runaway value was a real gap regardless of whether this is the
+ * actual cause. */
+static void sanitize_state(int n, int channels) {
+    for (int b = 0; b < n; b++)
+        for (int ch = 0; ch < channels; ch++) {
+            state_t *z = &g_state[b][ch];
+            if (!isfinite(z->z1) || !isfinite(z->z2) ||
+                fabsf(z->z1) > 1e6f || fabsf(z->z2) > 1e6f) {
+                z->z1 = 0.0f; z->z2 = 0.0f;
+            }
+        }
+}
+
 void eq_process_s16(short *buf, int frames, int channels) {
     if (!g_enabled) return;
     if (channels > EQ_MAX_CH) channels = EQ_MAX_CH;
@@ -167,6 +189,7 @@ void eq_process_s16(short *buf, int frames, int channels) {
             buf[idx] = (short)(y >= 0 ? y + 0.5f : y - 0.5f);
         }
     }
+    sanitize_state(s.n, channels);
 }
 
 /* DTFT of the cascade at z = e^jw: multiply each band's |H| (sum the dB,
@@ -213,4 +236,5 @@ void eq_process_s32(int32_t *buf, int frames, int channels) {
             buf[idx] = (int32_t)y;
         }
     }
+    sanitize_state(s.n, channels);
 }
