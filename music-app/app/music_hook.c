@@ -156,6 +156,50 @@ static int  bt_poll_run;
 static pthread_t bt_thread;
 static int  bt_thread_valid;
 
+/* BG38 (part 2): fuzzy-match a saved EQ profile to whichever headphone is
+ * connected, so Sonys getting the Sonys' profile and Jabras getting the
+ * Jabras' doesn't need a manual pick every session.
+ *
+ * The actual eq_switch_to()/save_conf() call has to happen on the main
+ * thread: eq_cur/eq_cur_path and everything save_conf() reads are only
+ * ever touched from there today, with no lock protecting them, the same
+ * as every other UI-owned global in this file. Doing the switch directly
+ * from this background thread would be a new, real data race against
+ * whatever the main thread is doing with the EQ screen at the same
+ * moment. So this thread only ever does the (cheap, stateless) fuzzy
+ * match and hands the winning path across through bt_lock -- the same
+ * handoff shape already used for the pending Bluetooth volume delta --
+ * and the main loop drains it and performs the switch itself. */
+static char bt_matched_name[64];      /* device this thread last matched */
+static char bt_eq_pending_path[EP_PATH_LEN];   /* set here, applied on the main thread */
+
+/* Case-insensitive, either-direction substring match against each profile's
+ * own name (from its filename): forgiving of a device advertising a
+ * slightly different string than the profile was saved under ("Sony
+ * WH-1000XM4" vs "WH-1000XM4"), which is the whole reason this is fuzzy
+ * rather than exact. A minimum length on the shorter side keeps a short or
+ * generic profile name (a stray "EQ" or "1") from matching almost anything
+ * by accident. First match wins; ep_scan()'s own directory order decides
+ * ties, same as everywhere else profiles are listed. Runs on the bt_poll
+ * thread, so a local array only -- see the comment above for why it must
+ * not touch the shared eq_profiles[]. */
+static void bt_match_profile(const char *dev_name) {
+    ep_entry_t profiles[EP_MAX_PROFILES];
+    int n = ep_scan(profiles, EP_MAX_PROFILES);
+    for (int i = 0; i < n; i++) {
+        size_t dn = strlen(dev_name), pn = strlen(profiles[i].name);
+        if ((dn < 4 && dn <= pn) || (pn < 4 && pn <= dn)) continue;
+        if (strcasestr(dev_name, profiles[i].name) ||
+            strcasestr(profiles[i].name, dev_name)) {
+            pthread_mutex_lock(&bt_lock);
+            snprintf(bt_eq_pending_path, sizeof(bt_eq_pending_path), "%s",
+                    profiles[i].path);
+            pthread_mutex_unlock(&bt_lock);
+            return;
+        }
+    }
+}
+
 static void *bt_poll(void *arg) {
     (void)arg;
     while (bt_poll_run) {
@@ -169,11 +213,18 @@ static void *bt_poll(void *arg) {
             snprintf(bt_codec_cached, sizeof(bt_codec_cached), "%s", c);
             bt_batt_cached = b;
             pthread_mutex_unlock(&bt_lock);
+            char nm[64];
+            st_bt_name(nm, sizeof(nm));
+            if (nm[0] && strcmp(nm, bt_matched_name) != 0) {
+                bt_match_profile(nm);
+                snprintf(bt_matched_name, sizeof(bt_matched_name), "%s", nm);
+            }
         } else {
             pthread_mutex_lock(&bt_lock);
             bt_codec_cached[0] = '\0';
             bt_batt_cached = -1;
             pthread_mutex_unlock(&bt_lock);
+            bt_matched_name[0] = '\0';
         }
         /* Checking for a pending volume write is a cheap mutex read, not a
          * D-Bus round-trip, so it can happen on every sub-tick without
@@ -3470,6 +3521,22 @@ static int music_entry(void *a0, void *a1) {
         int g = (tfd >= 0) ? read_gesture(tfd, &x, &y) : 0;
         if (locked) g = 0;             /* drained above, acted on here: never */
         else if (g) idle = 0;
+
+        /* BG38 (part 2): drain bt_poll's fuzzy-matched profile, if it found
+         * one since the last time round. The switch itself has to happen
+         * here, not on that thread -- see the comment on bt_match_profile(). */
+        {
+            char eqpath[EP_PATH_LEN];
+            pthread_mutex_lock(&bt_lock);
+            snprintf(eqpath, sizeof(eqpath), "%s", bt_eq_pending_path);
+            bt_eq_pending_path[0] = '\0';
+            pthread_mutex_unlock(&bt_lock);
+            if (eqpath[0] && strcmp(eqpath, eq_cur_path) != 0) {
+                eq_switch_to(eqpath);
+                save_conf();
+                dirty = 1;
+            }
+        }
 
         /* A track that reaches its end should roll into the next one; stopping
          * dead at every track boundary is the one thing a music player cannot
