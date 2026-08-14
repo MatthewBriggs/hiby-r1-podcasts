@@ -140,13 +140,27 @@ INSERT_BT = ('/usr/bin/bluealsa -p a2dp-source -p hfp-ag '
              '--a2dp-volume --sbc-quality=xq --xapl-resp-name=iPhone &')
 
 
+ANCHOR_BT_VANILLA = '/usr/bin/bluealsa -p a2dp-source --a2dp-volume &'
+INSERT_BT_VANILLA = ('/usr/bin/bluealsa -p a2dp-source -p hfp-ag '
+                     '--a2dp-volume --xapl-resp-name=iPhone &')
+
+
 def patch_bt_init(text):
-    """Add the HFP profile so a headset can report its battery."""
+    """Add the HFP profile so a headset can report its battery.
+
+    Two anchors: the mod's own bt_init already carries --sbc-quality=xq (a
+    separate, earlier tweak this project did not introduce), vanilla 1.6's
+    does not -- confirmed by reading it directly. Trying the vanilla anchor
+    only when the mod one does not match keeps this working against either
+    base without having to be told which one a given .upt actually is.
+    """
     if "hfp-ag" in text:
         return None                      # already done
-    if ANCHOR_BT not in text:
-        return None
-    return text.replace(ANCHOR_BT, INSERT_BT, 1)
+    if ANCHOR_BT in text:
+        return text.replace(ANCHOR_BT, INSERT_BT, 1)
+    if ANCHOR_BT_VANILLA in text:
+        return text.replace(ANCHOR_BT_VANILLA, INSERT_BT_VANILLA, 1)
+    return None
 
 
 ANCHOR_MOUNT = 'mount -o sync -t ubifs /dev/${ubi_name}_0 $mount_path'
@@ -247,6 +261,125 @@ def need(tool):
         die(f"{tool} not found — install squashfs-tools")
 
 
+# Vanilla 1.6's usr/bin/hiby_player.sh has none of the structure
+# patch_script() patches -- no MAX_CRASHES, no LD_PRELOAD, no crash counting.
+# It is thirteen bare lines: kill any stale hiby_player, start batd if
+# present, run the player once, reboot when it exits. There is no anchor to
+# key an incremental patch off, so build_vanilla_supervisor() below
+# constructs the complete replacement directly instead, reusing the mod's
+# own already-shipped supervisor loop (app/hiby_player.sh in this repo) as
+# the reference for the parts that are proven -- the crash-counting shape,
+# DEV_HOOK_GIVEUP, HEALTHY_RUN -- with three differences: vanilla's own batd
+# preamble is kept rather than introduced, HOOK_LIB is dropped entirely (the
+# yetisoldier Audiobook Mod's own separate tile hijack has no reason to exist
+# against a vanilla base -- Library has its own Audiobooks section, reached
+# through the same DEV_HOOK), and the performance tuning that used to be a
+# separate INSERT_CONFIG patch step is folded straight in rather than
+# layered on afterward.
+VANILLA_ANCHOR_PREAMBLE_END = '/usr/bin/batd -v -s -t5 -o /mnt/sd_0/batlog.txt &\nfi\n'
+
+VANILLA_SUPERVISOR_BODY = '''PLAYER="/usr/bin/hiby_player"
+CRASH_COUNT=0
+MAX_CRASHES=5
+
+# --- Library/Podcasts additions ---------------------------------------------
+# The rootfs is read-only squashfs, so there is otherwise no way to start user
+# code at boot or to load a preload without reflashing. DEV_HOOK reads from
+# /usr/data, which is writable and survives a firmware update.
+#
+# DEV_HOOK is dropped after DEV_HOOK_GIVEUP consecutive crashes so that a
+# broken library degrades to a working stock player instead of a reboot loop.
+DEV_HOOK="/usr/data/libpodcast_hook.so"
+DEV_HOOK_GIVEUP=2
+HEALTHY_RUN=60          # seconds up before a run counts as a success
+USER_INIT="/usr/data/init.sh"
+
+[ -f "$USER_INIT" ] && sh "$USER_INIT" >/dev/null 2>&1 &
+
+# Performance tuning, applied once at startup.
+#
+# Read-ahead: the card ships at 128 KB. Library scans and large FLAC reads are
+# sequential, and on a slow SD card a bigger window is most of the difference
+# between smooth and stuttering. 2 MB costs a little RAM for a lot of
+# throughput.
+for q in /sys/block/mmcblk*/queue/read_ahead_kb; do
+    [ -w "$q" ] && echo 2048 > "$q"
+done
+
+# vfs_cache_pressure: at the default 100 the kernel reclaims dentries and
+# inodes as eagerly as page cache. With 56 MB of RAM that means the library UI
+# keeps re-reading the same directory metadata and cover paths. Halving it
+# keeps them resident longer without pinning them outright.
+[ -w /proc/sys/vm/vfs_cache_pressure ] && echo 50 > /proc/sys/vm/vfs_cache_pressure
+# -----------------------------------------------------------------------------
+
+while true; do
+    if [ "$CRASH_COUNT" -lt "$DEV_HOOK_GIVEUP" ] && [ -f "$DEV_HOOK" ]; then
+        LD_PRELOAD="$DEV_HOOK" "$PLAYER" &
+    else
+        "$PLAYER" &
+    fi
+    HP_PID=$!
+    STARTED=$(date +%s)
+    wait "$HP_PID" 2>/dev/null
+
+    # The counter is meant to catch a hook that cannot survive startup, so it
+    # has to measure *consecutive* failures. A player that stayed up long
+    # enough to be useful is evidence the hook is fine.
+    if [ $(( $(date +%s) - STARTED )) -ge "$HEALTHY_RUN" ]; then
+        CRASH_COUNT=0
+    else
+        CRASH_COUNT=$((CRASH_COUNT + 1))
+    fi
+    if [ "$CRASH_COUNT" -ge "$MAX_CRASHES" ]; then
+        reboot
+    fi
+    sleep 1
+done
+'''
+
+
+def build_vanilla_supervisor(original_text):
+    """Full-replacement supervisor for a bare vanilla hiby_player.sh.
+
+    Returns None if this is not that script -- already has MAX_CRASHES (a
+    mod-based image; patch_script() handles that case), or is missing the
+    batd-preamble anchor this was written against, in which case the caller
+    should stop rather than silently produce a half-built script.
+    """
+    if "MAX_CRASHES" in original_text:
+        return None
+    if VANILLA_ANCHOR_PREAMBLE_END not in original_text:
+        return None
+    preamble = original_text.split(VANILLA_ANCHOR_PREAMBLE_END)[0] + VANILLA_ANCHOR_PREAMBLE_END
+    return preamble + "\n" + VANILLA_SUPERVISOR_BODY
+
+
+# Settings -> About only shows because Podcasts took the top-level slot that
+# used to say About; flipping this is what puts it back, one level in.
+# Present verbatim on both stock 1.6 and the mod's 2.0.26 (the mod already
+# flips it itself, which is why this is a no-op there -- confirmed by reading
+# both directly), so this one function is correct against either base.
+SET_FUNCTIONS_FILES = ("usr/resource/set_functions.json",
+                       "usr/resource/midi_set_functions.json")
+
+
+def enable_about_tile(root):
+    """Flip about:0 -> 1 in every set_functions.json this rootfs has."""
+    changed = []
+    for rel in SET_FUNCTIONS_FILES:
+        path = os.path.join(root, rel)
+        if not os.path.exists(path):
+            continue
+        with open(path) as fh:
+            text = fh.read()
+        if '"about":0' not in text:
+            continue                     # already enabled, or key not present
+        with open(path, "w") as fh:
+            fh.write(text.replace('"about":0', '"about":1'))
+        changed.append(rel)
+    return changed
+
 def patch_script(text):
     """Return the patched supervisor, or None if it is already patched."""
     if "DEV_HOOK" in text:
@@ -264,6 +397,164 @@ def patch_script(text):
     text = text.replace(ANCHOR_LAUNCH, INSERT_LAUNCH)
     text = text.replace(ANCHOR_COUNT, INSERT_COUNT)
     return text
+
+
+def detect_format(iso):
+    """'mod' (the D0000001/... chunk layout every prior release used) or
+    'stock' (the older OTA_V0/... layout vanilla 1.6 uses -- confirmed by
+    extracting a real stock 1.6 image directly, not assumed)."""
+    for path, name in (("/D0000001", "mod"), ("/OTA_V0", "stock")):
+        try:
+            next(iso.list_children(iso_path=path))
+            return name
+        except Exception:
+            continue
+    die("unrecognised .upt layout -- neither /D0000001 (mod) nor /OTA_V0 "
+        "(stock) found. Is this really an R1 firmware image?")
+
+
+def read_images_ota_v0(iso):
+    """Stock/vanilla layout: OTA_V0/OTA_UPDA.IN manifest, OTA_V0/OTA_MD5_.<xxx>
+    per-image ordered chunk-digest lists (xxx = the image's own md5, first 3
+    hex chars, uppercase -- same convention read_images() already documents
+    for the mod format's F0000002/3.BIN, just keyed by name here instead of
+    position), ROOTFS_S.<xxx>/XIMAGE_0.<xxx> chunk files.
+
+    xxx in a chunk's own filename is NOT its own digest -- confirmed
+    empirically against a real stock 1.6 image: chunk 0's suffix is the whole
+    image's own digest prefix, and chunk N>0's is chunk N-1's -- the same
+    verification-chain idea write_upt() already implements for the other
+    format, just discovered independently here rather than assumed to carry
+    over. Chunks are matched to the ordered digest list by each chunk's own
+    real md5, same as read_images() does; names are for the chain, not
+    lookup.
+    """
+    def rd(path):
+        b = io.BytesIO()
+        iso.get_file_from_iso_fp(b, iso_path=path)
+        return b.getvalue()
+
+    def list_dir(path):
+        return sorted(c.file_identifier().decode()
+                     for c in iso.list_children(iso_path=path)
+                     if c.file_identifier() not in (b'.', b'..'))
+
+    manifest = rd("/OTA_V0/OTA_UPDA.IN;1").decode()
+    entries = re.findall(r"img_type=(\S+)\s+img_name=(\S+)\s+"
+                         r"img_size=(\d+)\s+img_md5=([0-9a-f]+)", manifest)
+    if not entries:
+        die("could not parse the image manifest — is this an R1 .upt?")
+
+    names = list_dir("/OTA_V0")
+    chunk_files = [n for n in names if n.startswith("ROOTFS_S.") or n.startswith("XIMAGE_0.")]
+    by_own_md5 = {}
+    for n in chunk_files:
+        data = rd(f"/OTA_V0/{n}")
+        by_own_md5[hashlib.md5(data).hexdigest()] = data
+
+    images = []
+    for img_type, name, size, md5 in entries:
+        prefix = md5[:3].upper()
+        dfile = next((n for n in names if n.upper().startswith(f"OTA_MD5_.{prefix}")), None)
+        if dfile is None:
+            die(f"no OTA_MD5_ digest list found for {name} (prefix {prefix}) "
+                f"— image is corrupt or the layout has changed")
+        digest_list = rd(f"/OTA_V0/{dfile}").decode().split()
+        try:
+            data = b"".join(by_own_md5[d] for d in digest_list)
+        except KeyError as e:
+            die(f"{name}: a chunk digest in {dfile} matches no chunk file "
+                f"on disk ({e}) — image is corrupt or the layout has changed")
+        got = hashlib.md5(data).hexdigest()
+        if got != md5 or len(data) != int(size):
+            die(f"{name}: reassembled {len(data)} bytes md5={got}, "
+                f"manifest says {size} bytes md5={md5}")
+        images.append({"type": img_type, "name": name, "data": data})
+    return manifest, entries, images
+
+
+# 8.3 base name per image type -- fixed strings, not derived from img_name,
+# confirmed against the real stock image (every rootfs chunk is ROOTFS_S.xxx
+# regardless of index, every kernel chunk XIMAGE_0.xxx).
+OTA_V0_BASE_NAME = {"rootfs": "ROOTFS_S", "kernel": "XIMAGE_0"}
+
+
+def write_upt_ota_v0(out_path, images):
+    """Rebuild a stock-format .upt. See read_images_ota_v0() for the naming
+    scheme this reproduces. Same Joliet(3)/Rock Ridge(1.09) requirement as
+    the mod format's write_upt() -- confirmed present on the stock image too,
+    by direct inspection (iso.has_joliet()/has_rock_ridge()) -- and the same
+    reasoning applies: this is not cosmetic, the device's updater will not
+    navigate an image missing them. Real names below (ota_update.in,
+    ota_md5_..., ota_config.in, ...) are likewise taken from the stock
+    image's own Rock Ridge records, not guessed.
+    """
+    import pycdlib
+    iso = pycdlib.PyCdlib()
+    iso.new(interchange_level=1, vol_ident="CDROM",
+            joliet=3, rock_ridge="1.09")
+    iso.add_directory("/OTA_V0", joliet_path="/ota_v0", rr_name="ota_v0")
+
+    used_iso_paths = set()
+
+    def add(data, iso_path, real, joliet_dir="/ota_v0/"):
+        # The chunk suffix is 3 hex chars of a content digest -- only 4096
+        # slots, and a real rootfs runs ~70 chunks, so a same-directory
+        # collision is a real birthday-bound risk, not a hypothetical: it hit
+        # on the very first build of a rootfs whose content differs from the
+        # vendor's own (pycdlib doesn't error on a duplicate 8.3 name, it
+        # silently drops the earlier record, corrupting the image). ISO9660
+        # version numbers exist precisely to let two entries share a short
+        # name, so bump the version on a collision rather than invent a
+        # naming scheme of our own -- the Rock Ridge real name, which is what
+        # actually carries the chain semantics, is untouched either way.
+        base, _, version = iso_path.rpartition(";")
+        v = int(version)
+        while iso_path in used_iso_paths:
+            v += 1
+            iso_path = f"{base};{v}"
+        used_iso_paths.add(iso_path)
+        iso.add_fp(io.BytesIO(data), len(data), iso_path,
+                   joliet_path=joliet_dir + real if joliet_dir else "/" + real,
+                   rr_name=real)
+
+    def chunks(d):
+        return [d[i:i + CHUNK] for i in range(0, len(d), CHUNK)]
+
+    lines = ["ota_version=0", ""]
+    for img in images:
+        lines.append(f"img_type={img['type']}")
+        lines.append(f"img_name={img['name']}")
+        lines.append(f"img_size={len(img['data'])}")
+        lines.append(f"img_md5={hashlib.md5(img['data']).hexdigest()}")
+        lines.append("")
+    new_manifest = "\n".join(lines).rstrip("\n") + "\n"
+    add(new_manifest.encode(), "/OTA_V0/OTA_UPDA.IN;1", "ota_update.in")
+
+    for img in images:
+        base = OTA_V0_BASE_NAME.get(img["type"])
+        if base is None:
+            die(f"unknown image type {img['type']!r} — no stock chunk-name "
+                f"convention known for it; this tool has only ever seen "
+                f"'rootfs' and 'kernel'")
+        whole = hashlib.md5(img["data"]).hexdigest()
+        pieces = chunks(img["data"])
+        per_chunk = [hashlib.md5(c).hexdigest() for c in pieces]
+
+        digest_list_text = "".join(d + "\n" for d in per_chunk)
+        add(digest_list_text.encode(), f"/OTA_V0/OTA_MD5_.{whole[:3].upper()};1",
+            f"ota_md5_{img['name']}.{whole}")
+
+        for k, c in enumerate(pieces):
+            chain_digest = whole if k == 0 else per_chunk[k - 1]
+            suffix = chain_digest[:3].upper()
+            add(c, f"/OTA_V0/{base}.{suffix};1",
+                f"{img['name']}.{k:04d}.{chain_digest}")
+
+    add(b"\n", "/OTA_V0/OTA_V0.OK;1", "ota_v0.ok")
+    add(b"current_version=0\n", "/OTA_CONF.IN;1", "ota_config.in", joliet_dir="/")
+    iso.write(out_path)
+    iso.close()
 
 
 def read_images(iso):
@@ -391,15 +682,23 @@ def main():
 
     iso = pycdlib.PyCdlib()
     iso.open(args.input)
-    manifest, entries, images, last = read_images(iso)
+    fmt = detect_format(iso)
 
     def rd(path):
         b = io.BytesIO()
         iso.get_file_from_iso_fp(b, iso_path=path)
         return b.getvalue()
-    meta = rd("/D0000001/F0000005.TXT;1")
-    version_blob = rd(f"/F{last:07d}.TXT;1")
+
+    if fmt == "mod":
+        manifest, entries, images, last = read_images(iso)
+        meta = rd("/D0000001/F0000005.TXT;1")
+        version_blob = rd(f"/F{last:07d}.TXT;1")
+    else:
+        manifest, entries, images = read_images_ota_v0(iso)
+        last = None          # the mod format's own F{last}.TXT numbering doesn't apply
+        meta = version_blob = None    # written directly by write_upt_ota_v0() instead
     iso.close()
+    print(f"detected layout: {fmt}")
 
     print(f"{args.input}:")
     for img in images:
@@ -421,18 +720,40 @@ def main():
 
         target = os.path.join(root, SCRIPT)
         if not os.path.exists(target):
-            die(f"{SCRIPT} not found — this does not look like the Audiobook Mod. "
-                f"The Podcasts app needs the mod's LD_PRELOAD supervisor.")
+            die(f"{SCRIPT} not found — this does not look like a real R1 "
+                f"rootfs at all.")
 
         with open(target, "r") as fh:
             original = fh.read()
-        patched = patch_script(original)
-        if patched is None:
+
+        if "DEV_HOOK" in original:
             die(f"{SCRIPT} already contains DEV_HOOK — this image is already patched")
+
+        # Two supervisor shapes, routed on whether this is a mod-based image
+        # (has the mod's own MAX_CRASHES supervisor to patch incrementally)
+        # or a vanilla one (bare stock script, no anchor to patch --
+        # build_vanilla_supervisor() writes the whole replacement instead).
+        # Neither function guesses silently: each returns None if the input
+        # does not match what it was written against, and that is treated as
+        # a hard stop rather than a best-effort patch, for the same reason
+        # patch_script() always has -- a half-applied patch to init would be
+        # a brick rather than a bug.
+        if "MAX_CRASHES" in original:
+            patched = patch_script(original)
+            kind = "mod-based"
+        else:
+            patched = build_vanilla_supervisor(original)
+            kind = "vanilla"
+        if patched is None:
+            die(f"{SCRIPT} matches neither the mod's supervisor shape nor "
+                f"vanilla's bare one — this firmware's {SCRIPT} has changed "
+                f"from what this tool knows. Patch it by hand, using "
+                f"app/hiby_player.sh (mod-based) or build_vanilla_supervisor() "
+                f"(vanilla) as the reference.")
         with open(target, "w") as fh:
             fh.write(patched)
-        print(f"patched {SCRIPT} "
-              f"({len(original.splitlines())} -> {len(patched.splitlines())} lines)")
+        print(f"patched {SCRIPT} ({kind} base, "
+              f"{len(original.splitlines())} -> {len(patched.splitlines())} lines)")
 
         mtarget = os.path.join(root, MOUNT_SCRIPT)
         if os.path.exists(mtarget):
@@ -459,6 +780,12 @@ def main():
                 with open(btarget, "w") as fh:
                     fh.write(bpatched)
                 print(f"patched {BT_INIT} (bluealsa: +hfp-ag for battery reporting)")
+
+        about = enable_about_tile(root)
+        if about:
+            print(f"enabled Settings -> About in {len(about)} file(s)")
+        else:
+            print("note: About already enabled, or set_functions.json missing")
 
         # Version stamp, so the build is identifiable from the device itself.
         if not args.no_radio:
@@ -500,18 +827,27 @@ def main():
         with open(newsq, "rb") as fh:
             rootfs["data"] = fh.read()
 
-    # The rootfs almost always changes size, so the manifest has to follow it.
-    for img_type, name, size, md5 in entries:
-        if img_type == "rootfs":
-            manifest = manifest.replace(f"img_size={size}",
-                                        f"img_size={len(rootfs['data'])}")
-            manifest = manifest.replace(f"img_md5={md5}",
-                                        f"img_md5={hashlib.md5(rootfs['data']).hexdigest()}")
-
     print("building .upt...")
-    last = write_upt(args.output, images, manifest, meta, version_blob, last)
-    print(f"\nwrote {args.output} ({os.path.getsize(args.output)} bytes, "
-          f"last entry F{last:07d}.TXT)")
+    if fmt == "mod":
+        # The rootfs almost always changes size, so the manifest text has to
+        # follow it -- write_upt() takes the manifest as text and patches it
+        # in place, matching how it was read.
+        for img_type, name, size, md5 in entries:
+            if img_type == "rootfs":
+                manifest = manifest.replace(f"img_size={size}",
+                                            f"img_size={len(rootfs['data'])}")
+                manifest = manifest.replace(f"img_md5={md5}",
+                                            f"img_md5={hashlib.md5(rootfs['data']).hexdigest()}")
+        last = write_upt(args.output, images, manifest, meta, version_blob, last)
+        print(f"\nwrote {args.output} ({os.path.getsize(args.output)} bytes, "
+              f"last entry F{last:07d}.TXT)")
+    else:
+        # write_upt_ota_v0() rebuilds OTA_UPDA.IN fresh from each image's own
+        # (possibly just-changed) data, so there is no old manifest text to
+        # patch in place here -- unlike the mod format, size/md5 are never
+        # stale to begin with.
+        write_upt_ota_v0(args.output, images)
+        print(f"\nwrote {args.output} ({os.path.getsize(args.output)} bytes)")
     print("\nVerify it before flashing:  ./tools/verify_firmware.py " + args.output)
 
 

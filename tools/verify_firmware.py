@@ -27,6 +27,28 @@ MOUNT_SCRIPT = "usr/bin/mount_ubifs.sh"
 BT_INIT = "usr/bin/bt_init"
 CONFIG_JSON = "usr/resource/config.json"
 VERSION_FILE = "etc/r1_audiobook_version"
+SET_FUNCTIONS_FILES = ("usr/resource/set_functions.json",
+                       "usr/resource/midi_set_functions.json")
+
+
+def detect_format(path):
+    """'mod' (the D0000001/... layout every prior release used) or 'stock'
+    (the OTA_V0/... layout vanilla 1.6 uses) -- see patch_firmware.py's own
+    detect_format() for how this was confirmed against a real stock image.
+    """
+    import pycdlib
+    iso = pycdlib.PyCdlib()
+    iso.open(path)
+    fmt = None
+    for iso_path, name in (("/D0000001", "mod"), ("/OTA_V0", "stock")):
+        try:
+            next(iso.list_children(iso_path=iso_path))
+            fmt = name
+            break
+        except Exception:
+            continue
+    iso.close()
+    return fmt
 
 
 def load(path):
@@ -124,6 +146,114 @@ def check_structure(path, images, chunk_digests):
     return problems, first
 
 
+def load_ota_v0(path):
+    """Stock/vanilla layout counterpart to load(). See patch_firmware.py's
+    read_images_ota_v0() for the full account: manifest at
+    OTA_V0/OTA_UPDA.IN, per-image ordered chunk-digest lists at
+    OTA_V0/OTA_MD5_.<xxx> (xxx = the image's own md5, first 3 hex chars,
+    uppercase), chunk files at OTA_V0/ROOTFS_S.<xxx> / OTA_V0/XIMAGE_0.<xxx>
+    matched to the digest list by each chunk's own real md5.
+    """
+    import pycdlib
+    iso = pycdlib.PyCdlib()
+    iso.open(path)
+
+    def rd(p):
+        b = io.BytesIO()
+        iso.get_file_from_iso_fp(b, iso_path=p)
+        return b.getvalue()
+
+    def list_dir(p):
+        return sorted(c.file_identifier().decode()
+                     for c in iso.list_children(iso_path=p)
+                     if c.file_identifier() not in (b'.', b'..'))
+
+    manifest = rd("/OTA_V0/OTA_UPDA.IN;1").decode()
+    entries = re.findall(r"img_type=(\S+)\s+img_name=(\S+)\s+"
+                         r"img_size=(\d+)\s+img_md5=([0-9a-f]+)", manifest)
+    by_md5 = {md5: (t, name, int(size)) for t, name, size, md5 in entries}
+
+    names = list_dir("/OTA_V0")
+    chunk_files = [n for n in names if n.startswith("ROOTFS_S.") or n.startswith("XIMAGE_0.")]
+    by_own_md5 = {}
+    for n in chunk_files:
+        data = rd(f"/OTA_V0/{n}")
+        by_own_md5[hashlib.md5(data).hexdigest()] = data
+
+    images, chunk_digests, listed = [], [], []
+    for img_type, name, size, md5 in entries:
+        prefix = md5[:3].upper()
+        dfile = next((n for n in names if n.upper().startswith(f"OTA_MD5_.{prefix}")), None)
+        digest_list = rd(f"/OTA_V0/{dfile}").decode().split() if dfile else []
+        parts = [by_own_md5.get(d, b"") for d in digest_list]
+        data = b"".join(parts)
+        got = hashlib.md5(data).hexdigest()
+        img_type2, name2, size2 = by_md5.get(got, ("unknown", "unmatched", -1))
+        images.append({"type": img_type2, "name": name2, "size": size2,
+                       "matched": got in by_md5, "data": data, "first": None})
+        chunk_digests.append([hashlib.md5(p).hexdigest() for p in parts])
+        listed.append(digest_list)
+    version = rd("/OTA_CONF.IN;1")
+    iso.close()
+    return images, chunk_digests, listed, version, None
+
+
+def check_structure_ota_v0(path, images, chunk_digests):
+    """OTA_V0 counterpart to check_structure() -- same idea (checksums alone
+    don't prove the updater can navigate the image), adapted to this format's
+    own directory (OTA_V0, not D0000001) and fixed per-type chunk base names
+    (ROOTFS_S/XIMAGE_0, not the image's own real filename) -- see
+    patch_firmware.py's write_upt_ota_v0() for where those were confirmed
+    against a real stock image.
+    """
+    import pycdlib
+    iso = pycdlib.PyCdlib(); iso.open(path)
+    problems = []
+
+    if not iso.has_joliet():
+        problems.append("no Joliet extension")
+    if not iso.has_rock_ridge():
+        problems.append("no Rock Ridge extension")
+
+    def rr(rec):
+        return rec.rock_ridge.name().decode() if rec.rock_ridge and rec.rock_ridge.name() else ""
+
+    root = {}
+    for c in iso.list_children(iso_path="/"):
+        n = c.file_identifier().decode(errors="replace")
+        if n not in (".", ".."):
+            root[n] = rr(c)
+    if root.get("OTA_V0") != "ota_v0":
+        problems.append(f"payload dir is {root.get('OTA_V0')!r}, expected 'ota_v0'")
+    if "ota_config.in" not in root.values():
+        problems.append("no ota_config.in at the root")
+
+    names = []
+    for c in iso.list_children(iso_path="/OTA_V0"):
+        n = c.file_identifier().decode(errors="replace")
+        if n not in (".", ".."):
+            names.append(rr(c))
+    for want in ("ota_update.in", "ota_v0.ok"):
+        if want not in names:
+            problems.append(f"missing {want}")
+
+    chunk_names = [n for n in names if re.match(r".+\.\d{4}\.[0-9a-f]{32}$", n)]
+    expected = []
+    for i, img in enumerate(images):
+        whole = hashlib.md5(img["data"]).hexdigest()
+        for k in range(len(chunk_digests[i])):
+            digest = whole if k == 0 else chunk_digests[i][k - 1]
+            expected.append(f"{img['name']}.{k:04d}.{digest}")
+    if sorted(chunk_names) != sorted(expected):
+        missing = set(expected) - set(chunk_names)
+        extra = set(chunk_names) - set(expected)
+        problems.append(f"chunk name chain wrong "
+                        f"({len(missing)} expected missing, {len(extra)} unexpected present)")
+
+    iso.close()
+    return problems
+
+
 def unpack_rootfs(data, dest):
     sq = os.path.join(dest, "r.squashfs")
     with open(sq, "wb") as fh:
@@ -160,10 +290,17 @@ def main():
     except ImportError:
         sys.exit("error: pycdlib not installed — pip install pycdlib")
 
-    images, chunk_digests, listed, version, last = load(args.image)
+    fmt = detect_format(args.image)
+    if fmt is None:
+        sys.exit(f"error: unrecognised .upt layout in {args.image} -- "
+                 f"neither /D0000001 (mod) nor /OTA_V0 (stock) found")
+    if fmt == "mod":
+        images, chunk_digests, listed, version, last = load(args.image)
+    else:
+        images, chunk_digests, listed, version, last = load_ota_v0(args.image)
     ok = True
 
-    print(f"{args.image}  ({os.path.getsize(args.image)} bytes)\n")
+    print(f"{args.image}  ({os.path.getsize(args.image)} bytes)  [{fmt} layout]\n")
     for i, img in enumerate(images):
         size_ok = len(img["data"]) == img["size"]
         chunks_ok = chunk_digests[i] == listed[i]
@@ -171,14 +308,22 @@ def main():
         print(f"  {img['type']:8s} {img['name']}")
         print(f"    size          {len(img['data'])} {'OK' if size_ok else 'MISMATCH'}")
         print(f"    manifest md5  {'OK' if img['matched'] else 'MISMATCH'}")
+        from_str = f" from F{img['first']:07d}" if img['first'] is not None else ""
         print(f"    chunk digests {'OK' if chunks_ok else 'MISMATCH'} "
-              f"({len(chunk_digests[i])} chunks from F{img['first']:07d})")
-    print(f"\n  version entry   F{last:07d}.TXT = {version!r}")
+              f"({len(chunk_digests[i])} chunks{from_str})")
+    if fmt == "mod":
+        print(f"\n  version entry   F{last:07d}.TXT = {version!r}")
+    else:
+        print(f"\n  version entry   OTA_CONF.IN = {version!r}")
 
-    problems, first_extent = check_structure(args.image, images, chunk_digests)
+    if fmt == "mod":
+        problems, first_extent = check_structure(args.image, images, chunk_digests)
+    else:
+        problems, first_extent = check_structure_ota_v0(args.image, images, chunk_digests), None
     print(f"\n  structure       Joliet + Rock Ridge, chunk-name chain")
-    print(f"    first chunk extent {first_extent}"
-          f"{'' if first_extent == 51 else '  (stock images use 51)'}")
+    if first_extent is not None:
+        print(f"    first chunk extent {first_extent}"
+              f"{'' if first_extent == 51 else '  (stock images use 51)'}")
     if problems:
         ok = False
         for p in problems:
@@ -211,7 +356,11 @@ def main():
                         print(f"    {line.strip()}")
 
         if args.against:
-            other, *_ = load(args.against)
+            against_fmt = detect_format(args.against)
+            if against_fmt is None:
+                sys.exit(f"error: unrecognised .upt layout in {args.against}")
+            loader = load if against_fmt == "mod" else load_ota_v0
+            other, *_ = loader(args.against)
             other_rootfs = next(i for i in other if i["type"] == "rootfs")
             with tempfile.TemporaryDirectory(prefix="r1orig-") as tmp2:
                 oroot = unpack_rootfs(other_rootfs["data"], tmp2)
@@ -229,6 +378,7 @@ def main():
                     print(f"    - {k}")
                 expected = {SCRIPT, MOUNT_SCRIPT, CONFIG_JSON, VERSION_FILE,
                             BT_INIT}
+                expected |= set(SET_FUNCTIONS_FILES)
                 # Internet radio swaps each theme's Stream media layout for
                 # HiBy's own CN variant, which is the one carrying the tile.
                 expected |= {f"{d}/hiby_stream_media.view" for d in (

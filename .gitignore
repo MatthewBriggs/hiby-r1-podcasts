@@ -5,10 +5,10 @@ tools/*.raw
 
 # Resources pulled off the device for reference: HiBy's, not redistributable.
 strings/
-icon/stock_*.png
-icon/t2_*.png
-icon/*_t1.png
-icon/compare.png
+podcast-app/icon/stock_*.png
+podcast-app/icon/t2_*.png
+podcast-app/icon/*_t1.png
+podcast-app/icon/compare.png
 
 # Build artifacts
 *.so

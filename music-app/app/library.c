@@ -1,0 +1,678 @@
+/* library.c — browsing the music library.
+ *
+ * Reads the stock index at /usr/data/usrlocal_media.db rather than scanning the
+ * card again: it has already walked 176 GB, and it carries album_artist on
+ * every row. What the stock browsing UI does with that is another matter — it
+ * lists an album artist's individual tracks instead of their albums, which is
+ * the reason this app exists.
+ *
+ * Two traps in that database, both found the hard way:
+ *
+ *  - Every string is NUL-terminated *inside the value*. Rows come back as
+ *    'Ceremony\0'. A WHERE clause against 'Ceremony' matches nothing, and the
+ *    stray byte renders as a box. Everything is trimmed on the way out and
+ *    every lookup key is matched with LIKE 'x%' rather than =.
+ *  - There is no track number. Only track_gain and track_peak, which are
+ *    ReplayGain. The natural row order is alphabetical by title, so an album
+ *    comes back in the wrong order. Ordering is recovered from the filename
+ *    where it carries a number, and from the file's tags otherwise.
+ *
+ * Opened read-only: the stock scanner owns this file and may rewrite it.
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include <dirent.h>
+#include <sys/stat.h>
+
+#include "vendor/sqlite3.h"
+#include "library.h"
+#include "tags.h"
+
+#define DB_PATH "/usr/data/usrlocal_media.db"
+
+static sqlite3 *g_db;
+
+int lib_open(void) {
+    if (g_db) return 0;
+    /* nomutex: only the UI thread touches this handle. */
+    int rc = sqlite3_open_v2(DB_PATH, &g_db,
+                             SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, NULL);
+    if (rc != SQLITE_OK) {
+        if (g_db) { sqlite3_close(g_db); g_db = NULL; }
+        return -1;
+    }
+    return 0;
+}
+
+void lib_close(void) {
+    if (g_db) { sqlite3_close(g_db); g_db = NULL; }
+}
+
+/* Copy a column, dropping the embedded NUL and any trailing blanks. Some rows
+ * carry a name that is nothing but the NUL — those are the ~548 tracks with no
+ * album artist, and they need a label rather than an empty row. */
+static void copy_text(char *dst, size_t n, const unsigned char *src) {
+    if (!src) { dst[0] = '\0'; return; }
+    size_t i = 0;
+    while (src[i] && i < n - 1) { dst[i] = (char)src[i]; i++; }
+    while (i > 0 && (dst[i - 1] == ' ' || dst[i - 1] == '\t')) i--;
+    dst[i] = '\0';
+}
+
+static int is_blank(const char *s) {
+    for (; *s; s++) if (!isspace((unsigned char)*s)) return 0;
+    return 1;
+}
+
+/* BG15: LIB_UNKNOWN_MARK stands in for "the blank group", never for its
+ * display label -- a real tag value never starts with this byte. */
+static int is_blank_mark(const char *v) {
+    return v && v[0] == LIB_UNKNOWN_MARK[0] && v[1] == '\0';
+}
+
+/* Builds the WHERE-clause fragment (just the boolean expression, no leading
+ * "where ") for a facet filter, and reports whether a LIKE pattern still
+ * needs binding. The blank-group sentinel can't be matched with LIKE 'x%'
+ * like a real value -- the column is empty or NUL-led, not the text shown in
+ * the UI -- so it gets its own fragment and binds nothing. */
+static void filter_clause(const char *column, const char *value, int filtered,
+                          char *frag, size_t fraglen, int *need_bind) {
+    *need_bind = 0;
+    frag[0] = '\0';
+    if (!filtered) return;
+    if (is_blank_mark(value))
+        /* The stored value is a single 0x00 byte, not a true empty string --
+         * confirmed against the device's own database. SQLite's length() and
+         * substr() both report it as length 0 for this value (unlike a real
+         * multi-byte NUL-terminated string, where they at least see the
+         * leading byte), so only a direct char(0) comparison catches it;
+         * substr(column,1,1)=char(0) matches nothing. `= ''` is kept beside
+         * it for a column that is a genuinely empty string with no byte at
+         * all, which is a different, equally real case. */
+        snprintf(frag, fraglen, "(%s = '' or %s = char(0))", column, column);
+    else {
+        snprintf(frag, fraglen, "%s like ? escape '\\'", column);
+        *need_bind = 1;
+    }
+}
+
+/* A column name cannot be bound as a parameter, so it is pasted into the SQL
+ * and therefore has to come off a fixed list. */
+static int allowed_column(const char *c) {
+    return c && (!strcmp(c, "album_artist") || !strcmp(c, "artist") ||
+                 !strcmp(c, "genre"));
+}
+
+/* ---- grouped lists (album artists, artists, genres) ---------------------- */
+int lib_group(const char *column, lib_row_t *out, int max, int offset) {
+    if (!g_db || !allowed_column(column)) return 0;
+    /* The album count is what makes these lists worth reading, and for the
+     * album-artist list it is the whole point of the app: the stock browser
+     * shows an album artist's tracks rather than their albums. */
+    char sql[256];
+    snprintf(sql, sizeof(sql),
+             "select %s, count(distinct album) from MEDIA_TABLE "
+             "group by %s order by %s limit ? offset ?", column, column, column);
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(g_db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_int(st, 1, max);
+    sqlite3_bind_int(st, 2, offset);
+    int n = 0;
+    while (n < max && sqlite3_step(st) == SQLITE_ROW) {
+        copy_text(out[n].name, sizeof(out[n].name), sqlite3_column_text(st, 0));
+        /* BG15: owner is otherwise unused on a group row -- reused here to
+         * flag that "Unknown" is a display label, not real filter data. */
+        int blank = is_blank(out[n].name);
+        if (blank) snprintf(out[n].name, sizeof(out[n].name), "Unknown");
+        out[n].count = sqlite3_column_int(st, 1);
+        snprintf(out[n].owner, sizeof(out[n].owner), blank ? LIB_UNKNOWN_MARK : "");
+        n++;
+    }
+    sqlite3_finalize(st);
+    return n;
+}
+
+int lib_group_count(const char *column) {
+    if (!g_db || !allowed_column(column)) return 0;
+    char sql[128];
+    snprintf(sql, sizeof(sql), "select count(distinct %s) from MEDIA_TABLE", column);
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(g_db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
+    int n = (sqlite3_step(st) == SQLITE_ROW) ? sqlite3_column_int(st, 0) : 0;
+    sqlite3_finalize(st);
+    return n;
+}
+
+/* ---- albums, optionally within one facet value --------------------------- */
+/* max(album_artist) comes back with each album so that picking it can query
+ * tracks by album *and* artist. Two different artists with an album of the
+ * same name is common enough — "Greatest Hits" — that matching on the title
+ * alone would splice them together. */
+int lib_albums(const char *column, const char *value,
+               lib_row_t *out, int max, int offset) {
+    if (!g_db) return 0;
+    int filtered = allowed_column(column) && value;
+    char frag[128]; int need_bind;
+    filter_clause(column, value, filtered, frag, sizeof(frag), &need_bind);
+    char sql[320];
+    snprintf(sql, sizeof(sql),
+             "select album, count(*), max(album_artist) from MEDIA_TABLE %s%s "
+             "group by album order by album limit ? offset ?",
+             filtered ? "where " : "", frag);
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(g_db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
+    int a = 1;
+    char pat[LIB_NAME_LEN + 2];
+    if (need_bind) {
+        snprintf(pat, sizeof(pat), "%s%%", value);
+        sqlite3_bind_text(st, a++, pat, -1, SQLITE_TRANSIENT);
+    }
+    sqlite3_bind_int(st, a++, max);
+    sqlite3_bind_int(st, a++, offset);
+    int n = 0;
+    while (n < max && sqlite3_step(st) == SQLITE_ROW) {
+        copy_text(out[n].name, sizeof(out[n].name), sqlite3_column_text(st, 0));
+        if (is_blank(out[n].name))
+            snprintf(out[n].name, sizeof(out[n].name), "Unknown album");
+        out[n].count = sqlite3_column_int(st, 1);
+        copy_text(out[n].owner, sizeof(out[n].owner), sqlite3_column_text(st, 2));
+        n++;
+    }
+    sqlite3_finalize(st);
+    return n;
+}
+
+int lib_albums_count(const char *column, const char *value) {
+    if (!g_db) return 0;
+    int filtered = allowed_column(column) && value;
+    char frag[128]; int need_bind;
+    filter_clause(column, value, filtered, frag, sizeof(frag), &need_bind);
+    char sql[256];
+    snprintf(sql, sizeof(sql),
+             "select count(distinct album) from MEDIA_TABLE %s%s",
+             filtered ? "where " : "", frag);
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(g_db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
+    char pat[LIB_NAME_LEN + 2];
+    if (need_bind) {
+        snprintf(pat, sizeof(pat), "%s%%", value);
+        sqlite3_bind_text(st, 1, pat, -1, SQLITE_TRANSIENT);
+    }
+    int n = (sqlite3_step(st) == SQLITE_ROW) ? sqlite3_column_int(st, 0) : 0;
+    sqlite3_finalize(st);
+    return n;
+}
+
+/* The index stores paths as the player's own volume notation — every row is
+ * "a:\Artist\Album\01 Title.flac", drive letter and backslashes. Nothing will
+ * open until that is turned back into a real path; a: is the card. */
+#define SD_ROOT "/data/mnt/sd_0/"
+
+static void real_path(char *dst, size_t n, const char *stored) {
+    const char *p = stored;
+    if (((p[0] | 32) >= 'a' && (p[0] | 32) <= 'z') && p[1] == ':' &&
+        (p[2] == '\\' || p[2] == '/'))
+        p += 3;
+    snprintf(dst, n, "%s%s", SD_ROOT, p);
+    for (char *q = dst; *q; q++) if (*q == '\\') *q = '/';
+}
+
+/* ---- tracks on an album -------------------------------------------------- */
+/* Pull the leading number out of a filename: "04. New Order - ...", "11 - x",
+ * "Disc 1 - 11 - x". Returns -1 when there is nothing to read, which is the
+ * signal to fall back to the file's own tag. */
+static int track_no_from_path(const char *path) {
+    const char *base = strrchr(path, '/');
+    const char *b2 = strrchr(path, '\\');
+    if (b2 > base) base = b2;
+    base = base ? base + 1 : path;
+
+    /* A "Disc 1 - 11 - title" name has two numbers; the track is the last one
+     * before the title, so skip a leading disc marker if present. */
+    if (!strncasecmp(base, "disc", 4)) {
+        const char *dash = strchr(base, '-');
+        if (dash) base = dash + 1;
+        while (*base == ' ') base++;
+    }
+    if (!isdigit((unsigned char)*base)) return -1;
+    int v = 0, digits = 0;
+    while (isdigit((unsigned char)*base) && digits < 3) { v = v * 10 + (*base++ - '0'); digits++; }
+    /* Require a separator so "1999 - song.flac" is not read as track 199. */
+    if (*base != '.' && *base != ' ' && *base != '-' && *base != '_' && *base != ')')
+        return -1;
+    return v;
+}
+
+/* Files here are often named "01-03 Title" — disc, then track. Where the tags
+ * do not carry a disc number, that prefix is the only thing separating one
+ * disc of a boxed set from the next. */
+static int disc_no_from_path(const char *path) {
+    const char *base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    /* Skip any album-title prefix and take the last "NN-NN" in the name. */
+    const char *best = NULL;
+    for (const char *p = base; *p; p++) {
+        if (isdigit((unsigned char)p[0]) && isdigit((unsigned char)p[1]) &&
+            p[2] == '-' && isdigit((unsigned char)p[3]) && isdigit((unsigned char)p[4]) &&
+            (p == base || !isdigit((unsigned char)p[-1])))
+            best = p;
+    }
+    if (!best) return -1;
+    int d = (best[0] - '0') * 10 + (best[1] - '0');
+    return d > 0 && d < 100 ? d : -1;
+}
+
+static int cmp_track(const void *a, const void *b) {
+    const lib_track_t *x = a, *y = b;
+    /* Disc first, or a boxed set interleaves: every disc's track 1, then
+     * every track 2. Unstated counts as disc 1 so single-disc albums and
+     * stray files sort together. */
+    int dx = x->disc > 0 ? x->disc : 1, dy = y->disc > 0 ? y->disc : 1;
+    if (dx != dy) return dx - dy;
+    if (x->track != y->track) {
+        if (x->track < 0) return 1;          /* unnumbered sink to the bottom */
+        if (y->track < 0) return -1;
+        return x->track - y->track;
+    }
+    return strcmp(x->name, y->name);
+}
+
+static int is_audio(const char *name) {
+    const char *dot = strrchr(name, '.');
+    if (!dot) return 0;
+    return !strcasecmp(dot, ".flac") || !strcasecmp(dot, ".mp3") ||
+           !strcasecmp(dot, ".m4a")  || !strcasecmp(dot, ".wav") ||
+           !strcasecmp(dot, ".aiff") || !strcasecmp(dot, ".aif") ||
+           !strcasecmp(dot, ".ogg")  || !strcasecmp(dot, ".oga") ||
+           !strcasecmp(dot, ".opus");
+}
+
+/* Strip a leading "01-04 " or "04 " and the extension, for a name to show. */
+static void name_from_file(const char *file, char *out, size_t n) {
+    const char *p = file;
+    while (*p && (isdigit((unsigned char)*p) || *p == '-')) p++;
+    while (*p == ' ' || *p == '.' || *p == '_') p++;
+    if (!*p) p = file;
+    snprintf(out, n, "%s", p);
+    char *dot = strrchr(out, '.');
+    if (dot) *dot = '\0';
+}
+
+/* seed_path only needs to be some path that once lived in this album's
+ * folder -- used purely to find the folder, not read as a track. Passed
+ * explicitly rather than read from out[0] so this still works when every
+ * indexed row for the album is stale and n is 0 (see the BG11 fix below):
+ * out[0] is never populated in that case, but the folder is still knowable
+ * from the row that failed its stat() check. */
+static int sweep_album_folder(lib_track_t *out, int n, int max,
+                              const char *seed_path, const char *artist_fallback) {
+    char dir[LIB_PATH_LEN];
+    snprintf(dir, sizeof(dir), "%s", seed_path);
+    char *slash = strrchr(dir, '/');
+    if (!slash) return n;
+    *slash = '\0';
+
+    DIR *d = opendir(dir);
+    if (!d) return n;
+    struct dirent *e;
+    while (n < max && (e = readdir(d))) {
+        /* "._Name.flac" is a macOS AppleDouble sidecar — a few KB of resource
+         * fork, not music. There are 99 of them on this card and the sweep
+         * would otherwise offer every one as a track. The leading-dot test
+         * catches them, and the size test catches anything else too small to
+         * be audio. */
+        if (e->d_name[0] == '.' || !is_audio(e->d_name)) continue;
+        char full[LIB_PATH_LEN];
+        snprintf(full, sizeof(full), "%s/%s", dir, e->d_name);
+        struct stat st;
+        if (stat(full, &st) != 0 || st.st_size < 64 * 1024) continue;
+
+        int known = 0;
+        for (int i = 0; i < n; i++)
+            if (!strcmp(out[i].path, full)) { known = 1; break; }
+        if (known) continue;
+
+        lib_track_t *t = &out[n];
+        memset(t, 0, sizeof(*t));
+        snprintf(t->path, sizeof(t->path), "%s", full);
+        /* Prefer what the file calls itself; these names are long and the
+         * filename carries the whole album title as a prefix. */
+        if (tag_title(full, t->name, sizeof(t->name)) != 0 || !t->name[0])
+            name_from_file(e->d_name, t->name, sizeof(t->name));
+        /* artist_fallback, not out[0].artist: out[0] is never written when n
+         * starts at 0 (BG11 — every indexed row for this album was stale),
+         * so reading it here would be uninitialized caller memory. */
+        snprintf(t->artist, sizeof(t->artist), "%s", artist_fallback);
+        t->track = tag_track_number(full);
+        if (t->track <= 0) t->track = track_no_from_path(full);
+        t->disc = tag_disc_number(full);
+        if (t->disc <= 0) t->disc = disc_no_from_path(full);
+        n++;
+    }
+    closedir(d);
+    return n;
+}
+
+/* BG11's actual cause, found from the device's own database, not guessed:
+ * "In Time: The Best of R.E.M." has album_artist empty (a bare NUL, no
+ * scanner-written tag at all — a real compilation-album gap, not
+ * corruption) on every one of its 33 rows, while `artist` is correctly
+ * "R.E.M." per track. `album_artist LIKE 'R.E.M.%'` then matches nothing —
+ * a real artist name can never match an empty field — so the query below
+ * returns zero rows, not 33 with stale paths, and the sweep fallback above
+ * (n==0 && seed_path[0]) never gets a folder to sweep either. The only
+ * reason this ever looked like it worked was an unrelated bug: reaching
+ * this album via Albums directly left `cur_artist` empty (a `row->owner`
+ * that is itself the same bare NUL), and an empty artist parameter turns
+ * into a `%` wildcard that happens to match anything, including a blank
+ * album_artist. That is a coincidence a stale cur_artist should not be
+ * relied on for, not a fix.
+ *
+ * use_artist=1 tries the disambiguating filter first — needed when two
+ * different artists share an album name and album_artist is populated.
+ * use_artist=0 is the retry once that comes back with literally nothing to
+ * work with, dropping the filter and matching by album alone. */
+static int tracks_query(const char *artist, const char *album, int use_artist,
+                        lib_track_t *out, int max, char *seed_path, size_t seed_len) {
+    const char *sql = use_artist
+        ? "select name, path, format, bit, sample_rate, bit_rate, end_time, artist "
+          "from MEDIA_TABLE where album like ? escape '\\' "
+          "and album_artist like ? escape '\\' limit ?"
+        : "select name, path, format, bit, sample_rate, bit_rate, end_time, artist "
+          "from MEDIA_TABLE where album like ? escape '\\' limit ?";
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(g_db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
+    char pa[LIB_NAME_LEN + 2], pb[LIB_NAME_LEN + 2];
+    snprintf(pa, sizeof(pa), "%s%%", album);
+    int a = 1;
+    sqlite3_bind_text(st, a++, pa, -1, SQLITE_TRANSIENT);
+    if (use_artist) {
+        snprintf(pb, sizeof(pb), "%s%%", artist);
+        sqlite3_bind_text(st, a++, pb, -1, SQLITE_TRANSIENT);
+    }
+    sqlite3_bind_int(st, a++, max);
+    int n = 0;
+    /* BG11: seed_path is kept even when a row's file is gone, so there is
+     * still a folder to sweep if every single row turns out stale -- an
+     * album where every path was renamed used to come back with n stuck at
+     * 0 and out[0] never written, which meant no folder to derive and no
+     * way for the caller's sweep to ever run. One renamed path is as good
+     * as any other for finding the folder; it is never read as a track. */
+    seed_path[0] = '\0';
+    while (n < max && sqlite3_step(st) == SQLITE_ROW) {
+        lib_track_t *t = &out[n];
+        copy_text(t->name, sizeof(t->name), sqlite3_column_text(st, 0));
+        char stored[LIB_PATH_LEN];
+        copy_text(stored, sizeof(stored), sqlite3_column_text(st, 1));
+        real_path(t->path, sizeof(t->path), stored);
+        if (!seed_path[0]) snprintf(seed_path, seed_len, "%s", t->path);
+        t->format = sqlite3_column_int(st, 2);
+        t->bits = sqlite3_column_int(st, 3);
+        t->rate = sqlite3_column_int(st, 4);
+        t->bitrate = sqlite3_column_int(st, 5);
+        t->dur_ms = sqlite3_column_int(st, 6);
+        copy_text(t->artist, sizeof(t->artist), sqlite3_column_text(st, 7));
+        /* Ask the file first. The filename is a guess that happens to be right
+         * about half the time here, and a wrong guess does not leave a track
+         * unnumbered — it puts the album in the wrong order. */
+        t->track = tag_track_number(t->path);
+        if (t->track <= 0) t->track = track_no_from_path(t->path);
+        t->disc = tag_disc_number(t->path);
+        if (t->disc <= 0) t->disc = disc_no_from_path(t->path);
+        /* Rows can outlive their files — renaming anything leaves the index
+         * pointing at a name that is gone, and a track that cannot be opened
+         * is worse than one that is absent. The folder sweep below picks the
+         * real file up under its new name. */
+        {
+            struct stat fst;
+            if (stat(t->path, &fst) != 0) continue;
+        }
+        n++;
+    }
+    sqlite3_finalize(st);
+    return n;
+}
+
+int lib_tracks_for_album(const char *artist, const char *album,
+                         lib_track_t *out, int max) {
+    if (!g_db) return 0;
+    char seed_path[LIB_PATH_LEN];
+    int n = tracks_query(artist, album, 1, out, max, seed_path, sizeof(seed_path));
+
+    /* Nothing matched at the SQL level at all -- not "matched but every
+     * path is stale" (that still sets seed_path; see tracks_query's own
+     * comment), but zero rows, full stop. album_artist is empty on every
+     * row for a real, fairly common reason (no album-artist tag ever
+     * written, common on compilations) and a real artist name can never
+     * match an empty field. Retry once without the filter, by album name
+     * alone. This trades the artist-disambiguation the filter exists for
+     * (two different artists sharing an album name) for actually finding
+     * the album at all, which only matters in the disambiguation's own
+     * edge case -- and only once the first, more specific attempt has
+     * already found nothing to work with. */
+    if (n == 0 && !seed_path[0])
+        n = tracks_query(artist, album, 0, out, max, seed_path, sizeof(seed_path));
+
+    /* The stock index is not complete. A Beethoven 7 on this card has four
+     * movements on disk and three in the database — the scanner simply missed
+     * one, and an album quietly short of a track is worse than a slow open.
+     * Sweep the folder the album came from and take anything it did not know
+     * about. Runs even at n==0: the index can show a track count in the
+     * album list yet have every one of those rows' paths gone stale. */
+    if (n < max && seed_path[0]) n = sweep_album_folder(out, n, max, seed_path, artist);
+
+    /* The index carries the same file twice for some albums, which showed as a
+     * doubled movement. Drop repeats whatever their source. */
+    for (int i = 0; i < n; i++)
+        for (int j = i + 1; j < n; ) {
+            if (!strcmp(out[i].path, out[j].path)) {
+                memmove(&out[j], &out[j + 1], sizeof(out[0]) * (size_t)(n - j - 1));
+                n--;
+            } else j++;
+        }
+
+    qsort(out, (size_t)n, sizeof(out[0]), cmp_track);
+    return n;
+}
+
+/* The counts below must agree with the ORDER BY the lists use, or a jump lands
+ * in the wrong place. Both use the column's natural ordering, so both use a
+ * plain `<` against the letter rather than anything cleverer. */
+int lib_group_offset(const char *column, const char *key) {
+    if (!g_db || !allowed_column(column)) return 0;
+    char sql[256];
+    snprintf(sql, sizeof(sql),
+             "select count(*) from (select distinct %s as v from MEDIA_TABLE) "
+             "where v < ?", column);
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(g_db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_text(st, 1, key, -1, SQLITE_TRANSIENT);
+    int n = (sqlite3_step(st) == SQLITE_ROW) ? sqlite3_column_int(st, 0) : 0;
+    sqlite3_finalize(st);
+    return n;
+}
+
+int lib_albums_offset(const char *column, const char *value, const char *key) {
+    if (!g_db) return 0;
+    int filtered = allowed_column(column) && value;
+    char frag[128]; int need_bind;
+    filter_clause(column, value, filtered, frag, sizeof(frag), &need_bind);
+    char sql[320];
+    snprintf(sql, sizeof(sql),
+             "select count(*) from (select distinct album as v from MEDIA_TABLE %s%s) "
+             "where v < ?",
+             filtered ? "where " : "", frag);
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(g_db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
+    int a = 1;
+    char pat[LIB_NAME_LEN + 2];
+    if (need_bind) {
+        snprintf(pat, sizeof(pat), "%s%%", value);
+        sqlite3_bind_text(st, a++, pat, -1, SQLITE_TRANSIENT);
+    }
+    sqlite3_bind_text(st, a, key, -1, SQLITE_TRANSIENT);
+    int n = (sqlite3_step(st) == SQLITE_ROW) ? sqlite3_column_int(st, 0) : 0;
+    sqlite3_finalize(st);
+    return n;
+}
+
+/* The A-Z strip needs both the start of the touched letter and the start of
+ * the next one. Asking lib_*_offset() for those values while a thumb crosses
+ * the strip means many complete distinct-list scans. Do the same comparisons
+ * in one aggregate query instead: SQLite still decides collation and ordering,
+ * so this remains exactly in step with the single-key helpers. */
+int lib_letter_offsets(const char *column, const char *value, int albums,
+                       int out[LIB_INDEX_LETTERS]) {
+    if (!out || !g_db) return -1;
+    for (int i = 0; i < LIB_INDEX_LETTERS; i++) out[i] = 0;
+
+    int filtered = albums && allowed_column(column) && value;
+    if (!albums && !allowed_column(column)) return -1;
+
+    char frag[128]; int need_bind;
+    filter_clause(column, value, filtered, frag, sizeof(frag), &need_bind);
+
+    char sql[1024];
+    int used = snprintf(sql, sizeof(sql), "select ");
+    for (int i = 0; i < LIB_INDEX_LETTERS && used > 0 && used < (int)sizeof(sql); i++)
+        used += snprintf(sql + used, sizeof(sql) - (size_t)used,
+                         "%ssum(v < ?)", i ? ", " : "");
+    if (used <= 0 || used >= (int)sizeof(sql)) return -1;
+
+    if (albums)
+        used += snprintf(sql + used, sizeof(sql) - (size_t)used,
+                         " from (select distinct album as v from MEDIA_TABLE %s%s)",
+                         filtered ? "where " : "", frag);
+    else
+        used += snprintf(sql + used, sizeof(sql) - (size_t)used,
+                         " from (select distinct %s as v from MEDIA_TABLE)", column);
+    if (used <= 0 || used >= (int)sizeof(sql)) return -1;
+
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(g_db, sql, -1, &st, NULL) != SQLITE_OK) return -1;
+    int bind = 1;
+    for (int i = 0; i < LIB_INDEX_LETTERS; i++) {
+        char key[2] = { (char)('A' + i), '\0' };
+        sqlite3_bind_text(st, bind++, key, -1, SQLITE_TRANSIENT);
+    }
+    if (need_bind) {
+        char pat[LIB_NAME_LEN + 2];
+        snprintf(pat, sizeof(pat), "%s%%", value);
+        sqlite3_bind_text(st, bind++, pat, -1, SQLITE_TRANSIENT);
+    }
+
+    int rc = -1;
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        for (int i = 0; i < LIB_INDEX_LETTERS; i++)
+            out[i] = sqlite3_column_int(st, i);
+        rc = 0;
+    }
+    sqlite3_finalize(st);
+    return rc;
+}
+
+/* The inverse of real_path: back to "a:\Artist\Album\file.flac" so the row
+ * can be found. Doing it this way rather than storing the index's own paths in
+ * the playlist keeps the .m3u readable by anything else. */
+int lib_track_by_path(const char *real, lib_track_t *out) {
+    if (!g_db) return -1;
+    const char *rel = real;
+    if (!strncmp(real, SD_ROOT, strlen(SD_ROOT))) rel = real + strlen(SD_ROOT);
+
+    char stored[LIB_PATH_LEN];
+    snprintf(stored, sizeof(stored), "a:\\%s", rel);
+    for (char *q = stored; *q; q++) if (*q == '/') *q = '\\';
+
+    static const char *sql =
+        "select name, path, format, bit, sample_rate, bit_rate, end_time, artist "
+        "from MEDIA_TABLE where path like ? escape '\x01' limit 1";
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(g_db, sql, -1, &st, NULL) != SQLITE_OK) return -1;
+    char pat[LIB_PATH_LEN + 2];
+    snprintf(pat, sizeof(pat), "%s%%", stored);
+    sqlite3_bind_text(st, 1, pat, -1, SQLITE_TRANSIENT);
+
+    int rc = -1;
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        copy_text(out->name, sizeof(out->name), sqlite3_column_text(st, 0));
+        char raw[LIB_PATH_LEN];
+        copy_text(raw, sizeof(raw), sqlite3_column_text(st, 1));
+        real_path(out->path, sizeof(out->path), raw);
+        out->format  = sqlite3_column_int(st, 2);
+        out->bits    = sqlite3_column_int(st, 3);
+        out->rate    = sqlite3_column_int(st, 4);
+        out->bitrate = sqlite3_column_int(st, 5);
+        out->dur_ms  = sqlite3_column_int(st, 6);
+        copy_text(out->artist, sizeof(out->artist), sqlite3_column_text(st, 7));
+        out->track = tag_track_number(out->path);
+        if (out->track <= 0) out->track = track_no_from_path(out->path);
+        out->disc = tag_disc_number(out->path);
+        if (out->disc <= 0) out->disc = disc_no_from_path(out->path);
+        rc = 0;
+    }
+    sqlite3_finalize(st);
+    return rc;
+}
+
+/* The format column is a code, not a key into FORMAT_TABLE — that table's
+ * first column is a count. These were read off the library directly. */
+
+/* Every two-character prefix in the list, in sort order, in one pass. The
+ * per-letter version of this ran a full scan on each letter the thumb crossed
+ * — twenty-six of them on one drag down the strip, on a device that has to
+ * read them off a card. Gathered once per list instead, so the drag itself
+ * costs no query at all. `out` is 2 bytes per prefix, unterminated. */
+int lib_prefixes(const char *column, const char *value, int albums,
+                 char *out, int max) {
+    if (!g_db || max <= 0) return 0;
+    int filtered = albums && allowed_column(column) && value;
+    char frag[128]; int need_bind = 0;
+    char sql[420];
+    if (albums) {
+        filter_clause(column, value, filtered, frag, sizeof(frag), &need_bind);
+        snprintf(sql, sizeof(sql),
+                 "select distinct substr(album,1,2) from MEDIA_TABLE %s%s "
+                 "order by 1",
+                 filtered ? "where " : "", frag);
+    } else {
+        if (!allowed_column(column)) return 0;
+        snprintf(sql, sizeof(sql),
+                 "select distinct substr(%s,1,2) from MEDIA_TABLE order by 1",
+                 column);
+    }
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(g_db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
+    if (need_bind) {
+        char vpat[LIB_NAME_LEN + 2];
+        snprintf(vpat, sizeof(vpat), "%s%%", value);
+        sqlite3_bind_text(st, 1, vpat, -1, SQLITE_TRANSIENT);
+    }
+    int n = 0;
+    while (n < max && sqlite3_step(st) == SQLITE_ROW) {
+        const unsigned char *t = sqlite3_column_text(st, 0);
+        if (!t || !t[0] || !t[1]) continue;
+        /* Accented second letters are multi-byte and get no band of their
+         * own; the plain letter still reaches them. */
+        if (!isalpha((int)t[1])) continue;
+        char a = (char)t[0], b = (char)tolower((int)t[1]);
+        int dup = 0;
+        for (int i = 0; i < n; i++)
+            if (out[2 * i] == a && out[2 * i + 1] == b) dup = 1;
+        if (!dup) { out[2 * n] = a; out[2 * n + 1] = b; n++; }
+    }
+    sqlite3_finalize(st);
+    return n;
+}
+
+const char *lib_format_name(int code) {
+    switch (code) {
+        case 61868: case 0: return "FLAC";
+        case 85:            return "MP3";
+        case 278: case 41388: return "AAC";
+        case 1:             return "WAV";
+        default:            return "?";
+    }
+}

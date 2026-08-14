@@ -2,11 +2,29 @@
 
 ## Vendored sources
 
+### Podcasts (`podcast-app/`)
+
 | Path | Project | Licence |
 |---|---|---|
-| `app/vendor/minimp3.h`, `app/vendor/minimp3_ex.h` | [minimp3](https://github.com/lieff/minimp3) by lieff | CC0-1.0 (public domain) |
-| `app/vendor/stb_truetype.h` | [stb](https://github.com/nothings/stb) by Sean Barrett | Public domain / MIT |
-| `app/vendor/jpeg9/*.h` | [libjpeg 9](https://ijg.org/) by the Independent JPEG Group | IJG licence |
+| `podcast-app/app/vendor/minimp3.h`, `podcast-app/app/vendor/minimp3_ex.h` | [minimp3](https://github.com/lieff/minimp3) by lieff | CC0-1.0 (public domain) |
+| `podcast-app/app/vendor/stb_truetype.h` | [stb](https://github.com/nothings/stb) by Sean Barrett | Public domain / MIT |
+| `podcast-app/app/vendor/jpeg9/*.h` | [libjpeg 9](https://ijg.org/) by the Independent JPEG Group | IJG licence |
+
+### Library (`music-app/`)
+
+| Path | Project | Licence |
+|---|---|---|
+| `music-app/app/vendor/dr_flac.h`, `dr_mp3.h`, `dr_wav.h`, `dr_impl.c` | [dr_libs](https://github.com/mackron/dr_libs) by David Reid | Public domain / MIT-0 |
+| `music-app/app/vendor/sqlite3.c`, `sqlite3.h` | [SQLite](https://www.sqlite.org/) | Public domain |
+| `music-app/app/vendor/ogg/*` | [libogg](https://www.xiph.org/ogg/) (Xiph.Org) | BSD-style |
+| `music-app/app/vendor/opus/*.h` | [libopus](https://opus-codec.org/) (Xiph.Org / IETF) | BSD-style |
+| `music-app/app/vendor/vorbis/codec.h` | [libvorbis](https://xiph.org/vorbis/) (Xiph.Org) | BSD-style |
+
+The Opus and Vorbis vendoring is **headers only**, the same pattern as the
+libjpeg headers below: the R1's firmware provides the actual decode libraries
+at runtime and they are `dlopen`'d, not linked. Only `libogg`'s bitstream
+framing (`framing.c`) is compiled in directly, to demux the container without
+a runtime dependency on a system libogg.
 
 The libjpeg headers are **headers only**. No IJG code is compiled into or
 shipped with this project — the R1's firmware already provides
@@ -78,7 +96,8 @@ early on while working out how the firmware image is packed.
 ## Not included
 
 HiBy's own resources — the stock launcher icons, the `.ini` string tables, and
-the firmware itself — are not redistributed here. The tile's icon is drawn from
-scratch by `icon/make_icon.py`, and its label is produced at runtime by
-rewriting a single string in whatever `settings.ini` the installed firmware
-provides. Nothing in this repository is HiBy's.
+the firmware itself — are not redistributed here. Both tiles' icons are drawn
+from scratch (`podcast-app/icon/make_icon.py`, `music-app/icon/make_icon.py`),
+and Podcasts' label is produced at runtime by rewriting a single string in
+whatever `settings.ini` the installed firmware provides. Nothing in this
+repository is HiBy's.
