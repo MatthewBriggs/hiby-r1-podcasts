@@ -2873,7 +2873,15 @@ static int idle_ticks = IDLE_DEFAULT_S * 30;    /* loop runs at ~30/s while awak
 static void load_conf(void) {
     FILE *f = fopen(CONF_PATH, "r");
     if (!f) return;
-    char line[128];
+    /* Wide enough for eq_profile_path -- EP_PATH_LEN plus the key and '='. */
+    char line[EP_PATH_LEN + 32];
+    /* BG38: applied after the loop, once both are known, rather than as each
+     * line is seen -- eq_on can appear before or after eq_profile_path, and
+     * eq_switch_to() should only ever run once per load. -1 = not present in
+     * the file (a config from before this existed), so eq_enabled() is left
+     * at its compiled-in default rather than forced off. */
+    char eq_path_buf[EP_PATH_LEN] = "";
+    int eq_on_saved = -1;
     while (fgets(line, sizeof(line), f)) {
         int v;
         if (sscanf(line, "idle_lock_seconds = %d", &v) == 1 ||
@@ -2908,9 +2916,22 @@ static void load_conf(void) {
                    sscanf(line, "auto_off_minutes=%d", &v) == 1) {
             for (int i = 0; i < AUTO_OFF_CHOICE_N; i++)
                 if (AUTO_OFF_CHOICES[i] == v) { auto_off_idx = i; break; }
+        } else if (sscanf(line, "eq_on = %d", &v) == 1 ||
+                   sscanf(line, "eq_on=%d", &v) == 1) {
+            eq_on_saved = v != 0;
+        } else if (sscanf(line, "eq_profile_path = %383[^\r\n]", eq_path_buf) == 1 ||
+                   sscanf(line, "eq_profile_path=%383[^\r\n]", eq_path_buf) == 1) {
+            /* Paths can carry spaces (SD-card folder names do), hence %[^\r\n]
+             * rather than %s, which would stop at the first one. */
         }
     }
     fclose(f);
+    /* BG38: EQ settings did not survive a reboot -- nothing wrote them here
+     * at all. eq_switch_to() is a no-op against a path that no longer exists
+     * (a profile deleted or a card swapped since), same as any other stale
+     * path this app already tolerates. */
+    if (eq_path_buf[0]) eq_switch_to(eq_path_buf);
+    if (eq_on_saved >= 0) eq_set_enabled(eq_on_saved);
 }
 
 /* Does this line set `key`? Length taken from the key itself rather than
@@ -2928,7 +2949,8 @@ static int conf_line_is(const char *line, const char *key) {
  * own comment block (see BG5) is meant to stay human-readable, and this
  * only ever touches the lines it owns. */
 static void save_conf(void) {
-    char lines[64][128];
+    /* Wide enough for eq_profile_path -- see the matching line[] in load_conf(). */
+    char lines[64][EP_PATH_LEN + 32];
     int n = 0;
     FILE *f = fopen(CONF_PATH, "r");
     if (f) {
@@ -2937,7 +2959,9 @@ static void save_conf(void) {
                 !conf_line_is(lines[n], "button_lock_enabled") &&
                 !conf_line_is(lines[n], "deep_sleep") &&
                 !conf_line_is(lines[n], "sleep_minutes") &&
-                !conf_line_is(lines[n], "auto_off_minutes"))
+                !conf_line_is(lines[n], "auto_off_minutes") &&
+                !conf_line_is(lines[n], "eq_on") &&
+                !conf_line_is(lines[n], "eq_profile_path"))
                 n++;
         }
         fclose(f);
@@ -2950,6 +2974,9 @@ static void save_conf(void) {
     fprintf(f, "sleep_minutes = %d\n", sleep_minutes());
     fprintf(f, "deep_sleep = %d\n", deep_sleep_enabled);
     fprintf(f, "auto_off_minutes = %d\n", auto_off_minutes());
+    /* BG38 */
+    fprintf(f, "eq_on = %d\n", eq_enabled());
+    if (eq_cur_path[0]) fprintf(f, "eq_profile_path = %s\n", eq_cur_path);
     fclose(f);
 }
 
@@ -3563,6 +3590,7 @@ static int music_entry(void *a0, void *a1) {
                 } else if (y > qs_eq_y() && y < qs_eq_y() + QS_ROW_H) {
                     if (x > FB_W - 100) {
                         eq_set_enabled(!eq_enabled());
+                        save_conf();          /* BG38 */
                     } else {
                         /* Closed first, not left open behind the sheet --
                          * qs_open && g==1 is checked ahead of sheet_open in
@@ -3620,6 +3648,7 @@ static int music_entry(void *a0, void *a1) {
                  * ever touching a slider must not fork the outgoing one. */
                 if (i >= 0 && i < eq_profile_n) {
                     eq_switch_to(eq_profiles[i].path);
+                    save_conf();          /* BG38 */
                 }
                 sheet_open = 0;
             } else if (i == 0) {
@@ -3742,6 +3771,7 @@ static int music_entry(void *a0, void *a1) {
                 int ry_bands   = eq_row_bands_y();
                 if (y >= ry_enabled && y < ry_enabled + ROW_H) {
                     eq_set_enabled(!eq_enabled());
+                    save_conf();          /* BG38 */
                 } else if (y >= ry_profile && y < ry_profile + ROW_H) {
                     eq_profile_n = ep_scan(eq_profiles, EP_MAX_PROFILES);
                     sheet_open = 3;
@@ -3836,8 +3866,10 @@ static int music_entry(void *a0, void *a1) {
                         /* First visit this session, nothing chosen yet: load
                          * whatever sorts first rather than show an empty
                          * screen when a profile is sitting right there. */
-                        if (!eq_cur_path[0] && eq_profile_n > 0)
+                        if (!eq_cur_path[0] && eq_profile_n > 0) {
                             eq_switch_to(eq_profiles[0].path);
+                            save_conf();          /* BG38 */
+                        }
                         screen = SC_EQ; reset_scroll();
                         mlog("[music] %d EQ profiles\n", eq_profile_n);
                     } else if (idx == TOP_RADIO) {
