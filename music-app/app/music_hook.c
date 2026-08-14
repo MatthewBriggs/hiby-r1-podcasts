@@ -1903,7 +1903,11 @@ static void draw_screen(uint16_t *fb) {
                 snprintf(routebuf, sizeof(routebuf), "%s", route);
             route = routebuf;
             int ow = text_width(route, TEXT_PX_SMALL);
-            draw_text(fb, FB_W - 62 - ow, FB_H - 34, route, COL_DIM, TEXT_PX_SMALL, FB_W);
+            int biw = (devpct >= 0) ? 34 : 0;   /* 8px gap + 26px icon, BG34 */
+            draw_text(fb, FB_W - 62 - biw - ow, FB_H - 34, route, COL_DIM, TEXT_PX_SMALL, FB_W);
+            if (devpct >= 0)
+                draw_battery(fb, FB_W - 62 - 26, FB_H - 34 + TEXT_PX_SMALL / 2 - 6,
+                            devpct, st_charging());
             /* Format from the extension, not lib_format_name(t->format):
              * chapters come from a folder walk, never the SQL index, so
              * t->format is never populated (see audiobook.h) and showing its
@@ -2036,7 +2040,13 @@ static void draw_screen(uint16_t *fb) {
             snprintf(routebuf, sizeof(routebuf), "%s", route);
         route = routebuf;
         int ow = text_width(route, TEXT_PX_SMALL);
-        draw_text(fb, FB_W - 62 - ow, FB_H - 34, route, COL_DIM, TEXT_PX_SMALL, FB_W);
+        /* BG34: a glyph alongside the digits, same as the status bar's own
+         * battery reading -- text then icon, right to left. */
+        int biw = (devpct >= 0) ? 34 : 0;   /* 8px gap + 26px icon */
+        draw_text(fb, FB_W - 62 - biw - ow, FB_H - 34, route, COL_DIM, TEXT_PX_SMALL, FB_W);
+        if (devpct >= 0)
+            draw_battery(fb, FB_W - 62 - 26, FB_H - 34 + TEXT_PX_SMALL / 2 - 6,
+                        devpct, st_charging());
         snprintf(buf, sizeof(buf), "%s  %d/%g kHz  %d kbps",
                  track_format_name(t), t->bits, t->rate / 1000.0,
                  t->bitrate / 1000);
