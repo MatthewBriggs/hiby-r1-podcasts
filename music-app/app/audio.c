@@ -693,6 +693,35 @@ static int usb_card(void) {
 
 static int  g_out_kind;              /* 0 wired, 1 usb, 2 bluetooth */
 static int  g_out_card = -1;
+static unsigned g_out_rate;          /* what pcm_open() actually negotiated */
+
+/* BG41: a hi-res source (88.2/96/176.4/192 kHz) opened straight over Bluetooth
+ * makes bluealsa's own PCM plugin resample it in software to whatever the a2dp
+ * link really carries -- accepted silently, at whatever rate is asked for, so
+ * nothing here ever saw an open fail or fall back. That resample runs in this
+ * thread (it is a linked-in ALSA I/O plugin, not a separate process) and is
+ * exactly the "self-inflicted" cost the pcm_open comment already predicted for
+ * plughw; over Bluetooth it lands on top of decode and, if PEQ is on, the
+ * EQ cascade too, with the CPU log showing decode alone climbing from the
+ * usual sub-10% to ~70% of the single core once a 192 kHz PEQ track has been
+ * playing a while -- little enough headroom left that an ordinary hiccup
+ * produces the underrun and the audible quality the headset's own adaptive
+ * bitrate then reacts to by stepping down. No Bluetooth codec on this device
+ * carries more than 96 kHz of real information regardless, so nothing is
+ * actually thrown away by not asking for the full source rate.
+ *
+ * Restricted to a clean 2x/4x divide of a standard 44.1/48 kHz base -- every
+ * real hi-res file is one of those four multiples, and an exact integer ratio
+ * is what makes the plain box-car decimation in the worker loop correct
+ * without needing a general resampler: no fractional-position state to carry
+ * between chunks, so no cross-chunk phase or click risk. Anything else (an
+ * odd source rate, or already <=48 kHz) passes through unchanged, same as
+ * today. */
+static unsigned bt_target_rate(unsigned src_rate) {
+    if (src_rate == 88200 || src_rate == 176400) return 44100;
+    if (src_rate == 96000 || src_rate == 192000) return 48000;
+    return src_rate;
+}
 
 /* "Headphones" was the wrong word for the wired route: it is the internal DAC
  * feeding the 3.5 mm socket, and it showed even with nothing plugged in, which
@@ -889,6 +918,7 @@ static void *pcm_open(unsigned rate, int channels, int deep, int want_fmt) {
     int use_bt = (!jack && ucard <= 0) ? bt_sink_connected() : 0;
     g_out_kind = use_bt ? 2 : (ucard > 0 ? 1 : 0);
     g_out_card = ucard;
+    if (use_bt) rate = bt_target_rate(rate);   /* BG41 -- see bt_target_rate() */
 
     int card = ucard > 0 ? ucard : 0;
     snprintf(exact, sizeof(exact), "hw:%d,0", card);
@@ -950,6 +980,7 @@ static void *pcm_open(unsigned rate, int channels, int deep, int want_fmt) {
          * entries point at the same `exact` buffer, so this compares pointers. */
         g_exact = (!use_bt && names[i] == exact);
         g_out_fmt = fmts[i];
+        g_out_rate = r;
         if (use_bt && i > 0 && names[i] != exact) g_out_kind = 0;   /* fell back to the jack */
         alog("[audio] %s %u Hz %d ch %s%s\n", names[i], r, channels,
              fmts[i] == FMT_S32_LE ? "S32_LE" :
@@ -1100,8 +1131,7 @@ static void *worker(void *arg) {
         return NULL;
     }
     int ch = d->channels > 0 ? d->channels : 2;
-    unsigned rate = d->rate ? d->rate : 44100;
-    eq_set_format(rate, ch);
+    unsigned rate = d->rate ? d->rate : 44100;   /* the source's own rate -- seek/duration/polling always key off this, never eff_rate */
     pthread_mutex_lock(&g_lock);
     if (d->frames) g_dur_ms = (int)(d->frames * 1000 / rate);
     pthread_mutex_unlock(&g_lock);
@@ -1116,6 +1146,12 @@ static void *worker(void *arg) {
         pthread_mutex_unlock(&g_lock);
         return NULL;
     }
+    /* What pcm_open() actually negotiated -- equal to `rate` except when it
+     * applied BG41's Bluetooth cap, in which case everything downstream of
+     * decode (EQ, WSOLA, decimation, the write itself) has to key off this
+     * instead. */
+    unsigned eff_rate = g_out_rate;
+    eq_set_format(eff_rate, ch);
 
     /* Two buffers, because the two paths carry different sample sizes. Only
      * the lossless formats above 16 bits use the wide one; MP3 and AAC decode
@@ -1199,6 +1235,8 @@ static void *worker(void *arg) {
                         hires = dec_is_wide(d) && g_out_kind != 2;
                         src_wide = dec_is_wide(d);
                         frame_bytes = hires ? (size_t)ch * 4 : (size_t)ch * sizeof(short);
+                        eff_rate = g_out_rate;
+                        eq_set_format(eff_rate, ch);
                         g_out_lost = 0;
                         pthread_mutex_lock(&g_lock);
                         g_paused = 0;
@@ -1253,6 +1291,8 @@ static void *worker(void *arg) {
             hires = dec_is_wide(d) && g_out_kind != 2;
             src_wide = dec_is_wide(d);
             frame_bytes = hires ? (size_t)ch * 4 : (size_t)ch * sizeof(short);
+            eff_rate = g_out_rate;
+            eq_set_format(eff_rate, ch);
             g_out_lost = 0;
             alog("[audio] resumed on a fresh device\n");
         }
@@ -1278,6 +1318,8 @@ static void *worker(void *arg) {
                 hires = dec_is_wide(d) && g_out_kind != 2;
                 src_wide = dec_is_wide(d);
                 frame_bytes = hires ? (size_t)ch * 4 : (size_t)ch * sizeof(short);
+                eff_rate = g_out_rate;
+                eq_set_format(eff_rate, ch);
             }
         }
 
@@ -1287,6 +1329,46 @@ static void *worker(void *arg) {
          * than handed to dr_flac/dr_wav's own undithered s16 reader. */
         uint64_t got = src_wide ? dec_read32(d, buf32, CHUNK_FRAMES)
                                 : dec_read(d, buf, CHUNK_FRAMES);
+        /* done/g_pos_ms track source frames throughout -- captured before
+         * decimation below can shrink `got`, so position and duration (both
+         * figured against `rate`, the source rate) read correctly regardless
+         * of whether this chunk got folded down for Bluetooth. */
+        uint64_t got_src = got;
+        /* BG41: fold eff_rate's Bluetooth cap into the samples themselves,
+         * before EQ sees them -- otherwise the cascade still ran at the full
+         * source rate regardless of what got negotiated, which was most of
+         * the self-inflicted cost. bt_target_rate() only ever returns an
+         * exact 2x or 4x divisor of `rate`, so this is plain box-car
+         * decimation: no fractional position to carry between chunks, no
+         * per-track state, and it collapses to a no-op (decim == 1) for
+         * every source that wasn't hi-res-over-Bluetooth in the first place.
+         * A moving-average filter is not a brick-wall anti-alias -- it nulls
+         * exactly at the new Nyquist and leaks a little just below it -- but
+         * the destination is a lossy Bluetooth codec throwing away far more
+         * than that regardless, and acoustic recordings carry little real
+         * energy above 24 kHz to alias from in the first place. */
+        if (got > 0 && eff_rate != rate) {
+            unsigned decim = rate / eff_rate;
+            uint64_t got_d = got / decim;
+            if (src_wide) {
+                for (uint64_t f = 0; f < got_d; f++)
+                    for (int c = 0; c < ch; c++) {
+                        int64_t sum = 0;
+                        for (unsigned k = 0; k < decim; k++)
+                            sum += buf32[(f * decim + k) * (unsigned)ch + (unsigned)c];
+                        buf32[f * (unsigned)ch + (unsigned)c] = (int32_t)(sum / decim);
+                    }
+            } else {
+                for (uint64_t f = 0; f < got_d; f++)
+                    for (int c = 0; c < ch; c++) {
+                        int32_t sum = 0;
+                        for (unsigned k = 0; k < decim; k++)
+                            sum += buf[(f * decim + k) * (unsigned)ch + (unsigned)c];
+                        buf[f * (unsigned)ch + (unsigned)c] = (short)(sum / (int)decim);
+                    }
+            }
+            got = got_d;
+        }
         /* Before any volume scaling, shift or dither below, on whichever
          * buffer actually holds this chunk's decode -- the same raw samples
          * regardless of which output path they take afterward. A no-op
@@ -1339,12 +1421,13 @@ static void *worker(void *arg) {
                 if (x_drain) x_drain(pcm);
                 x_close(pcm);
                 ch = nch; rate = nrate;
-                eq_set_format(rate, ch);
                 hires = nhires;
                 want_fmt = hires ? FMT_S24_LE : FMT_S16_LE;
                 pcm = pcm_open(rate, ch, d->is_stream, want_fmt);
                 if (!pcm) break;
                 hires = hires && g_out_kind != 2;
+                eff_rate = g_out_rate;
+                eq_set_format(eff_rate, ch);
                 short *nb = realloc(buf, (size_t)CHUNK_FRAMES * (size_t)ch * sizeof(short));
                 int32_t *nb32 = realloc(buf32, (size_t)CHUNK_FRAMES * (size_t)ch * sizeof(int32_t));
                 if (!nb || !nb32) break;
@@ -1412,9 +1495,9 @@ static void *worker(void *arg) {
          * WSOLA works on shorts, and an audiobook is never hires in practice,
          * so a hires source simply keeps playing at 1.0x. */
         if (!hires && speed != 1000) {
-            if (g_wsola_rate != (int)rate || g_wsola_ch != ch || g_wsola_speed != speed) {
-                wsola_init(&g_wsola, (long)rate, ch, speed);
-                g_wsola_rate = (int)rate; g_wsola_ch = ch; g_wsola_speed = speed;
+            if (g_wsola_rate != (int)eff_rate || g_wsola_ch != ch || g_wsola_speed != speed) {
+                wsola_init(&g_wsola, (long)eff_rate, ch, speed);
+                g_wsola_rate = (int)eff_rate; g_wsola_ch = ch; g_wsola_speed = speed;
             }
             wsola_feed(&g_wsola, buf, (int)got);
             for (;;) {
@@ -1432,7 +1515,7 @@ static void *worker(void *arg) {
         /* The write did not happen, so the position must not advance. */
         if (!pcm) continue;
 
-        done += got;
+        done += got_src;
         pthread_mutex_lock(&g_lock);
         g_pos_ms = (int)(done * 1000 / rate);
         pthread_mutex_unlock(&g_lock);
