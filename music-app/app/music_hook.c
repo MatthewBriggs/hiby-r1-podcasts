@@ -655,8 +655,17 @@ static int title_y(void) { return ART_PX + 20; }
 
 /* Growing the art to edge-to-edge (ART_PX == FB_W, up from 384) ate more
  * vertical space than removing the status strip freed -- 96px added against
- * only 48px freed, which is what made a second title line unaffordable. */
-static int bar_y(void) { return ART_PX + 20 + 104; }
+ * only 48px freed, which is what made a second title line unaffordable.
+ *
+ * BG40: this used to be its own formula (title_y() + 104), fourteen pixels
+ * above what the main draw path actually put the bar at (title_y() + 118) --
+ * both the tap zone here and draw_scrub_strip()'s lightweight redraw during
+ * an active drag were quietly eleven-then-three pixels off from where a
+ * non-scrubbing frame draws it, which is a real bug (a bar that jumps on the
+ * first scrub touch, tap zones biased high), just masked by generous
+ * tolerance bands. Now the one shared value everyone -- the main draw path
+ * included -- calls, so it cannot drift again. */
+static int bar_y(void) { return title_y() + 118; }
 
 /* Same layout formula as bar_y(), two bars instead of one: book (display-only,
  * thin) above chapter (scrubbable, the same weight and hit-test band the
@@ -2051,7 +2060,7 @@ static void draw_screen(uint16_t *fb) {
         /* While scrubbing the bar and the clock follow the finger rather than
          * the decoder, so you can see where you are about to land. */
         if (scrub_active) pos = scrub_ms(dur);
-        int by = ty + 118;
+        int by = bar_y();      /* BG40: was its own ty+118, now the shared value */
         int bh = scrub_active ? 10 : 6;
         int byy = by - (bh - 6) / 2;
         fill_rect(fb, 24, byy, FB_W - 48, bh, COL_LINE);
@@ -2068,7 +2077,10 @@ static void draw_screen(uint16_t *fb) {
         snprintf(buf, sizeof(buf), "-%d:%02d", rem / 60000, (rem / 1000) % 60);
         draw_right(fb, by + 14, buf);
 
-        int cyy = by + 58;                       /* centre line of the transport */
+        /* BG40: was +58, tight enough against the clock row above (ends
+         * around by+36) that the gap read as uneven next to the bigger one
+         * below the buttons. +70 splits the difference more evenly. */
+        int cyy = by + 70;                       /* centre line of the transport */
         int mid = FB_W / 2;
 
         /* previous: triangle against a bar */
@@ -2866,7 +2878,28 @@ static void draw_scrub_strip(uint16_t *fb) {
     draw_right(fb, by + 14, buf);
 }
 
+/* R14 profiling, temporary. Accumulated in memory and reported once every
+ * PROF_EVERY painted frames: mlog() writes to /usr/data, and BG27 established
+ * that storage I/O on this thread is exactly what stalls the UI loop, so
+ * logging per frame would measure the instrument rather than the redraw. */
+#define PROF_EVERY 60
+static int      prof_n;
+static uint64_t prof_ui_us, prof_clear_us, prof_text_us;
+static uint64_t prof_ui_max;
+uint64_t g_prof_text_us;        /* added to by text.c's draw path */
+
+static uint64_t us_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)(ts.tv_nsec / 1000);
+}
+
+uint64_t g_prof_clear_us;       /* added to by fill_rect's full-screen path */
+
 static void draw_ui(uint16_t *fb) {
+    uint64_t t0 = us_now();
+    uint64_t clear0 = g_prof_clear_us, text0 = g_prof_text_us;
+
     draw_screen(fb);
     if (index_visible()) draw_index(fb);
     if (mini_visible()) draw_mini(fb);
@@ -2874,6 +2907,21 @@ static void draw_ui(uint16_t *fb) {
     if (qs_open) draw_quick_settings(fb);
     else if (vol_ticks > 0) draw_volume(fb);
     if (edge_active) draw_back_hint(fb);
+
+    uint64_t dt = us_now() - t0;
+    prof_ui_us    += dt;
+    prof_clear_us += g_prof_clear_us - clear0;
+    prof_text_us  += g_prof_text_us - text0;
+    if (dt > prof_ui_max) prof_ui_max = dt;
+    if (++prof_n >= PROF_EVERY) {
+        mlog("[prof] draw_ui avg %lu us (max %lu) | clear %lu | text %lu | other %lu\n",
+             (unsigned long)(prof_ui_us / prof_n),
+             (unsigned long)prof_ui_max,
+             (unsigned long)(prof_clear_us / prof_n),
+             (unsigned long)(prof_text_us / prof_n),
+             (unsigned long)((prof_ui_us - prof_clear_us - prof_text_us) / prof_n));
+        prof_n = 0; prof_ui_us = prof_clear_us = prof_text_us = 0; prof_ui_max = 0;
+    }
 }
 
 /* ---- screen lock --------------------------------------------------------- */
@@ -3814,7 +3862,7 @@ static int music_entry(void *a0, void *a1) {
                     if (dur > 0) audio_seek_ms((int)((int64_t)dur * px / span));
                 }
 
-                int cyy = bary + 58;
+                int cyy = bary + 70;      /* BG40: matches the draw-side offset */
                 if (y > cyy - 48 && y < cyy + 48) {
                     if (x < FB_W / 3)            play_index(cur_track - 1);
                     else if (x > 2 * FB_W / 3)   play_index(cur_track + 1);
