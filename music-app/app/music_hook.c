@@ -1523,10 +1523,14 @@ static void draw_mini(uint16_t *fb) {
         /* A chapter carries no artist -- tracks[] built by ab_load_book()
          * never sets one -- so the regular artist line would be blank here.
          * q_album is the book title, set once when the queue was loaded and
-         * stable regardless of what's being browsed elsewhere meanwhile,
-         * same reasoning as q_artist below for a normal album. */
+         * stable regardless of what's being browsed elsewhere meanwhile.
+         * For music, the track's own artist wins when it has one: q_artist
+         * is the *album's* artist (BG30 -- a track's own tag can genuinely
+         * differ from it, e.g. a compilation, and showing the album's
+         * artist for every track was wrong). q_artist is only a fallback
+         * for the rare track with no artist tag of its own at all. */
         const char *sub = audiobook_mode ? q_album
-                         : (q_artist[0] ? q_artist : t->artist);
+                         : (t->artist[0] ? t->artist : q_artist);
         draw_text(fb, text_x, by + 42, sub, COL_DIM, TEXT_PX_SMALL, text_edge);
     }
 
@@ -1958,9 +1962,13 @@ static void draw_screen(uint16_t *fb) {
         blit_art(fb, cx, cy);
         int ty = title_y();
         draw_scroll_title(fb, ty, t->name);
-        /* A playlist has no one artist, so the track's own is used when the
-         * queue cannot name one. */
-        draw_text(fb, 24, ty + 44, q_artist[0] ? q_artist : t->artist,
+        /* The track's own artist wins when it has one -- q_artist is the
+         * *album's* artist and can genuinely differ from a track's own tag
+         * (BG30: a compilation showed the album's artist for every track
+         * instead of each one's real artist). Falls back to q_artist only
+         * for a track with no artist tag of its own (e.g. a playlist entry
+         * pulled in from elsewhere) so the line is never simply blank. */
+        draw_text(fb, 24, ty + 44, t->artist[0] ? t->artist : q_artist,
                   COL_DIM, TEXT_PX_BODY, FB_W - 24);
         draw_text(fb, 24, ty + 82, q_album, COL_DIM, TEXT_PX_SMALL, FB_W - 110);
         /* Position in the queue, not the track's own number. Those are not the
