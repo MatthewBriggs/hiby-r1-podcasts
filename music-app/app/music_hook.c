@@ -3914,9 +3914,18 @@ static int music_entry(void *a0, void *a1) {
                     snprintf(cur_album, sizeof(cur_album), "%s", row->name);
                     /* Take the artist from the album row rather than from
                      * whatever facet led here: two artists can have an album
-                     * of the same name, and the track query needs both. */
-                    if (row->owner[0])
-                        snprintf(cur_artist, sizeof(cur_artist), "%s", row->owner);
+                     * of the same name, and the track query needs both.
+                     * Unconditional, not "if row->owner[0]" -- BG30: an
+                     * album with no album_artist tag at all (common; see the
+                     * BG11 comment in library.c) used to leave cur_artist
+                     * holding whatever a *previous* album or artist browse
+                     * had set, which then stuck on the Now Playing screen
+                     * indefinitely. row->owner empty here genuinely means
+                     * "this album has no album_artist", and lib_tracks_for_
+                     * album() already retries without the filter when an
+                     * empty artist finds nothing, so writing "" through is
+                     * correct, not just harmless. */
+                    snprintf(cur_artist, sizeof(cur_artist), "%s", row->owner);
                     screen = SC_TRACKS; reset_scroll();
                     ab_list = 0;
                     track_n = lib_tracks_for_album(cur_artist, cur_album,
