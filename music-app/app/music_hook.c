@@ -35,6 +35,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/ioctl.h>
+#include <sys/utsname.h>
 #include <linux/fb.h>
 #include <linux/input.h>
 
@@ -553,7 +554,7 @@ static void fill_rect_clip(uint16_t *fb, int x, int y, int w, int h, uint16_t c,
 typedef enum { SC_MENU = 0, SC_MUSIC_MENU, SC_ARTISTS, SC_ALBUMS, SC_TRACKS, SC_PLAYING,
                SC_RADIO, SC_PLAYLISTS, SC_AUDIOBOOKS,
                SC_EQ, SC_EQ_BANDS, SC_EQ_BAND,
-               SC_SETTINGS, SC_SETTINGS_THEME } screen_t;
+               SC_SETTINGS, SC_SETTINGS_THEME, SC_SETTINGS_ABOUT } screen_t;
 
 /* L2: the top-level menu ("Main Menu", EXIT on the right) stays small on
  * purpose rather than listing every library-browsing facet alongside
@@ -775,6 +776,44 @@ static int set_lock_desc_y(void) { return set_row_lock_y() + ROW_H; }
 static int set_row_autooff_y(void)  { return set_lock_desc_y() + 64; }
 static int set_autooff_desc_y(void) { return set_row_autooff_y() + ROW_H; }
 static int set_row_theme_y(void) { return set_autooff_desc_y() + 64; }
+/* R26: About, one row below Accent colour -- which now needs its own
+ * trailing divider back (it used to be the last row and closed the list
+ * itself), and this row takes over closing the list instead. */
+static int set_row_about_y(void) { return set_row_theme_y() + ROW_H; }
+
+#define LIBRARY_VERSION "0.1"
+
+static void about_kernel(char *out, size_t n) {
+    struct utsname u;
+    if (uname(&u) == 0) snprintf(out, n, "%s", u.release);
+    else snprintf(out, n, "unknown");
+}
+
+/* config.json's own "version" key appears twice -- a bare integer for the
+ * slef entry ahead of it ("version":1, no quotes) and a quoted string for
+ * the product entry that actually matters here ("version":"1.6a"). The
+ * quote right after the colon is what tells them apart, confirmed against
+ * the file directly rather than assumed. patch_firmware.py stamps this
+ * field itself (stamp_config_json()), so it already reads a
+ * build-identifying value like "1.6a", not the vendor's plain "1.6". */
+static void about_firmware(char *out, size_t n) {
+    snprintf(out, n, "unknown");
+    FILE *f = fopen("/usr/resource/config.json", "r");
+    if (!f) return;
+    char buf[4096];
+    size_t got = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[got] = '\0';
+    const char *p = strstr(buf, "\"version\":\"");
+    if (!p) return;
+    p += strlen("\"version\":\"");
+    const char *end = strchr(p, '"');
+    if (!end) return;
+    size_t len = (size_t)(end - p);
+    if (len >= n) len = n - 1;
+    memcpy(out, p, len);
+    out[len] = '\0';
+}
 
 /* One line, dragged sideways rather than wrapped.
  *
@@ -1759,6 +1798,7 @@ static void draw_screen(uint16_t *fb) {
     }
     else if (screen == SC_SETTINGS)       { title = "Settings"; right = "BACK"; }
     else if (screen == SC_SETTINGS_THEME) { title = "Accent colour"; right = "BACK"; }
+    else if (screen == SC_SETTINGS_ABOUT) { title = "About"; right = "BACK"; }
     else if (screen == SC_MUSIC_MENU)     { title = "Music"; right = "BACK"; }
 
     /* The player has no title bar. Drawn unconditionally, it sat behind the
@@ -2380,10 +2420,36 @@ static void draw_screen(uint16_t *fb) {
         fill_rect(fb, 0, ry - 1, FB_W, 1, COL_LINE);
         draw_text(fb, 24, ry + 20, "Accent colour", COL_TEXT, TEXT_PX_BODY, FB_W - 200);
         draw_right(fb, ry + 20, ACCENT_PRESETS[g_accent_idx].name);
-        /* Accent colour has no description below it, so this is the only
-         * divider that still belongs at a row's own bottom -- it closes the
-         * list off, matching the trailing line every other row-based screen
-         * ends on. */
+
+        /* R26: takes over closing the list -- Accent colour no longer does,
+         * now that it has a row below it. */
+        ry = set_row_about_y();
+        fill_rect(fb, 0, ry - 1, FB_W, 1, COL_LINE);
+        draw_text(fb, 24, ry + 20, "About", COL_TEXT, TEXT_PX_BODY, FB_W - 200);
+        fill_rect(fb, 0, ry + ROW_H - 1, FB_W, 1, COL_LINE);
+
+        if (mini_visible()) draw_mini(fb);
+        return;
+    }
+
+    if (screen == SC_SETTINGS_ABOUT) {
+        char kernel[64], firmware[32];
+        about_kernel(kernel, sizeof(kernel));
+        about_firmware(firmware, sizeof(firmware));
+
+        int ry = CONTENT_Y;
+        draw_text(fb, 24, ry + 20, "Library version", COL_TEXT, TEXT_PX_BODY, FB_W - 200);
+        draw_right(fb, ry + 20, LIBRARY_VERSION);
+        fill_rect(fb, 0, ry + ROW_H - 1, FB_W, 1, COL_LINE);
+
+        ry += ROW_H;
+        draw_text(fb, 24, ry + 20, "Firmware version", COL_TEXT, TEXT_PX_BODY, FB_W - 200);
+        draw_right(fb, ry + 20, firmware);
+        fill_rect(fb, 0, ry + ROW_H - 1, FB_W, 1, COL_LINE);
+
+        ry += ROW_H;
+        draw_text(fb, 24, ry + 20, "Kernel version", COL_TEXT, TEXT_PX_BODY, FB_W - 200);
+        draw_right(fb, ry + 20, kernel);
         fill_rect(fb, 0, ry + ROW_H - 1, FB_W, 1, COL_LINE);
 
         if (mini_visible()) draw_mini(fb);
@@ -2582,6 +2648,7 @@ static int go_back(void) {
             screen = SC_EQ; reset_scroll();
             break;
         case SC_SETTINGS_THEME:
+        case SC_SETTINGS_ABOUT:
             screen = SC_SETTINGS; reset_scroll();
             break;
         case SC_EQ_BAND:
@@ -3970,7 +4037,7 @@ static int music_entry(void *a0, void *a1) {
                 }
             } else if (screen == SC_SETTINGS) {
                 int ry_lock = set_row_lock_y(), ry_theme = set_row_theme_y();
-                int ry_autooff = set_row_autooff_y();
+                int ry_autooff = set_row_autooff_y(), ry_about = set_row_about_y();
                 if (y >= ry_lock && y < ry_lock + ROW_H) {
                     button_lock_enabled = !button_lock_enabled;
                     save_conf();
@@ -3982,6 +4049,8 @@ static int music_entry(void *a0, void *a1) {
                     save_conf();
                 } else if (y >= ry_theme && y < ry_theme + ROW_H) {
                     screen = SC_SETTINGS_THEME; reset_scroll();
+                } else if (y >= ry_about && y < ry_about + ROW_H) {
+                    screen = SC_SETTINGS_ABOUT; reset_scroll();
                 }
             } else if (screen == SC_SETTINGS_THEME) {
                 int idx = (y - CONTENT_Y) / ROW_H;
