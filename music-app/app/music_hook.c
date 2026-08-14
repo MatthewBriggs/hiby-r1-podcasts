@@ -213,17 +213,30 @@ static void *bt_poll(void *arg) {
             snprintf(bt_codec_cached, sizeof(bt_codec_cached), "%s", c);
             bt_batt_cached = b;
             pthread_mutex_unlock(&bt_lock);
-            char nm[64];
-            st_bt_name(nm, sizeof(nm));
-            if (nm[0] && strcmp(nm, bt_matched_name) != 0) {
-                bt_match_profile(nm);
-                snprintf(bt_matched_name, sizeof(bt_matched_name), "%s", nm);
-            }
         } else {
             pthread_mutex_lock(&bt_lock);
             bt_codec_cached[0] = '\0';
             bt_batt_cached = -1;
             pthread_mutex_unlock(&bt_lock);
+        }
+        /* BG38 (part 2): connection-based, not audio_using_bt()'s
+         * playback-based -- reconnecting a headset with nothing actively
+         * routing through it yet (paused, or between tracks) must still
+         * get its profile matched rather than wait for playback to touch
+         * Bluetooth again, which is the bug a real test caught. st_bt_name()
+         * already answers "is something connected" on its own (bt_pcm_path()
+         * looks for a live sink PCM in bluealsa's registry -- the same check
+         * bt_sink_connected() in audio.c makes for routing), with its own
+         * internal 10s cache, so running it every cycle regardless of on_bt
+         * is cheap. */
+        char nm[64];
+        st_bt_name(nm, sizeof(nm));
+        if (nm[0]) {
+            if (strcmp(nm, bt_matched_name) != 0) {
+                bt_match_profile(nm);
+                snprintf(bt_matched_name, sizeof(bt_matched_name), "%s", nm);
+            }
+        } else {
             bt_matched_name[0] = '\0';
         }
         /* Checking for a pending volume write is a cheap mutex read, not a
