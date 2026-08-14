@@ -380,6 +380,35 @@ def enable_about_tile(root):
         changed.append(rel)
     return changed
 
+
+# Stock 1.6 ships /etc/init.d/T90adb (adbd start/stop, dispatched to S310adb
+# or S440adb depending on the USB gadget interface) but rcS only runs S??*
+# scripts at boot, so T90adb is never invoked and the device boots with no
+# ADB at all -- confirmed empirically: the first vanilla-based flash of this
+# project booted fine but never enumerated over USB. S90adb is a wrapper this
+# project wrote (not HiBy's, not the mod's) that starts adb through T90adb's
+# own S310adb/S440adb when USB working mode is Auto/Device, with retries for
+# a host that didn't finish enumerating; it has shipped inside every mod-base
+# .upt used by this project since before patch_firmware.py existed in its
+# current form, which is why the mod code path never had to install it. S310
+# and S440 themselves are confirmed byte-identical between stock 1.6 and the
+# mod base, so only the wrapper is missing here, not any underlying support.
+S90ADB_SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "S90adb")
+
+
+def install_boot_adb(root):
+    """Add the boot-time ADB wrapper if this rootfs doesn't already have one."""
+    dest = os.path.join(root, "etc/init.d/S90adb")
+    if os.path.exists(dest):
+        return False                     # mod-based image already carries it
+    with open(S90ADB_SRC, "rb") as fh:
+        data = fh.read()
+    with open(dest, "wb") as fh:
+        fh.write(data)
+    os.chmod(dest, 0o755)
+    return True
+
+
 def patch_script(text):
     """Return the patched supervisor, or None if it is already patched."""
     if "DEV_HOOK" in text:
@@ -786,6 +815,12 @@ def main():
             print(f"enabled Settings -> About in {len(about)} file(s)")
         else:
             print("note: About already enabled, or set_functions.json missing")
+
+        if install_boot_adb(root):
+            print("installed etc/init.d/S90adb (boot ADB — stock rcS never "
+                  "runs T90adb, so a vanilla base boots with no ADB otherwise)")
+        else:
+            print("note: boot ADB already present (mod base carries its own)")
 
         # Version stamp, so the build is identifiable from the device itself.
         if not args.no_radio:

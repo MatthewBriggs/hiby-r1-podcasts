@@ -385,7 +385,12 @@ def main():
                     "usr/resource/layout/theme1",
                     "usr/resource/layout/theme2",
                     "usr/resource/layout/midi/theme1")}
-                if set(changed) <= expected and not added and not removed:
+                # New, not changed, on a vanilla base -- a mod base already
+                # carries this file, so there it would show up as "changed"
+                # (or not at all, if identical) instead.
+                expected_added = {"etc/init.d/S90adb"}
+                if (set(changed) <= expected and set(added) <= expected_added
+                        and not removed):
                     print(f"    only expected files changed ({len(changed)}), "
                           f"as intended")
                 else:
