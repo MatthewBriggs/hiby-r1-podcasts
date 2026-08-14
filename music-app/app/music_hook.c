@@ -844,6 +844,15 @@ static int scroll;                      /* index of the first visible row */
 static int scroll_px;                   /* 0..ROW_H-1: how far into that row */
 static int total;                       /* rows in the current list */
 
+/* BG37: SC_ARTISTS' own scroll position, saved the moment a row is tapped
+ * (whichever facet -- Album artists, Artists, Genres, all share this same
+ * screen and tap handler) and restored in go_back()'s SC_ALBUMS case, so
+ * returning from an artist's albums lands back where you were rather than
+ * at the top. One slot, not a stack: this only ever needs to undo the one
+ * level SC_ARTISTS -> SC_ALBUMS goes, the same scope BG7's albums_artist
+ * already covers for the artist filter itself. */
+static int artists_scroll_saved, artists_scroll_px_saved;
+
 /* Live drag + inertia state for list scrolling, set up alongside scroll_to_px
  * below (which needs vis_rows/load_page, not yet declared here). */
 static int   list_dragging;
@@ -2592,6 +2601,13 @@ static int go_back(void) {
                  * this the footer kept the number from the level below — one
                  * artist's two albums, reported as "1-9 of 2". */
                 total = lib_group_count(cur_facet);
+                /* BG37: land back where the list was, not at the top.
+                 * Clamped in case the library changed shape underneath (a
+                 * rescan removed rows) since the artist was tapped. */
+                scroll = artists_scroll_saved;
+                if (scroll > total - 1) scroll = total > 0 ? total - 1 : 0;
+                if (scroll < 0) scroll = 0;
+                scroll_px = artists_scroll_px_saved;
                 load_page();
             } else {
                 /* Reached via "Music" -> Albums, no facet above it. */
@@ -4041,6 +4057,8 @@ static int music_entry(void *a0, void *a1) {
                     snprintf(cur_artist, sizeof(cur_artist), "%s",
                              row->owner[0] ? LIB_UNKNOWN_MARK : row->name);
                     snprintf(albums_artist, sizeof(albums_artist), "%s", cur_artist);
+                    artists_scroll_saved = scroll;         /* BG37 */
+                    artists_scroll_px_saved = scroll_px;
                     screen = SC_ALBUMS; reset_scroll();
                     total = row->count;
                     load_page();
