@@ -40,4 +40,11 @@ const char *audio_codec(void);        /* of the stream now playing */
 int  audio_is_exact(void);            /* output opened with no conversion layer */
 int  audio_output_lost(void);         /* playback stopped because the device went away */
 const char *audio_output(void);   /* "3.5 mm", "USB" or "Bluetooth" */
+
+/* R28: header-only duration probe for a track the library's own database
+ * has no duration for (see the comment above its definition in audio.c for
+ * why that is the common case, not a rare one). bitrate_bps is only used
+ * as an MP3/VBR fallback; pass 0 if unknown. Safe to call from any thread,
+ * including while something else is playing. Returns 0 on failure. */
+int audio_probe_dur_ms(const char *path, int bitrate_bps);
 #endif

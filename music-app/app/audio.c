@@ -34,6 +34,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
@@ -567,6 +568,58 @@ static void dec_close(dec_t *d) {
         default: break;
     }
     d->kind = DEC_NONE;
+}
+
+/* R28: a header-only duration probe for tracks the stock scanner's own
+ * database never gives a duration for. MEDIA_TABLE's begin_time/end_time
+ * columns turn out to be populated only for cue-sheet split tracks (an
+ * audiobook sharing one physical file across several rows); an ordinary
+ * one-file-one-track file -- the overwhelming majority of a real library
+ * -- is left at -1 indefinitely, which is why durations were blank almost
+ * everywhere rather than just for a stale minority.
+ *
+ * FLAC/WAV/Vorbis/Opus state their total sample count in the header, so
+ * dec_open()+dec_close() gets an exact answer with no PCM decode -- safe
+ * to call from any thread, since none of those four keep decode state
+ * anywhere but the local dec_t this function owns.
+ *
+ * M4A (AAC or ALAC) deliberately does NOT go through dec_open() here: that
+ * path primes the first access unit through alac_decode()/aac_decode()
+ * into g_aacpcm, the same buffer the playback worker's own dec_read()
+ * writes into for an M4A track that might be playing on another thread
+ * right now -- a real data race, not a hypothetical one, since this can
+ * run from the UI thread while a track is playing. mp4_duration_ms()
+ * (already used by audiobook.c for exactly this reason) answers from the
+ * container's own moov atom instead, never touching either decoder.
+ *
+ * MP3 has no cheap answer for a VBR file: dec_open() deliberately leaves
+ * d->frames at 0 rather than decode the whole file to count frames (see
+ * its own comment). Estimated instead from file size and the bitrate
+ * already in the database -- exact for CBR, close for VBR, which is all
+ * a list-row label needs. */
+int audio_probe_dur_ms(const char *path, int bitrate_bps) {
+    if (!path[0]) return 0;
+    unsigned char m4a_check[8];
+    int fd = open(path, O_RDONLY);
+    if (fd >= 0) {
+        ssize_t n = read(fd, m4a_check, sizeof(m4a_check));
+        close(fd);
+        if (n == 8 && !memcmp(m4a_check + 4, "ftyp", 4))
+            return (int)mp4_duration_ms(path);
+    }
+
+    dec_t d;
+    if (dec_open(&d, path) != 0) return 0;
+    int ms = 0;
+    if (d.kind == DEC_MP3) {
+        struct stat st;
+        if (bitrate_bps > 0 && stat(path, &st) == 0)
+            ms = (int)((int64_t)st.st_size * 8000 / bitrate_bps);
+    } else if (d.frames && d.rate) {
+        ms = (int)(d.frames * 1000 / d.rate);
+    }
+    dec_close(&d);
+    return ms;
 }
 
 /* ---- ALSA, dlopen'd ------------------------------------------------------ */

@@ -30,6 +30,7 @@
 #include "vendor/sqlite3.h"
 #include "library.h"
 #include "tags.h"
+#include "audio.h"
 
 #define DB_PATH "/usr/data/usrlocal_media.db"
 
@@ -414,6 +415,12 @@ static int tracks_query(const char *artist, const char *album, int use_artist,
         t->rate = sqlite3_column_int(st, 4);
         t->bitrate = sqlite3_column_int(st, 5);
         t->dur_ms = sqlite3_column_int(st, 6);
+        /* R28: end_time is only ever populated for a cue-sheet split track
+         * (one physical file shared across several rows) -- an ordinary
+         * track, which is nearly everything, is left at -1 indefinitely.
+         * See audio_probe_dur_ms()'s own comment for why this is safe to
+         * call here, including while something else is playing. */
+        if (t->dur_ms <= 0) t->dur_ms = audio_probe_dur_ms(t->path, t->bitrate);
         copy_text(t->artist, sizeof(t->artist), sqlite3_column_text(st, 7));
         /* Ask the file first. The filename is a guess that happens to be right
          * about half the time here, and a wrong guess does not leave a track
@@ -606,6 +613,7 @@ int lib_track_by_path(const char *real, lib_track_t *out) {
         out->rate    = sqlite3_column_int(st, 4);
         out->bitrate = sqlite3_column_int(st, 5);
         out->dur_ms  = sqlite3_column_int(st, 6);
+        if (out->dur_ms <= 0) out->dur_ms = audio_probe_dur_ms(out->path, out->bitrate);
         copy_text(out->artist, sizeof(out->artist), sqlite3_column_text(st, 7));
         out->track = tag_track_number(out->path);
         if (out->track <= 0) out->track = track_no_from_path(out->path);
