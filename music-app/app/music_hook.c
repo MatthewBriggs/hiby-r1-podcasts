@@ -984,6 +984,16 @@ static char cur_album[LIB_NAME_LEN];
  * filtered at all. Set wherever SC_ALBUMS is actually entered as a browse
  * target, restored into cur_artist on the way back out of Tracks. */
 static char albums_artist[LIB_NAME_LEN];
+/* Set right before a normal Albums -> Tracks -> Playing descent; cleared at
+ * the mini-player's direct jump into Playing. Tells go_back()'s SC_PLAYING
+ * case whether albums_artist (the "artist" facet column's group name, e.g.
+ * "Alice Sara Ott") is still good, or whether q_artist (BG7's fallback,
+ * which is really the album_artist *column*'s value, e.g. "Alice Sara Ott
+ * (piano)" -- a different tag that can hold a different string) is the only
+ * thing available. Without this, backing out of a normal browse clobbered a
+ * perfectly good albums_artist with a value from the wrong column, and the
+ * next "back" filtered Albums by a facet value that matched nothing. */
+static int played_from_browse;
 static int  cur_track;          /* index into tracks[] */
 
 /* An A-Z strip down the right edge. 117 artists and 277 albums nine rows at a
@@ -2623,10 +2633,16 @@ static int go_back(void) {
             track_n = queue_n;
             snprintf(cur_artist, sizeof(cur_artist), "%s", q_artist);
             snprintf(cur_album,  sizeof(cur_album),  "%s", q_album);
-            /* So a further "back" out of this queue view (BG7's fix, below)
-             * restores this same artist rather than whatever an earlier,
-             * unrelated Albums browse last left in albums_artist. */
-            snprintf(albums_artist, sizeof(albums_artist), "%s", q_artist);
+            /* So a further "back" out of this queue view (BG7's fix) restores
+             * this same artist rather than whatever an earlier, unrelated
+             * Albums browse last left in albums_artist -- but only when we
+             * actually got here without a normal Albums browse to fall back
+             * on (played_from_browse false). When we did descend normally,
+             * albums_artist already holds the right facet-column value and
+             * q_artist (a different column, see the field's own comment)
+             * would overwrite it with the wrong one. */
+            if (!played_from_browse)
+                snprintf(albums_artist, sizeof(albums_artist), "%s", q_artist);
             ab_list = audiobook_mode;
             screen = SC_TRACKS;
             reset_scroll();
@@ -3974,7 +3990,7 @@ static int music_entry(void *a0, void *a1) {
                 } else {
                     if (x > MINI_ZONE_SIDE)      play_index(cur_track + 1);
                     else if (x > MINI_ZONE_PLAY) audio_toggle();
-                    else                          screen = SC_PLAYING;
+                    else { screen = SC_PLAYING; played_from_browse = 0; }
                 }
             } else if (screen == SC_EQ) {
                 int ry_enabled = eq_row_enabled_y();
@@ -4144,6 +4160,7 @@ static int music_entry(void *a0, void *a1) {
                          * carry into a song. */
                         audio_set_speed(1000);
                         screen = SC_PLAYING;
+                        played_from_browse = 1;
                         play_from_list(scroll + idx);
                     }
                 } else if (screen == SC_PLAYLISTS && scroll + idx < playlist_n) {
