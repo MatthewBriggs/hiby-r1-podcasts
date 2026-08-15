@@ -952,6 +952,16 @@ static int total;                       /* rows in the current list */
  * already covers for the artist filter itself. */
 static int artists_scroll_saved, artists_scroll_px_saved;
 
+/* BG37 follow-up: the same idea, one level down. SC_ALBUMS' own scroll
+ * position was never saved at all -- BG37 only ever covered SC_ARTISTS ->
+ * SC_ALBUMS, not SC_ALBUMS -> SC_TRACKS, so backing out of an album always
+ * landed on top of the Albums list regardless. Saved the moment an album
+ * row is tapped, restored in go_back()'s default case (the only path back
+ * from SC_TRACKS to a real SC_ALBUMS browse -- the ab_list branch there is
+ * Chapters, a different screen's data, and ALBUMS-with-no-facet is a
+ * distinct forward entry that correctly wants the top). */
+static int albums_scroll_saved, albums_scroll_px_saved;
+
 /* Live drag + inertia state for list scrolling, set up alongside scroll_to_px
  * below (which needs vis_rows/load_page, not yet declared here). */
 static int   list_dragging;
@@ -2795,6 +2805,14 @@ static int go_back(void) {
                 snprintf(cur_artist, sizeof(cur_artist), "%s", albums_artist);
                 screen = SC_ALBUMS; reset_scroll();
                 total = lib_albums_count(cur_facet, cur_artist[0] ? cur_artist : NULL);
+                /* BG37 follow-up: land back where the list was, not at the
+                 * top. Same clamp BG37 uses for SC_ARTISTS, in case the
+                 * album count changed underneath (a rescan) since the album
+                 * was tapped. */
+                scroll = albums_scroll_saved;
+                if (scroll > total - 1) scroll = total > 0 ? total - 1 : 0;
+                if (scroll < 0) scroll = 0;
+                scroll_px = albums_scroll_px_saved;
                 load_page();
             }
             break;
@@ -4295,6 +4313,8 @@ static int music_entry(void *a0, void *a1) {
                      * empty artist finds nothing, so writing "" through is
                      * correct, not just harmless. */
                     snprintf(cur_artist, sizeof(cur_artist), "%s", row->owner);
+                    albums_scroll_saved = scroll;          /* BG37 follow-up */
+                    albums_scroll_px_saved = scroll_px;
                     screen = SC_TRACKS; reset_scroll();
                     ab_list = 0;
                     track_n = lib_tracks_for_album(cur_artist, cur_album,
