@@ -289,7 +289,9 @@ static void *art_worker(void *arg) {
      * named .jpg simply fails. Any of those used to mean a blank panel even
      * when the track had good embedded art a few candidates further down. */
     for (int n = 0; !bits; n++) {
-        if (art_candidate(track, n, jpg, sizeof(jpg), key, sizeof(key)) != 0) break;
+        int rc = art_candidate(track, n, jpg, sizeof(jpg), key, sizeof(key));
+        if (rc == -1) break;
+        if (rc == ART_SKIP) continue;
         bits = cover_load(jpg, key, ART_PX);
     }
 
@@ -3431,11 +3433,14 @@ static void set_locked(int on) {
  * This unit has no play/pause button of its own; that control is on screen. */
 typedef enum { KEYS_BUTTONS = 0, KEYS_REMOTE } key_src_t;
 
-/* Returns non-zero if anything happened, so the caller can mark the UI dirty. */
+/* Returns non-zero if anything happened, so the caller can mark the UI dirty;
+ * -1 means the fd itself has died and the caller should close and forget it
+ * (see the comment below the loop). */
 static int handle_keys(int fd, key_src_t src) {
     struct input_event ev;
     int acted = 0;
-    while (fd >= 0 && read(fd, &ev, sizeof(ev)) == sizeof(ev)) {
+    ssize_t r;
+    while (fd >= 0 && (r = read(fd, &ev, sizeof(ev))) == (ssize_t)sizeof(ev)) {
         if (ev.type != EV_KEY || ev.value == 0) continue;   /* presses only */
         mlog("[music] key %d\n", ev.code);
         /* Power is the lock key, and the only one that wakes the screen. A
@@ -3554,6 +3559,20 @@ static int handle_keys(int fd, key_src_t src) {
             default: break;
         }
     }
+    /* A short read of 0 is a true EOF, not "no data queued" (that's EAGAIN,
+     * expected on nearly every poll of a nonblocking fd and not an error).
+     * EOF means the device itself is gone: BlueZ tears down and recreates
+     * the AVRCP input node on every headset reconnect, reusing the same
+     * eventN path scan_inputs() already has recorded, and its "already have
+     * this name" check has no way to tell a now-dead fd from a live one by
+     * name alone -- so it never reopens it, and this app is left polling a
+     * handle that will never produce another event, permanently, until the
+     * whole app restarts. RBG1: headset controls worked once, then silently
+     * stopped after the first reconnect. Signalling death here lets the
+     * caller close it and forget the name so the next scan picks the fresh
+     * device back up. */
+    if (fd >= 0 && r == 0) return -1;
+    if (fd >= 0 && r < 0 && errno != EAGAIN && errno != EWOULDBLOCK) return -1;
     return acted;
 }
 
@@ -4235,7 +4254,25 @@ static int music_entry(void *a0, void *a1) {
         }
 
         int keyed = 0;
-        for (int k = 0; k < kfd_n; k++) keyed |= handle_keys(kfd[k], kfd_src[k]);
+        for (int k = 0; k < kfd_n; k++) {
+            int r = handle_keys(kfd[k], kfd_src[k]);
+            if (r < 0) {
+                /* RBG1: this fd died (its device was torn down and
+                 * recreated, e.g. a Bluetooth headset's AVRCP reconnect).
+                 * Close it and drop it by swapping in the last entry, so
+                 * the name frees up and the next scan_inputs() call below
+                 * picks up a fresh, live handle instead of leaving this
+                 * slot permanently dead for the rest of the app session. */
+                close(kfd[k]);
+                kfd_n--;
+                kfd[k] = kfd[kfd_n];
+                kfd_src[k] = kfd_src[kfd_n];
+                snprintf(kfd_name[k], sizeof(kfd_name[0]), "%s", kfd_name[kfd_n]);
+                k--;
+                continue;
+            }
+            keyed |= r;
+        }
         if (keyed) { dirty = 1; idle = 0; }
 
         /* A headset connecting brings its AVRCP device with it. */

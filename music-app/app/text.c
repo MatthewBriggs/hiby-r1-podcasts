@@ -17,10 +17,12 @@
 #include "vendor/stb_truetype.h"
 
 #include <fcntl.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "text.h"
@@ -143,15 +145,23 @@ static const char *utf8_next(const char *s, unsigned *cp) {
     return s + 1;
 }
 
+/* Divide by 255, exactly, without dividing. This target is an in-order MIPS32
+ * with no fast integer divide, and the three /255 that used to be here ran
+ * once per *antialiased glyph pixel* -- the single hottest arithmetic in the
+ * whole UI. Identical results for every value this can produce (t is at most
+ * 255*255): checked against t/255 across the full range, not assumed. */
+static inline unsigned div255(unsigned t) { return (t + 1 + (t >> 8)) >> 8; }
+
 /* RGB565 blend; a is 0..255 coverage. */
 static inline uint16_t blend(uint16_t dst, uint16_t src, unsigned a) {
     if (a >= 250) return src;
     if (a < 6) return dst;
     unsigned sr = (src >> 11) & 0x1F, sg = (src >> 5) & 0x3F, sb = src & 0x1F;
     unsigned dr = (dst >> 11) & 0x1F, dg = (dst >> 5) & 0x3F, db = dst & 0x1F;
-    unsigned r = (sr * a + dr * (255 - a)) / 255;
-    unsigned g = (sg * a + dg * (255 - a)) / 255;
-    unsigned b = (sb * a + db * (255 - a)) / 255;
+    unsigned na = 255 - a;
+    unsigned r = div255(sr * a + dr * na);
+    unsigned g = div255(sg * a + dg * na);
+    unsigned b = div255(sb * a + db * na);
     return (uint16_t)((r << 11) | (g << 5) | b);
 }
 

@@ -1,31 +1,36 @@
 /* art.c — find a JPEG for a track.
  *
- * Candidates, cheapest first:
+ * Candidates, in the order they are offered:
  *
- *  1. A picture file in the album folder. Cheapest, and shared by every track
- *     on the album — but only 108 of the 293 album folders here have one under
- *     a conventional name.
- *  2. *Any* other .jpg/.jpeg sitting in that folder. If a single JPEG is in an
+ *  1. The picture embedded in the file itself. This is the authoritative one:
+ *     it was chosen for *this* release by whoever tagged it, whereas a loose
+ *     image in the folder may be a back cover, a booklet scan, a label logo,
+ *     or the art for a different edition sharing the directory. FLAC PICTURE
+ *     blocks, ID3v2 APIC frames and MP4 covr atoms are all parsed directly:
+ *     the layouts are a few fixed fields, and doing it by hand avoids pulling
+ *     in a tag library for about sixty lines of work.
+ *  2. A picture file in the album folder under a conventional name
+ *     (cover.jpg, folder.jpg, front.jpg...), shared by every track on it.
+ *  3. *Any* other .jpg/.jpeg sitting in that folder. If a single JPEG is in an
  *     album directory it is the cover, whatever it happens to be called;
  *     insisting on cover.jpg/folder.jpg meant a blank panel until someone
  *     renamed files by hand, which is not a reasonable thing to ask of a
  *     library.
- *  3. The picture embedded in the file itself, which is where most of the rest
- *     keep it. FLAC PICTURE blocks and ID3v2 APIC frames are both parsed
- *     directly: they sit at the head of the file, the layouts are a few fixed
- *     fields, and doing it by hand avoids pulling in a tag library for what is
- *     about sixty lines.
+ *
+ * Embedded went last for a long time because it is the expensive one -- it
+ * parses the file and spills to /tmp, against a stat each for the folder
+ * images. That ordering is what made a stray JPEG in the folder win over the
+ * release's own art. The cost is now paid at most once per album instead:
+ * art_worker() asks the cover cache first (cover_cached()) and only comes
+ * here on a miss, so a second visit to the same album never re-extracts.
  *
  * These are offered one at a time rather than resolved to a single answer,
  * because "a file exists" is not the same as "art that loads": the decoder
  * declines large progressive JPEGs and over-size images by design, and a PNG
- * named .jpg fails outright. Returning the first existing file meant one bad
- * cover.jpg produced a blank panel even when the track carried perfectly good
- * embedded art. The caller walks the list until something actually decodes.
- *
- * Extracted pictures are written once into the cover cache and thereafter hit
- * as ordinary files, so this runs at full cost only the first time an album is
- * opened.
+ * named .jpg fails outright. The caller walks the list until something
+ * actually decodes, so an embedded picture the decoder refuses still falls
+ * through to a hand-placed cover.jpg -- which is exactly the documented
+ * workaround for progressive embedded covers (see H4 in the backlog).
  */
 
 #include <stdio.h>
@@ -273,30 +278,34 @@ static int folder_art(const char *dir, char out[][ART_NAME_LEN], int max) {
  * between its tracks neither re-extracts nor re-decodes). Returns 0 while
  * candidates remain, -1 once the list is exhausted.
  *
- * The embedded scan is deliberately last and only paid for when everything
- * cheaper has failed — it parses the file and spills to /tmp, against a stat
- * each for the folder images above it. */
+ * Slot 0 is the embedded picture; slots 1.. are the folder images. Slot 0
+ * returns ART_SKIP rather than -1 when the file carries no usable embedded
+ * picture: -1 means "no candidates left at all" and would end the walk before
+ * the folder fallback was ever tried, and folding it into slot 1 instead
+ * would offer the first folder image twice. */
 int art_candidate(const char *track_path, int n, char *out, size_t out_n,
                   char *key, size_t key_n) {
     char dir[512];
     album_dir(track_path, dir, sizeof(dir));
     snprintf(key, key_n, "%s", dir);
 
-    char names[ART_MAX_FILES][ART_NAME_LEN];
-    int cnt = folder_art(dir, names, ART_MAX_FILES);
-    if (n < cnt) {
-        snprintf(out, out_n, "%s/%s", dir, names[n]);
+    if (n == 0) {
+        FILE *f = fopen(track_path, "rb");
+        if (!f) return ART_SKIP;
+        int rc = flac_picture(f, ART_SCRATCH);
+        if (rc != 0) { rewind(f); rc = id3_apic(f, ART_SCRATCH); }
+        if (rc != 0) { rewind(f); rc = mp4_cover(f, ART_SCRATCH); }
+        fclose(f);
+        if (rc != 0) return ART_SKIP;
+        snprintf(out, out_n, "%s", ART_SCRATCH);
         return 0;
     }
-    if (n > cnt) return -1;          /* past the embedded slot as well */
 
-    FILE *f = fopen(track_path, "rb");
-    if (!f) return -1;
-    int rc = flac_picture(f, ART_SCRATCH);
-    if (rc != 0) { rewind(f); rc = id3_apic(f, ART_SCRATCH); }
-    if (rc != 0) { rewind(f); rc = mp4_cover(f, ART_SCRATCH); }
-    fclose(f);
-    if (rc != 0) return -1;
-    snprintf(out, out_n, "%s", ART_SCRATCH);
-    return 0;
+    char names[ART_MAX_FILES][ART_NAME_LEN];
+    int cnt = folder_art(dir, names, ART_MAX_FILES);
+    if (n - 1 < cnt) {
+        snprintf(out, out_n, "%s/%s", dir, names[n - 1]);
+        return 0;
+    }
+    return -1;
 }

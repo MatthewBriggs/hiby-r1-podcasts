@@ -194,6 +194,35 @@ static void save_cache(const char *key, int px, const uint16_t *buf) {
     prune_cache();
 }
 
+uint16_t *cover_cached(const char *cache_key, const char *dir, int px) {
+    if (px <= 0 || px > 512 || !cache_key) return NULL;
+    char p[512];
+    cache_path(cache_key, px, p, sizeof(p));
+
+    /* Same staleness rule load_cache() applies to a JPEG, against the folder
+     * instead: adding or replacing artwork in an album directory bumps the
+     * directory's own mtime, so a cache entry older than the folder is thrown
+     * away rather than pinning yesterday's cover forever. Replacing a file
+     * fully in place on exFAT may not move the folder's mtime -- that case
+     * still resolves on the next cache prune, or by deleting the entry. */
+    struct stat cs, ds;
+    if (stat(p, &cs) != 0) return NULL;
+    if (dir && stat(dir, &ds) == 0 && ds.st_mtime > cs.st_mtime) {
+        unlink(p);
+        return NULL;
+    }
+
+    FILE *f = fopen(p, "rb");
+    if (!f) return NULL;
+    size_t want = (size_t)px * px;
+    uint16_t *buf = malloc(want * sizeof(uint16_t));
+    if (!buf) { fclose(f); return NULL; }
+    size_t got = fread(buf, sizeof(uint16_t), want, f);
+    fclose(f);
+    if (got != want) { free(buf); return NULL; }
+    return buf;
+}
+
 uint16_t *cover_load(const char *jpeg_path, const char *cache_key, int px) {
     if (px <= 0 || px > 512) return NULL;
     if (!cache_key) cache_key = jpeg_path;
