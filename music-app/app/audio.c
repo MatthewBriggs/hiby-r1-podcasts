@@ -1495,9 +1495,18 @@ static void *worker(void *arg) {
          * WSOLA works on shorts, and an audiobook is never hires in practice,
          * so a hires source simply keeps playing at 1.0x. */
         if (!hires && speed != 1000) {
-            if (g_wsola_rate != (int)eff_rate || g_wsola_ch != ch || g_wsola_speed != speed) {
+            if (g_wsola_rate != (int)eff_rate || g_wsola_ch != ch) {
                 wsola_init(&g_wsola, (long)eff_rate, ch, speed);
                 g_wsola_rate = (int)eff_rate; g_wsola_ch = ch; g_wsola_speed = speed;
+            } else if (g_wsola_speed != speed) {
+                /* BG44: a pure speed change (rate/channels unchanged) needs
+                 * no flush -- wsola_set_speed() only touches Ha, so the
+                 * overlap-add continuity and cross-correlation reference
+                 * survive, and the transition is inaudible instead of the
+                 * ~40ms re-prime gap a full wsola_init() cost on every tap
+                 * of the speed control. */
+                wsola_set_speed(&g_wsola, speed);
+                g_wsola_speed = speed;
             }
             wsola_feed(&g_wsola, buf, (int)got);
             for (;;) {

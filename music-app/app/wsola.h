@@ -66,8 +66,17 @@ typedef struct {
 
 /* (Re-)initialise for the given rate/channels/speed. Zeros all state, builds the
  * Hann window, computes N/Hs/Lr/delta/Ha from rate. Safe to call mid-stream
- * (flushes ~40 ms; the caller uses this on speed change). */
+ * (flushes ~40 ms). Use this when rate or channels change; for a pure speed
+ * change, wsola_set_speed() below is cheaper and does not flush. */
 void wsola_init(wsola_t *w, long rate, int channels, int speed_permille);
+
+/* Update the time-stretch ratio in place. N/Hs/Lr/delta/win depend only on
+ * rate, not speed -- Ha (the analysis hop) is the only thing a speed change
+ * actually affects -- so this leaves the input ring, overlap accumulator and
+ * cross-correlation reference (prev_tail) exactly as they were, with no
+ * flush and no audible discontinuity. Only valid when rate and channels are
+ * unchanged; call wsola_init instead if either differs. */
+void wsola_set_speed(wsola_t *w, int speed_permille);
 
 /* Append `frames` interleaved S16 samples to the input buffer. */
 void wsola_feed(wsola_t *w, const short *in, int frames);

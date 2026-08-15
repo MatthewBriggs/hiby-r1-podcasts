@@ -44,6 +44,14 @@ void wsola_init(wsola_t *w, long rate, int channels, int speed_permille) {
     w->have_tail = 0;
 }
 
+void wsola_set_speed(wsola_t *w, int speed_permille) {
+    if (speed_permille < 800) speed_permille = 800;
+    if (speed_permille > 2000) speed_permille = 2000;
+    w->speed = speed_permille;
+    w->Ha = w->Hs * speed_permille / 1000;
+    if (w->Ha < 1) w->Ha = 1;
+}
+
 /* ---- input buffer helpers ----------------------------------------------- */
 
 /* Drop `n` frames from the front of in_buf, adjusting ideal_off and in_have. */
