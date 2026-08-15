@@ -36,6 +36,7 @@
 #include <sys/syscall.h>
 #include <sys/ioctl.h>
 #include <sys/utsname.h>
+#include <sys/vfs.h>
 #include <linux/fb.h>
 #include <linux/input.h>
 
@@ -815,6 +816,63 @@ static void about_firmware(char *out, size_t n) {
     if (len >= n) len = n - 1;
     memcpy(out, p, len);
     out[len] = '\0';
+}
+
+/* R26 follow-up. The efuse chip ID is the right source (confirmed live --
+ * hiby_player's own strings name both this /proc path and getSerialNumber
+ * together), but the raw 32-hex-digit ID is not itself the serial number:
+ * the stock About screen's "Serial number" is "R1" + the first 8 hex digits
+ * of the chip ID, uppercased. Confirmed by direct comparison on this unit --
+ * chip ID "7b42423542a0c500afa0560804000001" against stock's own displayed
+ * "R17B424235". First attempt showed the full raw ID; wrong, per the user. */
+static void about_serial(char *out, size_t n) {
+    snprintf(out, n, "unknown");
+    FILE *f = fopen("/proc/jz/efuse/efuse_chip_id", "r");
+    if (!f) return;
+    char buf[128];
+    if (!fgets(buf, sizeof(buf), f)) { fclose(f); return; }
+    fclose(f);
+    const char *p = strstr(buf, "CHIP_ID:");
+    if (p) p += strlen("CHIP_ID:"); else p = buf;
+    while (*p == ' ') p++;
+    if (strlen(p) < 8) return;
+    char hex8[9];
+    memcpy(hex8, p, 8);
+    hex8[8] = '\0';
+    for (int i = 0; i < 8; i++) hex8[i] = (char)toupper((unsigned char)hex8[i]);
+    snprintf(out, n, "R1%s", hex8);
+}
+
+/* SD_ROOT matches library.c's own -- /data is a symlink to usr/data, so this
+ * resolves to the same mount statfs sees at /usr/data/mnt/sd_0 either way. */
+static void about_sd_free(char *out, size_t n) {
+    struct statfs sf;
+    if (statfs("/data/mnt/sd_0/", &sf) != 0 || sf.f_bsize <= 0) {
+        snprintf(out, n, "unknown");
+        return;
+    }
+    double gb = (double)sf.f_bavail * (double)sf.f_bsize / (1000.0 * 1000.0 * 1000.0);
+    snprintf(out, n, "%.1f GB free", gb);
+}
+
+/* MemAvailable (not MemFree): what the kernel itself estimates could actually
+ * be given to a new allocation without swapping, once reclaimable cache is
+ * counted -- MemFree alone reads alarmingly low on this device even when
+ * plenty is available, for exactly the reason BG44's own investigation ran
+ * into (buff/cache regularly the largest share of a 56 MB budget). */
+static void about_ram_free(char *out, size_t n) {
+    snprintf(out, n, "unknown");
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (!f) return;
+    char line[128];
+    while (fgets(line, sizeof(line), f)) {
+        long kb;
+        if (sscanf(line, "MemAvailable: %ld kB", &kb) == 1) {
+            snprintf(out, n, "%.0f MB free", kb / 1024.0);
+            break;
+        }
+    }
+    fclose(f);
 }
 
 /* One line, dragged sideways rather than wrapped.
@@ -2445,9 +2503,12 @@ static void draw_screen(uint16_t *fb) {
     }
 
     if (screen == SC_SETTINGS_ABOUT) {
-        char kernel[64], firmware[32];
+        char kernel[64], firmware[32], serial[40], sd_free[24], ram_free[24];
         about_kernel(kernel, sizeof(kernel));
         about_firmware(firmware, sizeof(firmware));
+        about_serial(serial, sizeof(serial));
+        about_sd_free(sd_free, sizeof(sd_free));
+        about_ram_free(ram_free, sizeof(ram_free));
 
         int ry = CONTENT_Y;
         draw_text(fb, 24, ry + 20, "Library version", COL_TEXT, TEXT_PX_BODY, FB_W - 200);
@@ -2462,6 +2523,21 @@ static void draw_screen(uint16_t *fb) {
         ry += ROW_H;
         draw_text(fb, 24, ry + 20, "Kernel version", COL_TEXT, TEXT_PX_BODY, FB_W - 200);
         draw_right(fb, ry + 20, kernel);
+        fill_rect(fb, 0, ry + ROW_H - 1, FB_W, 1, COL_LINE);
+
+        ry += ROW_H;
+        draw_text(fb, 24, ry + 20, "Serial number", COL_TEXT, TEXT_PX_BODY, FB_W - 200);
+        draw_right(fb, ry + 20, serial);
+        fill_rect(fb, 0, ry + ROW_H - 1, FB_W, 1, COL_LINE);
+
+        ry += ROW_H;
+        draw_text(fb, 24, ry + 20, "SD card", COL_TEXT, TEXT_PX_BODY, FB_W - 200);
+        draw_right(fb, ry + 20, sd_free);
+        fill_rect(fb, 0, ry + ROW_H - 1, FB_W, 1, COL_LINE);
+
+        ry += ROW_H;
+        draw_text(fb, 24, ry + 20, "Memory", COL_TEXT, TEXT_PX_BODY, FB_W - 200);
+        draw_right(fb, ry + 20, ram_free);
         fill_rect(fb, 0, ry + ROW_H - 1, FB_W, 1, COL_LINE);
 
         if (mini_visible()) draw_mini(fb);
