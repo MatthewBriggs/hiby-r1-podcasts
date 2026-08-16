@@ -157,20 +157,41 @@ static void take_snapshot(snapshot_t *s) {
  * that would otherwise ever reset a bad value short of a format change.
  * Checked once per buffer, not per sample: negligible cost, and normal audio
  * in this +/-1.0 domain never comes remotely close to this magnitude.
+ *
  * BG32 (an occasional loud tone in one channel that pausing and resuming
- * cleared) is the suspected symptom -- not confirmed, but state with nothing
- * to catch a runaway value was a real gap regardless of whether this is the
- * actual cause. */
+ * cleared) recurred live -- Bluetooth WH-1000XM4, EQ on -- with the previous
+ * 1e6f threshold in place, which is why it never caught anything: the output
+ * sample is clamped to +/-1.0 in this domain on every single sample
+ * regardless of z1/z2 (see the write side below), so anything past roughly
+ * z=2-3 is already producing a continuously clipped, full-scale tone --
+ * exactly the reported symptom -- while sitting nowhere near 1e6. A bounded,
+ * non-decaying oscillation (a marginally stable pole, not a truly diverging
+ * one) can sit at that kind of magnitude indefinitely without ever growing
+ * further, which also explains why only pause/resume cleared it: nothing
+ * about the state was moving toward the old threshold at all. Retightened to
+ * 8.0f -- generous headroom above anything a legitimately configured filter
+ * should ever ring to, while catching this failure mode within the one
+ * ~46ms chunk (2048 frames @ 44.1kHz, audio.c's CHUNK_FRAMES) it takes to
+ * reach it, not indefinitely. */
 static void sanitize_state(int n, int channels) {
     for (int b = 0; b < n; b++)
         for (int ch = 0; ch < channels; ch++) {
             state_t *z = &g_state[b][ch];
             if (!isfinite(z->z1) || !isfinite(z->z2) ||
-                fabsf(z->z1) > 1e6f || fabsf(z->z2) > 1e6f) {
+                fabsf(z->z1) > 8.0f || fabsf(z->z2) > 8.0f) {
                 z->z1 = 0.0f; z->z2 = 0.0f;
             }
         }
 }
+
+/* How often sanitize_state() runs within a buffer, in frames -- a tradeoff
+ * between the cost of the check (negligible either way, see sanitize_state's
+ * own comment) and how long a runaway state gets to sit at an audible,
+ * clamped-full-scale amplitude before it's caught. At 256 this is ~5.8ms at
+ * 44.1kHz, worst case, instead of the full ~46ms chunk (audio.c's
+ * CHUNK_FRAMES=2048) a once-per-buffer check would allow -- worth the extra
+ * handful of comparisons per buffer given what the failure sounds like. */
+#define SANITIZE_PERIOD 256
 
 void eq_process_s16(short *buf, int frames, int channels) {
     if (!g_enabled) return;
@@ -188,6 +209,8 @@ void eq_process_s16(short *buf, int frames, int channels) {
             else if (y < -32768.0f) y = -32768.0f;
             buf[idx] = (short)(y >= 0 ? y + 0.5f : y - 0.5f);
         }
+        if ((f % SANITIZE_PERIOD) == SANITIZE_PERIOD - 1)
+            sanitize_state(s.n, channels);
     }
     sanitize_state(s.n, channels);
 }
@@ -235,6 +258,8 @@ void eq_process_s32(int32_t *buf, int frames, int channels) {
             else if (y < -2147483648.0f) y = -2147483648.0f;
             buf[idx] = (int32_t)y;
         }
+        if ((f % SANITIZE_PERIOD) == SANITIZE_PERIOD - 1)
+            sanitize_state(s.n, channels);
     }
     sanitize_state(s.n, channels);
 }
