@@ -27,6 +27,7 @@
 
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <math.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -923,6 +924,20 @@ void audio_bt_volume_service(void) {
     if (!bt_mixer[0]) find_bt_mixer();
     if (!bt_mixer[0]) return;
 
+    /* BG39 diagnostics: no log trail existed for this path at all, unlike
+     * BG41 where the existing decode% log was what actually found the cause.
+     * "jumps the wrong way sometimes" is not reproducible by reading this
+     * code -- the accumulation logic and the key-to-delta mapping both look
+     * correct, and the comment above already names a real, external
+     * candidate (the headset's own buttons moving the same mixer with no
+     * event reaching this app), which no amount of static reading can rule
+     * in or out. Logging the pre-write intent, the resulting command and the
+     * post-write readback gives an actual trail to pull the next time this
+     * is reproduced, the same way BG41 got solved with real evidence rather
+     * than a guess. */
+    int pre_g_vol;
+    pthread_mutex_lock(&g_lock); pre_g_vol = g_vol; pthread_mutex_unlock(&g_lock);
+
     if (pending) {
         char cmd[224];
         if (is_delta)
@@ -931,11 +946,20 @@ void audio_bt_volume_service(void) {
         else
             snprintf(cmd, sizeof(cmd), "amixer -D bluealsa sset '%s' %d%% >/dev/null 2>&1",
                      bt_mixer, abs_val);
-        if (system(cmd) == -1) return;
+        alog("[btvol] applying %s (pre g_vol=%d)\n", cmd, pre_g_vol);
+        if (system(cmd) == -1) {
+            alog("[btvol] system() failed\n");
+            return;
+        }
     }
 
     int pct = bt_read_pct();
-    if (pct < 0) { bt_mixer[0] = '\0'; return; }   /* gone: re-look next time */
+    if (pct < 0) {
+        alog("[btvol] readback failed, mixer gone\n");
+        bt_mixer[0] = '\0'; return;   /* gone: re-look next time */
+    }
+    if (pct != pre_g_vol)
+        alog("[btvol] readback %d%% (was g_vol=%d, pending=%d)\n", pct, pre_g_vol, pending);
     pthread_mutex_lock(&g_lock);
     g_vol = pct;
     pthread_mutex_unlock(&g_lock);
@@ -1006,6 +1030,10 @@ static void *pcm_open(unsigned rate, int channels, int deep, int want_fmt) {
         names[count] = plug;  fmts[count++] = FMT_S16_LE;     /* last resort */
     }
 
+    /* Negotiated buffer depth, carried out of the loop for the start_threshold
+     * decision below. Zero means the query was unavailable or failed. */
+    unsigned long bufsz = 0;
+
     for (unsigned i = 0; i < count; i++) {
         if (x_open(&pcm, names[i], SND_PCM_STREAM_PLAYBACK, 0) < 0 || !pcm) {
             pcm = NULL;
@@ -1031,6 +1059,15 @@ static void *pcm_open(unsigned rate, int channels, int deep, int want_fmt) {
         /* Which *device* was opened, not which index: the exact device now has
          * two candidate formats, so "i == 0" no longer means bit-perfect. Both
          * entries point at the same `exact` buffer, so this compares pointers. */
+        /* Must be read before x_hwp_free() below. Optional symbol (dlsym'd
+         * without SYM's hard failure), so both the pointer and the return
+         * value are checked -- a miss just leaves bufsz at 0 and the
+         * threshold decision falls back to the old behaviour. */
+        if (x_hwp_get_buffer_size) {
+            unsigned long bs = 0;
+            if (x_hwp_get_buffer_size(hw, &bs) >= 0 && bs > 0) bufsz = bs;
+        }
+
         g_exact = (!use_bt && names[i] == exact);
         g_out_fmt = fmts[i];
         g_out_rate = r;
@@ -1048,14 +1085,37 @@ static void *pcm_open(unsigned rate, int channels, int deep, int want_fmt) {
      * happily, took about eleven seconds of audio, and then parked forever in
      * wait_for_avail: the stream never started, so nothing ever drained. */
 
-    /* start_threshold 1: begin playing as soon as there is a frame, rather
-     * than waiting for the buffer to fill. */
+    /* start_threshold 1 -- begin playing as soon as there is a frame rather
+     * than waiting for the buffer to fill -- is right for the internal DAC and
+     * for USB, where the transport has no jitter worth a cushion and the only
+     * thing a threshold buys is startup latency.
+     *
+     * It is wrong for A2DP. snd_pcm_recover() calls prepare(), which returns
+     * the stream to the un-started state, so with a threshold of 1 every
+     * recovery restarts playback on an empty buffer with no cushion at all --
+     * straight back to the edge of underrun on a transport that has real
+     * jitter. That turns a single dropout into a self-sustaining loop, which
+     * is what the log shows: underruns arriving not scattered but at a
+     * metronomic ~10/sec, thousands in a row (#129 through #2177 in one
+     * stretch), rather than the random spacing an external cause would give.
+     *
+     * Over Bluetooth, wait for the whole negotiated buffer instead. Costs up
+     * to one buffer of latency at track start and once per recovery -- a
+     * single gap, against a continuous stutter -- on a path that already
+     * carries a couple of hundred ms of transport latency regardless.
+     *
+     * Note this is not a difference from open_hiby_player, which sets no
+     * sw_params and so takes alsa-lib's default: that default is also 1. It
+     * is a fix on its own merits, not a missed trick from another player. */
     void *sw = NULL;
     if (x_swp_malloc(&sw) >= 0 && sw) {
+        unsigned long thresh = (use_bt && bufsz > 0) ? bufsz : 1;
         x_swp_current(pcm, sw);
-        x_swp_set_start_threshold(pcm, sw, 1);
+        x_swp_set_start_threshold(pcm, sw, thresh);
         x_swp_apply(pcm, sw);
         x_swp_free(sw);
+        if (thresh > 1)
+            alog("[audio] start_threshold %lu frames (bt cushion)\n", thresh);
     }
     x_prepare(pcm);
     return pcm;
@@ -1374,6 +1434,38 @@ static void *worker(void *arg) {
                 eff_rate = g_out_rate;
                 eq_set_format(eff_rate, ch);
             }
+
+            /* BG32 diagnostics. Drained on the same once-a-second tick as the
+             * USB poll, from the same thread that accumulates them, so this
+             * needs no lock. Silent unless something is actually worth seeing:
+             * a clean chunk of normal music trips none of these conditions, so
+             * a quiet log is itself the result -- it means the samples leaving
+             * the EQ were fine and a reported tone came from further down the
+             * chain (bluealsa, the A2DP link, the headset), not from here.
+             *
+             * Deliberately not gated on eq_enabled(): a drain with the EQ off
+             * reports zero samples, which distinguishes "EQ ran and was clean"
+             * from "EQ never ran at all" when reading the log afterwards.
+             *
+             * Per channel, not aggregated: every report of this tone has named
+             * the left ear specifically, and both channels run identical
+             * coefficients, so a left/right split in our own output is the one
+             * measurement that can tell "this filter made the tone" apart from
+             * "our output is clean and something downstream did." A threshold
+             * on the per-channel peak difference, not just on the individual
+             * peaks, catches the case both channels are loud but only one is
+             * clipped-loud. */
+            eq_stats_t es;
+            eq_stats_drain(&es);
+            float pdiff = fabsf(es.peak[0] - es.peak[1]);
+            if (es.trips || es.clipped[0] || es.clipped[1] ||
+                es.peak[0] > 1.0f || es.peak[1] > 1.0f ||
+                es.zmax > 1.0f || pdiff > 0.3f)
+                alog("[eq] peak L%.3f R%.3f zmax %.3f clipped L%lu/R%lu of %lu"
+                     " trips %lu last b%d c%d\n",
+                     (double)es.peak[0], (double)es.peak[1], (double)es.zmax,
+                     es.clipped[0], es.clipped[1], es.samples,
+                     es.trips, es.trip_band, es.trip_ch);
         }
 
         /* Read at full precision whenever the source has it, regardless of

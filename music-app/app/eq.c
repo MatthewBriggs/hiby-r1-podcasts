@@ -29,6 +29,17 @@ static coeffs_t      g_coeffs[EQ_MAX_BANDS];
 
 static state_t g_state[EQ_MAX_BANDS][EQ_MAX_CH];   /* audio-thread only */
 
+/* See eq.h. Audio-thread only, same as g_state -- accumulated in the process
+ * loops, drained by audio.c from that same thread, so no lock. */
+static eq_stats_t g_st = { 0, { 0, 0 }, 0, { 0.0f, 0.0f }, 0.0f, -1, -1 };
+
+void eq_stats_drain(eq_stats_t *out) {
+    if (out) *out = g_st;
+    g_st.samples = 0; g_st.trips = 0; g_st.zmax = 0.0f;
+    for (int c = 0; c < EQ_MAX_CH; c++) { g_st.clipped[c] = 0; g_st.peak[c] = 0.0f; }
+    g_st.trip_band = -1; g_st.trip_ch = -1;
+}
+
 /* RBJ Audio-EQ-Cookbook. Same formulas verified against the real Sony
  * WH-1000XM4 filter set in the on-device benchmark this was built from. */
 static void design(coeffs_t *c, eq_type_t type, double rate, double fc,
@@ -159,26 +170,39 @@ static void take_snapshot(snapshot_t *s) {
  * in this +/-1.0 domain never comes remotely close to this magnitude.
  *
  * BG32 (an occasional loud tone in one channel that pausing and resuming
- * cleared) recurred live -- Bluetooth WH-1000XM4, EQ on -- with the previous
- * 1e6f threshold in place, which is why it never caught anything: the output
- * sample is clamped to +/-1.0 in this domain on every single sample
- * regardless of z1/z2 (see the write side below), so anything past roughly
- * z=2-3 is already producing a continuously clipped, full-scale tone --
- * exactly the reported symptom -- while sitting nowhere near 1e6. A bounded,
- * non-decaying oscillation (a marginally stable pole, not a truly diverging
- * one) can sit at that kind of magnitude indefinitely without ever growing
- * further, which also explains why only pause/resume cleared it: nothing
- * about the state was moving toward the old threshold at all. Retightened to
- * 8.0f -- generous headroom above anything a legitimately configured filter
- * should ever ring to, while catching this failure mode within the one
- * ~46ms chunk (2048 frames @ 44.1kHz, audio.c's CHUNK_FRAMES) it takes to
- * reach it, not indefinitely. */
+ * cleared) is why the threshold moved from 1e6f to 8.0f. Be clear about what
+ * that change is worth: 1e6f was plainly useless, since the output is clamped
+ * on every sample regardless of z1/z2 (see the write side below), so a state
+ * of z=3 already produces a continuously clipped full-scale tone while
+ * sitting six orders of magnitude below the old trigger. But 8.0f does not
+ * fix BG32 either -- it was picked as "headroom" without working out what
+ * magnitude is already audible, and in a +/-1.0 domain anything past roughly
+ * z=1 is. An oscillation parked between 1 and 8 is a full-volume tone that
+ * still walks straight through this check.
+ *
+ * It was left at 8.0f rather than tightened further because a legitimate
+ * filter ringing on loud material does reach past 1.0, and a reset fires a
+ * discontinuity into the signal -- a click. Tightening blindly trades one
+ * audible defect for another. The counters below exist to settle it with
+ * evidence: BG32 recurred with this threshold live, so either the state never
+ * gets near 8.0 (zmax will say so, and the cause is elsewhere) or it does and
+ * resets are firing constantly (trips will say so). Until one of those
+ * numbers comes back from a real occurrence, this stays a safety net of
+ * unproven value, not a fix. */
 static void sanitize_state(int n, int channels) {
     for (int b = 0; b < n; b++)
         for (int ch = 0; ch < channels; ch++) {
             state_t *z = &g_state[b][ch];
+            /* NaN fails every comparison, so it never raises zmax -- that is
+             * fine, the trip counter catches it and zmax is here to show
+             * growth that stays *under* the threshold. */
+            float a1 = fabsf(z->z1), a2 = fabsf(z->z2);
+            float m = a1 > a2 ? a1 : a2;
+            if (m > g_st.zmax) g_st.zmax = m;
             if (!isfinite(z->z1) || !isfinite(z->z2) ||
-                fabsf(z->z1) > 8.0f || fabsf(z->z2) > 8.0f) {
+                a1 > 8.0f || a2 > 8.0f) {
+                g_st.trips++;
+                g_st.trip_band = b; g_st.trip_ch = ch;
                 z->z1 = 0.0f; z->z2 = 0.0f;
             }
         }
@@ -204,11 +228,16 @@ void eq_process_s16(short *buf, int frames, int channels) {
             float x = (float)buf[idx] * (1.0f / 32768.0f) * s.preamp;
             for (int b = 0; b < s.n; b++)
                 if (s.on[b]) x = biquad(&s.c[b], &g_state[b][ch], x);
+            /* Measured on the normalised value, before the clamp, so a
+             * runaway shows its real magnitude rather than the clipped one. */
+            float ax = fabsf(x);
+            if (ax > g_st.peak[ch]) g_st.peak[ch] = ax;
             float y = x * 32768.0f;
-            if (y > 32767.0f) y = 32767.0f;
-            else if (y < -32768.0f) y = -32768.0f;
+            if (y > 32767.0f) { y = 32767.0f; g_st.clipped[ch]++; }
+            else if (y < -32768.0f) { y = -32768.0f; g_st.clipped[ch]++; }
             buf[idx] = (short)(y >= 0 ? y + 0.5f : y - 0.5f);
         }
+        g_st.samples++;   /* frames, so it is the denominator for clipped[] */
         if ((f % SANITIZE_PERIOD) == SANITIZE_PERIOD - 1)
             sanitize_state(s.n, channels);
     }
@@ -253,11 +282,14 @@ void eq_process_s32(int32_t *buf, int frames, int channels) {
             float x = (float)buf[idx] * (1.0f / 2147483648.0f) * s.preamp;
             for (int b = 0; b < s.n; b++)
                 if (s.on[b]) x = biquad(&s.c[b], &g_state[b][ch], x);
+            float ax = fabsf(x);
+            if (ax > g_st.peak[ch]) g_st.peak[ch] = ax;
             float y = x * 2147483648.0f;
-            if (y > 2147483520.0f) y = 2147483520.0f;
-            else if (y < -2147483648.0f) y = -2147483648.0f;
+            if (y > 2147483520.0f) { y = 2147483520.0f; g_st.clipped[ch]++; }
+            else if (y < -2147483648.0f) { y = -2147483648.0f; g_st.clipped[ch]++; }
             buf[idx] = (int32_t)y;
         }
+        g_st.samples++;   /* frames, so it is the denominator for clipped[] */
         if ((f % SANITIZE_PERIOD) == SANITIZE_PERIOD - 1)
             sanitize_state(s.n, channels);
     }

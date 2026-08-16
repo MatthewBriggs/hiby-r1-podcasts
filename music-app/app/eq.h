@@ -68,4 +68,42 @@ void eq_process_s32(int32_t *buf, int frames, int channels);
  * preamp and every band whose `on` is set, the same as eq_process_* respects. */
 void eq_response_db(const float *freq_hz, float *out_db, int n);
 
+/* Diagnostics for the sustained-tone report (BG32).
+ *
+ * Two failed fixes went in on reasoning alone -- a runaway-state reset that
+ * fired silently, so there was never any way to tell whether it had fired at
+ * all, and a threshold picked without checking what magnitude is already
+ * audible. The point of these counters is to make the next occurrence produce
+ * evidence instead of another hypothesis, and specifically to answer the one
+ * question that splits the search in half: is the signal leaving this filter
+ * already wrong, or is it clean and something downstream (bluealsa, the
+ * headset, the A2DP link) is mangling it?
+ *
+ * `clipped` and `peak` answer that. A sustained tone of our own making means
+ * `peak` pinned high and `clipped` counting a large fraction of `samples`;
+ * a clean output with the user still hearing a tone rules this file out
+ * entirely. `zmax` shows filter memory growing even while it stays under the
+ * reset threshold -- the case the previous fix was blind to.
+ *
+ * The audio thread accumulates; audio.c drains on its own periodic tick.
+ * Same thread does both, so there is no lock here and none needed. */
+/* Peak and clipping are per channel, not aggregated. The reported symptom has
+ * always been the left ear specifically, and both channels run identical
+ * coefficients -- so left/right asymmetry in our own output is the one
+ * measurement that separates "this filter is producing the tone" from "our
+ * output is clean and something downstream (SBC's joint stereo, the A2DP
+ * link, the headset) is". Aggregated figures cannot answer that at all. */
+typedef struct {
+    unsigned long samples;              /* frames processed since last drain */
+    unsigned long clipped[EQ_MAX_CH];   /* per channel, hit the output clamp */
+    unsigned long trips;                /* sanitize_state() resets */
+    float         peak[EQ_MAX_CH];      /* per channel, normalised, pre-clamp */
+    float         zmax;                 /* largest |z1|/|z2| across all bands */
+    int           trip_band;            /* band and channel of the most recent */
+    int           trip_ch;              /* trip, or -1 when nothing tripped */
+} eq_stats_t;
+
+/* Copy the accumulated counters out and reset them. */
+void eq_stats_drain(eq_stats_t *out);
+
 #endif

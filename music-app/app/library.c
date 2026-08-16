@@ -74,16 +74,44 @@ static int is_blank_mark(const char *v) {
     return v && v[0] == LIB_UNKNOWN_MARK[0] && v[1] == '\0';
 }
 
-/* Builds the WHERE-clause fragment (just the boolean expression, no leading
+/* BG45: the stock scanner indexes /Podcasts along with everything else, so
+ * every feed turned up in the Music section as an "album" -- 43 episodes
+ * across 5 feeds on the live database, sorted alphabetically, carrying no
+ * download state or resume markers, duplicating what the Podcasts section
+ * already shows properly.
+ *
+ * No ESCAPE clause: backslash is not special to SQLite's LIKE unless one is
+ * declared, so the separators are literal and only the trailing % is a
+ * wildcard. The prefix contains no _ either, which would otherwise match any
+ * single character. LIKE is ASCII-case-insensitive by default, so a drive
+ * letter or folder in another case still matches. This is the exact prefix
+ * the count in BG45 was confirmed against.
+ *
+ * Two spellings, because the trailing LIKE wildcard is also printf's
+ * conversion character and almost every query here is assembled with
+ * snprintf. Use _FMT when the text is pasted into a *format string*, and _SQL
+ * when it reaches SQLite as-is (a bare string literal, or an argument to a
+ * %s). Getting this backwards is not a silent style problem: as a format it
+ * eats the following character as a conversion and emits nonsense SQL, and as
+ * a literal it leaves a doubled %% that matches nothing. The compiler catches
+ * the first case with -Wformat; nothing catches the second. */
+#define PODCAST_EXCL_SQL "path not like 'a:\\Podcasts\\%'"
+#define PODCAST_EXCL_FMT "path not like 'a:\\Podcasts\\%%'"
+
+/* Builds the WHERE-clause body (just the boolean expression, no leading
  * "where ") for a facet filter, and reports whether a LIKE pattern still
  * needs binding. The blank-group sentinel can't be matched with LIKE 'x%'
  * like a real value -- the column is empty or NUL-led, not the text shown in
- * the UI -- so it gets its own fragment and binds nothing. */
+ * the UI -- so it gets its own fragment and binds nothing.
+ *
+ * Always emits at least the podcast exclusion, so there is no longer an
+ * "unfiltered" case that produces an empty string: every caller now writes an
+ * unconditional "where ". */
 static void filter_clause(const char *column, const char *value, int filtered,
                           char *frag, size_t fraglen, int *need_bind) {
     *need_bind = 0;
     frag[0] = '\0';
-    if (!filtered) return;
+    if (!filtered) { snprintf(frag, fraglen, "%s", PODCAST_EXCL_SQL); return; }
     if (is_blank_mark(value))
         /* The stored value is a single 0x00 byte, not a true empty string --
          * confirmed against the device's own database. SQLite's length() and
@@ -93,9 +121,10 @@ static void filter_clause(const char *column, const char *value, int filtered,
          * substr(column,1,1)=char(0) matches nothing. `= ''` is kept beside
          * it for a column that is a genuinely empty string with no byte at
          * all, which is a different, equally real case. */
-        snprintf(frag, fraglen, "(%s = '' or %s = char(0))", column, column);
+        snprintf(frag, fraglen, "(%s = '' or %s = char(0)) and " PODCAST_EXCL_FMT,
+                 column, column);
     else {
-        snprintf(frag, fraglen, "%s like ? escape '\\'", column);
+        snprintf(frag, fraglen, "%s like ? escape '\\' and " PODCAST_EXCL_FMT, column);
         *need_bind = 1;
     }
 }
@@ -116,6 +145,7 @@ int lib_group(const char *column, lib_row_t *out, int max, int offset) {
     char sql[256];
     snprintf(sql, sizeof(sql),
              "select %s, count(distinct album) from MEDIA_TABLE "
+             "where " PODCAST_EXCL_FMT " "
              "group by %s order by %s limit ? offset ?", column, column, column);
     sqlite3_stmt *st;
     if (sqlite3_prepare_v2(g_db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
@@ -138,8 +168,10 @@ int lib_group(const char *column, lib_row_t *out, int max, int offset) {
 
 int lib_group_count(const char *column) {
     if (!g_db || !allowed_column(column)) return 0;
-    char sql[128];
-    snprintf(sql, sizeof(sql), "select count(distinct %s) from MEDIA_TABLE", column);
+    char sql[192];
+    snprintf(sql, sizeof(sql),
+             "select count(distinct %s) from MEDIA_TABLE where " PODCAST_EXCL_FMT,
+             column);
     sqlite3_stmt *st;
     if (sqlite3_prepare_v2(g_db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
     int n = (sqlite3_step(st) == SQLITE_ROW) ? sqlite3_column_int(st, 0) : 0;
@@ -162,7 +194,7 @@ int lib_albums(const char *column, const char *value,
     snprintf(sql, sizeof(sql),
              "select album, count(*), max(album_artist) from MEDIA_TABLE %s%s "
              "group by album order by album limit ? offset ?",
-             filtered ? "where " : "", frag);
+             "where ", frag);
     sqlite3_stmt *st;
     if (sqlite3_prepare_v2(g_db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
     int a = 1;
@@ -194,7 +226,7 @@ int lib_albums_count(const char *column, const char *value) {
     char sql[256];
     snprintf(sql, sizeof(sql),
              "select count(distinct album) from MEDIA_TABLE %s%s",
-             filtered ? "where " : "", frag);
+             "where ", frag);
     sqlite3_stmt *st;
     if (sqlite3_prepare_v2(g_db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
     char pat[LIB_NAME_LEN + 2];
@@ -381,9 +413,10 @@ static int tracks_query(const char *artist, const char *album, int use_artist,
     const char *sql = use_artist
         ? "select name, path, format, bit, sample_rate, bit_rate, end_time, artist "
           "from MEDIA_TABLE where album like ? escape '\\' "
-          "and album_artist like ? escape '\\' limit ?"
+          "and album_artist like ? escape '\\' and " PODCAST_EXCL_SQL " limit ?"
         : "select name, path, format, bit, sample_rate, bit_rate, end_time, artist "
-          "from MEDIA_TABLE where album like ? escape '\\' limit ?";
+          "from MEDIA_TABLE where album like ? escape '\\' "
+          "and " PODCAST_EXCL_SQL " limit ?";
     sqlite3_stmt *st;
     if (sqlite3_prepare_v2(g_db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
     char pa[LIB_NAME_LEN + 2], pb[LIB_NAME_LEN + 2];
@@ -492,7 +525,8 @@ int lib_group_offset(const char *column, const char *key) {
     if (!g_db || !allowed_column(column)) return 0;
     char sql[256];
     snprintf(sql, sizeof(sql),
-             "select count(*) from (select distinct %s as v from MEDIA_TABLE) "
+             "select count(*) from (select distinct %s as v from MEDIA_TABLE "
+             "where " PODCAST_EXCL_FMT ") "
              "where v < ?", column);
     sqlite3_stmt *st;
     if (sqlite3_prepare_v2(g_db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
@@ -511,7 +545,7 @@ int lib_albums_offset(const char *column, const char *value, const char *key) {
     snprintf(sql, sizeof(sql),
              "select count(*) from (select distinct album as v from MEDIA_TABLE %s%s) "
              "where v < ?",
-             filtered ? "where " : "", frag);
+             "where ", frag);
     sqlite3_stmt *st;
     if (sqlite3_prepare_v2(g_db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
     int a = 1;
@@ -552,10 +586,11 @@ int lib_letter_offsets(const char *column, const char *value, int albums,
     if (albums)
         used += snprintf(sql + used, sizeof(sql) - (size_t)used,
                          " from (select distinct album as v from MEDIA_TABLE %s%s)",
-                         filtered ? "where " : "", frag);
+                         "where ", frag);
     else
         used += snprintf(sql + used, sizeof(sql) - (size_t)used,
-                         " from (select distinct %s as v from MEDIA_TABLE)", column);
+                         " from (select distinct %s as v from MEDIA_TABLE "
+                         "where " PODCAST_EXCL_FMT ")", column);
     if (used <= 0 || used >= (int)sizeof(sql)) return -1;
 
     sqlite3_stmt *st;
@@ -583,7 +618,13 @@ int lib_letter_offsets(const char *column, const char *value, int albums,
 
 /* The inverse of real_path: back to "a:\Artist\Album\file.flac" so the row
  * can be found. Doing it this way rather than storing the index's own paths in
- * the playlist keeps the .m3u readable by anything else. */
+ * the playlist keeps the .m3u readable by anything else.
+ *
+ * Deliberately carries no PODCAST_EXCL, unlike every browsing query above.
+ * This resolves one already-known path that something else decided to play --
+ * a playlist entry or a resume position -- rather than deciding what to offer.
+ * Filtering here would not tidy a listing, it would make an episode
+ * unresolvable and break resuming it. */
 int lib_track_by_path(const char *real, lib_track_t *out) {
     if (!g_db) return -1;
     const char *rel = real;
@@ -644,11 +685,12 @@ int lib_prefixes(const char *column, const char *value, int albums,
         snprintf(sql, sizeof(sql),
                  "select distinct substr(album,1,2) from MEDIA_TABLE %s%s "
                  "order by 1",
-                 filtered ? "where " : "", frag);
+                 "where ", frag);
     } else {
         if (!allowed_column(column)) return 0;
         snprintf(sql, sizeof(sql),
-                 "select distinct substr(%s,1,2) from MEDIA_TABLE order by 1",
+                 "select distinct substr(%s,1,2) from MEDIA_TABLE "
+                 "where " PODCAST_EXCL_FMT " order by 1",
                  column);
     }
     sqlite3_stmt *st;
