@@ -814,7 +814,13 @@ static int set_row_theme_y(void) { return set_autooff_desc_y() + 64; }
  * itself), and this row takes over closing the list instead. */
 static int set_row_about_y(void) { return set_row_theme_y() + ROW_H; }
 
-#define LIBRARY_VERSION "0.1"
+/* Bump this with every release -- it had been stuck at "0.1" since the very
+ * first one, through 0.14, because nothing ever reminded anyone to touch it.
+ * There is no build-time derivation from the git tag (this .so is built and
+ * pushed by hand, not by CI against a tagged commit), so this stays a
+ * literal that a human edits; the discipline is remembering to, not the
+ * mechanism. */
+#define LIBRARY_VERSION "0.15"
 
 static void about_kernel(char *out, size_t n) {
     struct utsname u;
