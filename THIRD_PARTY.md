@@ -19,6 +19,13 @@
 | `music-app/app/vendor/ogg/*` | [libogg](https://www.xiph.org/ogg/) (Xiph.Org) | BSD-style |
 | `music-app/app/vendor/opus/*.h` | [libopus](https://opus-codec.org/) (Xiph.Org / IETF) | BSD-style |
 | `music-app/app/vendor/vorbis/codec.h` | [libvorbis](https://xiph.org/vorbis/) (Xiph.Org) | BSD-style |
+| `music-app/tools/icons/*.svg` | [Font Awesome Free](https://fontawesome.com) by Fonticons, Inc. | CC BY 4.0 (icons) |
+
+The Font Awesome SVGs are source assets, not shipped as SVG: they are
+rasterized offline by `music-app/tools/icons/gen_icons.py` into 8-bit
+alpha-coverage bitmaps baked into `music-app/app/icons_data.h`, which *is*
+compiled into the app (the device has no SVG renderer). CC BY 4.0 requires
+attribution for a derivative work — this notice is it.
 
 The Opus and Vorbis vendoring is **headers only**, the same pattern as the
 libjpeg headers below: the R1's firmware provides the actual decode libraries

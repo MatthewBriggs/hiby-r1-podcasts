@@ -45,6 +45,16 @@ int lib_albums(const char *column, const char *value,
                lib_row_t *out, int max, int offset);
 int lib_albums_count(const char *column, const char *value);
 
+/* R30: two separate lists, not merged. "Added" is MEDIA_TABLE's own ctime,
+ * newest first, and always fills up to `max` (every track has one).
+ * "Heard" is supplied by the caller via a callback (library.c has no
+ * business knowing about recent.c's file format) and returns fewer than
+ * `max` -- even zero -- rather than padding with albums that have never
+ * actually been played. Both exclude Podcasts and Audiobooks. */
+int lib_albums_recent_added(lib_row_t *out, int max);
+int lib_albums_recent_heard(long long (*heard_ts)(const char *album),
+                            lib_row_t *out, int max);
+
 /* Find one track by the path this app hands out (a real filesystem path, not
  * the index's own volume notation). Returns 0 on success. */
 int lib_track_by_path(const char *real, lib_track_t *out);

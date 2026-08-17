@@ -130,6 +130,24 @@ static int dec_is_wide(const dec_t *d) {
 #define DEC_MAX_FRAMES 4096
 static short g_aacpcm[DEC_MAX_FRAMES * 8];
 
+/* Worst case for one *compressed* ALAC access unit, not the decoded PCM
+ * g_aacpcm above holds: 4096 samples * 2 ch * 16-bit, the size a frame can
+ * reach in ALAC's escape mode, where a loud or noisy passage compresses so
+ * poorly the encoder just stores it close to raw rather than losing time to
+ * a compression pass that will not pay for itself. 8192 (this file's
+ * previous size) is exactly half of that -- silently wrong, not obviously
+ * wrong: mp4_next() treats an access unit bigger than the caller's buffer as
+ * unreadable and skips it rather than erroring (see its own comment, "one
+ * unreadable access unit... should cost a click, not the rest of the
+ * chapter"), and once 64 in a row fail that way the file reads as finished.
+ * Reproduced live on a noisy 1969 Velvet Underground bootleg -- exactly the
+ * loud, compression-resistant material escape mode exists for -- where every
+ * track past the first ended after a few seconds instead of several minutes.
+ * Doubled with headroom, not tuned to the exact 16384-byte theoretical max,
+ * since the cost of being wrong here is a silently truncated track, not a
+ * cheap buffer a few KB larger than strictly necessary. */
+#define M4A_AU_MAX 32768
+
 /* Sniff the magic rather than trust the extension — a wrong decoder is a hang
  * rather than an error. */
 static dec_kind_t sniff(const char *path) {
@@ -338,7 +356,7 @@ static int dec_open_stream(dec_t *d, const char *url) {
  * only loops for AAC in practice but stays generic since both fill the same
  * shared buffer. */
 static int m4a_prime(dec_t *d) {
-    unsigned char au[8192];
+    unsigned char au[M4A_AU_MAX];
     for (int i = 0; i < 8; i++) {
         int len = mp4_next(&d->mp4, au, sizeof(au));
         if (len <= 0) return -1;
@@ -491,7 +509,7 @@ static uint64_t dec_read(dec_t *d, short *out, uint64_t want) {
         uint64_t done = 0;
         while (done < want) {
             if (d->aac_taken >= d->aac_frames) {
-                unsigned char au[8192];
+                unsigned char au[M4A_AU_MAX];
                 int len = mp4_next(&d->mp4, au, sizeof(au));
                 if (len <= 0) break;
                 int fr = d->alac
@@ -924,20 +942,6 @@ void audio_bt_volume_service(void) {
     if (!bt_mixer[0]) find_bt_mixer();
     if (!bt_mixer[0]) return;
 
-    /* BG39 diagnostics: no log trail existed for this path at all, unlike
-     * BG41 where the existing decode% log was what actually found the cause.
-     * "jumps the wrong way sometimes" is not reproducible by reading this
-     * code -- the accumulation logic and the key-to-delta mapping both look
-     * correct, and the comment above already names a real, external
-     * candidate (the headset's own buttons moving the same mixer with no
-     * event reaching this app), which no amount of static reading can rule
-     * in or out. Logging the pre-write intent, the resulting command and the
-     * post-write readback gives an actual trail to pull the next time this
-     * is reproduced, the same way BG41 got solved with real evidence rather
-     * than a guess. */
-    int pre_g_vol;
-    pthread_mutex_lock(&g_lock); pre_g_vol = g_vol; pthread_mutex_unlock(&g_lock);
-
     if (pending) {
         char cmd[224];
         if (is_delta)
@@ -946,20 +950,11 @@ void audio_bt_volume_service(void) {
         else
             snprintf(cmd, sizeof(cmd), "amixer -D bluealsa sset '%s' %d%% >/dev/null 2>&1",
                      bt_mixer, abs_val);
-        alog("[btvol] applying %s (pre g_vol=%d)\n", cmd, pre_g_vol);
-        if (system(cmd) == -1) {
-            alog("[btvol] system() failed\n");
-            return;
-        }
+        if (system(cmd) == -1) return;
     }
 
     int pct = bt_read_pct();
-    if (pct < 0) {
-        alog("[btvol] readback failed, mixer gone\n");
-        bt_mixer[0] = '\0'; return;   /* gone: re-look next time */
-    }
-    if (pct != pre_g_vol)
-        alog("[btvol] readback %d%% (was g_vol=%d, pending=%d)\n", pct, pre_g_vol, pending);
+    if (pct < 0) { bt_mixer[0] = '\0'; return; }   /* gone: re-look next time */
     pthread_mutex_lock(&g_lock);
     g_vol = pct;
     pthread_mutex_unlock(&g_lock);

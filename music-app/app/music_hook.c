@@ -41,11 +41,14 @@
 #include <linux/input.h>
 
 #include "text.h"
+#include "icons.h"
 #include "library.h"
 #include "audiobook.h"
 #include "audio.h"
 #include "eq.h"
 #include "eqprofile.h"
+#include "mseb.h"
+#include "recent.h"
 #include "cover.h"
 #include "art.h"
 #include "status.h"
@@ -556,7 +559,7 @@ static void fill_rect_clip(uint16_t *fb, int x, int y, int w, int h, uint16_t c,
 
 typedef enum { SC_MENU = 0, SC_MUSIC_MENU, SC_ARTISTS, SC_ALBUMS, SC_TRACKS, SC_PLAYING,
                SC_RADIO, SC_PLAYLISTS, SC_AUDIOBOOKS,
-               SC_EQ, SC_EQ_BANDS, SC_EQ_BAND,
+               SC_EQ, SC_EQ_BANDS, SC_EQ_BAND, SC_MSEB,
                SC_SETTINGS, SC_SETTINGS_THEME, SC_SETTINGS_ABOUT } screen_t;
 
 /* L2: the top-level menu ("Main Menu", EXIT on the right) stays small on
@@ -567,31 +570,49 @@ static const struct { const char *label; } top_menu[] = {
     { "Music" },
     { "Audiobooks" },
     { "Parametric EQ" },
+    { "MSEB" },
     { "Radio" },
     { "Settings" },
 };
 #define TOP_MUSIC      0
 #define TOP_AUDIOBOOKS 1
 #define TOP_EQ         2
-#define TOP_RADIO      3
-#define TOP_SETTINGS   4
+#define TOP_MSEB       3
+#define TOP_RADIO      4
+#define TOP_SETTINGS   5
 #define TOP_N ((int)(sizeof(top_menu) / sizeof(top_menu[0])))
 
 /* Reached via "Music" from the main menu (SC_MUSIC_MENU). Each entry is a
  * column to group by, except Albums which skips the grouping step and
  * lists the lot, and Playlists which is not a library query at all. */
 static const struct { const char *label; const char *column; } menu[] = {
-    { "Album artists", "album_artist" },
-    { "Albums",        NULL           },
-    { "Artists",       "artist"       },
-    { "Genres",        "genre"        },
-    { "Playlists",     NULL           },
+    { "Album artists",       "album_artist" },
+    { "Albums",              NULL           },
+    { "Recently added",      NULL           },
+    { "Recently heard",      NULL           },
+    { "Artists",             "artist"       },
+    { "Genres",              "genre"        },
+    { "Playlists",           NULL           },
 };
-#define MENU_PLAYLISTS 4
+#define MENU_RECENT_ADDED 2
+#define MENU_RECENT_HEARD 3
+#define MENU_PLAYLISTS    6
+#define RECENT_ALBUMS_N 10   /* R30: "the last 10 albums", not PAGE_MAX's 32 */
 #define MENU_N ((int)(sizeof(menu) / sizeof(menu[0])))
 
 static const char *cur_facet;      /* column being grouped by, NULL for Albums */
 static const char *cur_facet_label;
+/* 0 normal, 1 Recently added, 2 Recently heard -- set only by those two menu
+ * entries, cleared by every other facet pick. See load_page()/
+ * index_visible()/the SC_ALBUMS header title for what it changes. R30:
+ * SC_ALBUMS's screen and row-tap-to-tracks code are reused as-is for both
+ * rather than a new screen, since a recent-albums list is, structurally,
+ * just an album list with an unusual sort and no A-Z index -- everything
+ * rows[]/row_at()/play_from_list() already do for a normal album row
+ * applies unchanged. */
+static int         recent_mode;
+#define RECENT_ADDED 1
+#define RECENT_HEARD 2
 
 /* Held-track actions, drawn over whatever list is showing rather than as a
  * screen of their own: it is a decision about one row, and pushing a screen
@@ -604,8 +625,13 @@ static int live_x, live_y;          /* where the finger is now, while it is down
 /* Quick settings, pulled down from the status strip. Brightness, Wi-Fi and
  * Bluetooth are wanted often enough that leaving the app to reach them is the
  * annoyance; everything else stays in the firmware's own settings. */
-#define QS_H       418
+#define QS_H       490          /* was 418; +QS_ROW_H for the MSEB row */
 #define QS_ROW_H   72
+/* Row label column. Was a bare 68 until the Wi-Fi/Bluetooth/EQ row icons grew
+ * larger -- Wi-Fi's natural width at its new height puts its right edge
+ * exactly at 68, no gap at all, so the label column moved out to clear it.
+ * +10 past that on top, on request, for a bit more breathing room still. */
+#define QS_LABEL_X 86
 #define QS_PULL    40           /* how far down before it counts as a pull */
 /* BG16: the start zone used to be STATUS_H (32px), and logging real presses
  * showed every miss landing at down_y 33-67 against every hit at 25-31 --
@@ -711,6 +737,10 @@ static int eq_row_profile_y(void) { return eq_row_enabled_y() + ROW_H; }
 static int eq_preamp_y(void)      { return eq_row_profile_y() + ROW_H; }
 static int eq_curve_y(void)       { return eq_preamp_y() + 60; }
 static int eq_row_bands_y(void)   { return eq_curve_y() + 66; }
+
+#define MSEB_ROW_H 70
+static int mseb_row_enabled_y(void) { return CONTENT_Y; }
+static int mseb_band_row_y(int i) { return mseb_row_enabled_y() + ROW_H + i * MSEB_ROW_H; }
 
 /* How long the device may sit locked with nothing playing before it goes into
  * its low-power idle. Minutes, and 0 means never. Declared up here with the
@@ -1041,6 +1071,13 @@ static int         eq_editing_band;       /* index into eq_cur.band[] on SC_EQ_B
  * the value every tick in between. */
 static int         eq_dragging;
 
+static float       mseb_gain[MSEB_BAND_N];
+static int         mseb_on;
+/* -1 none, else the band index being dragged on SC_MSEB. Same live_x-driven
+ * pattern as eq_dragging, kept separate since MSEB has 9 independent
+ * sliders rather than eq_dragging's fixed handful of named ones. */
+static int         mseb_dragging = -1;
+
 static lib_track_t queue[PAGE_MAX * 8];
 static int  queue_n;
 static char q_artist[LIB_NAME_LEN];
@@ -1131,9 +1168,11 @@ static int vis_rows(void) {
     return h / ROW_H;
 }
 
-/* Only the two lists long enough to need it. */
+/* Only the two lists long enough to need it -- and not Recent, capped at
+ * PAGE_MAX items and sorted by recency rather than alphabetically, where a
+ * letter strip would have nothing meaningful to jump to. */
 static int index_visible(void) {
-    return screen == SC_ARTISTS || screen == SC_ALBUMS;
+    return (screen == SC_ARTISTS || screen == SC_ALBUMS) && !recent_mode;
 }
 
 static int index_bottom(void) { return FB_H - (mini_visible() ? MINI_H : 40); }
@@ -1463,6 +1502,13 @@ static void play_index(int i) {
     art_request(queue[i].path);
     queue_follower();
     was_active = 1;
+    /* R30's "recently heard" side. q_album is the queue's album, set by
+     * play_from_list() before this ever runs -- empty here means the queue
+     * came from somewhere that never set it (radio, before that guard was
+     * added, say), not a real album to record. Marked on every track start,
+     * not just the first: an album played track-by-track over an evening
+     * should read as heard "now", not at whatever moment side one began. */
+    if (q_album[0]) recent_heard_mark(q_album);
     mlog("[music] play %s\n", queue[i].path);
 }
 
@@ -1779,17 +1825,17 @@ static void draw_mini(uint16_t *fb) {
  * accent-coloured on charge, so the state reads without counting digits. A
  * filled rounded rect punched out by a slightly smaller one in the header
  * colour, the same trick as the pill sliders, rather than four traced edges. */
+/* Five discrete fill levels (icon_batt_0/25/50/75/100), not a continuous
+ * procedural fill -- the FA glyph reads far better at this pixel size than
+ * the hand-drawn rounded-rect ever did, and every call site already prints
+ * the exact percentage as text alongside the icon, so nothing is lost:
+ * the number still carries the precision, the icon now just looks right. */
 static void draw_battery(uint16_t *fb, int x, int y, int pct, int charging) {
-    const int w = 26, h = 13, r = 3;
+    const icon_t *ic = pct > 87 ? &icon_batt_100 : pct > 62 ? &icon_batt_75
+                      : pct > 37 ? &icon_batt_50  : pct > 12 ? &icon_batt_25
+                      : &icon_batt_0;
     uint16_t c = charging ? COL_ACCENT : (pct >= 0 && pct <= 15 ? RGB(230, 80, 70) : COL_DIM);
-    fill_round_rect(fb, x, y, w, h, r, c);
-    fill_round_rect(fb, x + 2, y + 2, w - 4, h - 4, r - 1, COL_HEADER);
-    fill_rect(fb, x + w, y + 4, 2, 5, c);
-    if (pct > 0) {
-        int fillw = (w - 4) * pct / 100;
-        if (fillw < 1) fillw = 1;
-        fill_round_rect(fb, x + 2, y + 2, fillw, h - 4, r - 1, c);
-    }
+    draw_icon(fb, FB_W, FB_H, x, y - 1, ic, c);
 }
 
 /* Three bars and a play triangle: the queue, in the place a hamburger would
@@ -1822,10 +1868,12 @@ static void draw_status(uint16_t *fb) {
     /* Volume and battery only. The headphone and Bluetooth icons both said
      * what the route already says at the foot of the player. */
 
-    /* "vol" as plain text -- placeholder until there's a real icon. */
-    draw_text(fb, 24, ty, "vol", COL_DIM, TEXT_PX_SMALL, 40);
-    snprintf(buf, sizeof(buf), "%d%%", audio_volume());
-    draw_text(fb, 24 + 36, ty, buf, COL_DIM, TEXT_PX_SMALL, FB_W - 24 - 36);
+    int vol = audio_volume();
+    const icon_t *vic = vol <= 0 ? &icon_vol_mute : vol < 34 ? &icon_vol_low
+                       : vol < 67 ? &icon_vol_mid  : &icon_vol_high;
+    draw_icon(fb, FB_W, FB_H, 24, mid - vic->h / 2, vic, COL_DIM);
+    snprintf(buf, sizeof(buf), "%d%%", vol);
+    draw_text(fb, 24 + 26, ty, buf, COL_DIM, TEXT_PX_SMALL, FB_W - 24 - 26);
 
     int pct = st_battery_pct();
     int bx = FB_W - 18 - 28;
@@ -1858,7 +1906,9 @@ static void draw_screen(uint16_t *fb) {
     const char *right = "EXIT";
     if (screen == SC_ARTISTS) { title = cur_facet_label; right = "BACK"; }
     else if (screen == SC_ALBUMS)  {
-        title = !cur_artist[0] ? "Albums"
+        title = recent_mode == RECENT_ADDED ? "Recently added"
+              : recent_mode == RECENT_HEARD ? "Recently heard"
+              : !cur_artist[0] ? "Albums"
               : cur_artist[0] == LIB_UNKNOWN_MARK[0] ? "Unknown" : cur_artist;
         right = "BACK";
     }
@@ -1871,6 +1921,7 @@ static void draw_screen(uint16_t *fb) {
     else if (screen == SC_AUDIOBOOKS) { title = "Audiobooks"; right = "BACK"; }
     else if (screen == SC_EQ)         { title = "Parametric EQ"; right = "BACK"; }
     else if (screen == SC_EQ_BANDS)   { title = "Bands"; right = "BACK"; }
+    else if (screen == SC_MSEB)       { title = "MSEB"; right = "BACK"; }
     else if (screen == SC_EQ_BAND) {
         static char band_title[16];   /* draw_screen's own `buf` isn't declared this early */
         snprintf(band_title, sizeof(band_title), "Band %d", eq_editing_band + 1);
@@ -1907,11 +1958,14 @@ static void draw_screen(uint16_t *fb) {
     if (screen == SC_MENU) {
         /* TEMP: log only when it actually changes from what was last seen,
          * so a long natural session leaves a trail showing exactly when
-         * (not just that) top_menu[4] stops being "Settings", instead of
-         * either a single boot-time snapshot or a flood on every redraw. */
+         * (not just that) the last entry stops being "Settings", instead of
+         * either a single boot-time snapshot or a flood on every redraw.
+         * TOP_N-1, not a hardcoded index: MSEB's insertion already moved
+         * this once, from 4 to 5, and a literal index silently starts
+         * watching the wrong slot every time the menu grows again. */
         static const void *dbg_last;
-        if (top_menu[4].label != dbg_last) {
-            dbg_last = top_menu[4].label;
+        if (top_menu[TOP_N - 1].label != dbg_last) {
+            dbg_last = top_menu[TOP_N - 1].label;
             for (int i = 0; i < TOP_N; i++)
                 mlog("[dbg] top_menu[%d] ptr=%p str=\"%s\"\n",
                      i, (void *)top_menu[i].label, top_menu[i].label);
@@ -2095,18 +2149,32 @@ static void draw_screen(uint16_t *fb) {
 
             draw_queue_icon(fb, FB_W - 24 - 26, FB_H - 32, COL_DIM);
             /* Same device-battery-in-the-route-line treatment as the regular
-             * player -- see the matching comment there. */
-            char routebuf[64];
-            const char *route = audio_output();
+             * player -- see the matching comment there, including that the
+             * icon replaces the connection-kind word rather than sitting
+             * beside it. */
+            const char *route_kind = audio_output();
             int devpct = st_battery_pct();
-            if (devpct >= 0)
-                snprintf(routebuf, sizeof(routebuf), "%s \xc2\xb7 %d%%", route, devpct);
+            const icon_t *ric = !strcmp(route_kind, "Bluetooth") ? &icon_bt_sm
+                               : !strcmp(route_kind, "USB")      ? &icon_usb_sm : NULL;
+            char routebuf[64];
+            if (ric && devpct >= 0)
+                snprintf(routebuf, sizeof(routebuf), "%d%%", devpct);
+            else if (ric)
+                routebuf[0] = '\0';
+            else if (devpct >= 0)
+                snprintf(routebuf, sizeof(routebuf), "%s \xc2\xb7 %d%%", route_kind, devpct);
             else
-                snprintf(routebuf, sizeof(routebuf), "%s", route);
-            route = routebuf;
+                snprintf(routebuf, sizeof(routebuf), "%s", route_kind);
+            const char *route = routebuf;
             int ow = text_width(route, TEXT_PX_SMALL);
+            int riw = ric ? ric->w + 6 : 0;
             int biw = (devpct >= 0) ? 34 : 0;   /* 8px gap + 26px icon, BG34 */
-            draw_text(fb, FB_W - 62 - biw - ow, FB_H - 34, route, COL_DIM, TEXT_PX_SMALL, FB_W);
+            int route_x = FB_W - 62 - biw - ow;
+            if (route[0])
+                draw_text(fb, route_x, FB_H - 34, route, COL_DIM, TEXT_PX_SMALL, FB_W);
+            if (ric)
+                draw_icon(fb, FB_W, FB_H, route_x - riw,
+                          FB_H - 34 + TEXT_PX_SMALL / 2 - ric->h / 2, ric, COL_DIM);
             if (devpct >= 0)
                 draw_battery(fb, FB_W - 62 - 26, FB_H - 34 + TEXT_PX_SMALL / 2 - 6,
                             devpct, st_charging());
@@ -2129,7 +2197,7 @@ static void draw_screen(uint16_t *fb) {
             if (kbps > 0) snprintf(buf, sizeof(buf), "%s  %d kbps", ext, kbps);
             else          snprintf(buf, sizeof(buf), "%s", ext);
             draw_text(fb, 24, FB_H - 34, buf, COL_ACCENT, TEXT_PX_SMALL,
-                      FB_W - 62 - ow - 36);
+                      FB_W - 62 - ow - riw - 36);
             return;
         }
         if (radio_mode) {
@@ -2236,19 +2304,36 @@ static void draw_screen(uint16_t *fb) {
         /* The Bluetooth codec and headset battery that used to live here moved
          * to the quick-settings Bluetooth row instead -- this line shows the
          * device's own battery now, in the same slot. */
-        char routebuf[64];
-        const char *route = audio_output();
+        const char *route_kind = audio_output();   /* "3.5 mm" / "USB" / "Bluetooth" */
         int devpct = st_battery_pct();
-        if (devpct >= 0)
-            snprintf(routebuf, sizeof(routebuf), "%s \xc2\xb7 %d%%", route, devpct);
+        /* The icon already says the connection kind -- printing the word next
+         * to it said the same thing twice. Where there's an icon, the text is
+         * just the battery percentage (or nothing); "3.5 mm" has no Font
+         * Awesome asset in this set, so that route keeps the plain word, as
+         * it always has. */
+        const icon_t *ric = !strcmp(route_kind, "Bluetooth") ? &icon_bt_sm
+                           : !strcmp(route_kind, "USB")      ? &icon_usb_sm : NULL;
+        char routebuf[64];
+        if (ric && devpct >= 0)
+            snprintf(routebuf, sizeof(routebuf), "%d%%", devpct);
+        else if (ric)
+            routebuf[0] = '\0';
+        else if (devpct >= 0)
+            snprintf(routebuf, sizeof(routebuf), "%s \xc2\xb7 %d%%", route_kind, devpct);
         else
-            snprintf(routebuf, sizeof(routebuf), "%s", route);
-        route = routebuf;
+            snprintf(routebuf, sizeof(routebuf), "%s", route_kind);
+        const char *route = routebuf;
         int ow = text_width(route, TEXT_PX_SMALL);
+        int riw = ric ? ric->w + 6 : 0;
         /* BG34: a glyph alongside the digits, same as the status bar's own
          * battery reading -- text then icon, right to left. */
         int biw = (devpct >= 0) ? 34 : 0;   /* 8px gap + 26px icon */
-        draw_text(fb, FB_W - 62 - biw - ow, FB_H - 34, route, COL_DIM, TEXT_PX_SMALL, FB_W);
+        int route_x = FB_W - 62 - biw - ow;
+        if (route[0])
+            draw_text(fb, route_x, FB_H - 34, route, COL_DIM, TEXT_PX_SMALL, FB_W);
+        if (ric)
+            draw_icon(fb, FB_W, FB_H, route_x - riw,
+                      FB_H - 34 + TEXT_PX_SMALL / 2 - ric->h / 2, ric, COL_DIM);
         if (devpct >= 0)
             draw_battery(fb, FB_W - 62 - 26, FB_H - 34 + TEXT_PX_SMALL / 2 - 6,
                         devpct, st_charging());
@@ -2256,7 +2341,7 @@ static void draw_screen(uint16_t *fb) {
                  track_format_name(t), t->bits, t->rate / 1000.0,
                  t->bitrate / 1000);
         draw_text(fb, 24, FB_H - 34, buf, COL_ACCENT, TEXT_PX_SMALL,
-                  FB_W - 62 - ow - 36);
+                  FB_W - 62 - ow - riw - 36);
         return;
     }
 
@@ -2366,6 +2451,46 @@ static void draw_screen(uint16_t *fb) {
         fill_rect(fb, 0, ry + ROW_H - 1, FB_W, 1, COL_LINE);
 
         if (mini_visible()) draw_mini(fb);
+        return;
+    }
+
+    if (screen == SC_MSEB) {
+        int ry = mseb_row_enabled_y();
+        draw_text(fb, 24, ry + 24, "Enabled", COL_TEXT, TEXT_PX_BODY, FB_W - 140);
+        draw_toggle_switch(fb, ry, mseb_on);
+        fill_rect(fb, 0, ry + ROW_H - 1, FB_W, 1, COL_LINE);
+
+        int span = FB_W - 48;
+        for (int i = 0; i < MSEB_BAND_N; i++) {
+            int by = mseb_band_row_y(i);
+            /* Same live-tracking trick as the preamp slider on SC_EQ: while
+             * this band is being dragged, show where the finger actually is
+             * rather than the last committed value. */
+            float g = mseb_gain[i];
+            if (mseb_dragging == i) {
+                int px = live_x - 24; if (px < 0) px = 0; if (px > span) px = span;
+                g = -12.0f + 24.0f * (float)px / (float)span;
+            }
+            uint16_t c = mseb_on ? COL_TEXT : COL_DIM;
+            draw_text(fb, 24, by + 2, EQ_MSEB_BANDS[i].name, c, TEXT_PX_SMALL, span - 100);
+            snprintf(buf, sizeof(buf), "%+.1f dB", g);
+            draw_right(fb, by + 2, buf);
+            draw_text(fb, 24, by + 22, EQ_MSEB_BANDS[i].freq_label, COL_DIM, TEXT_PX_SMALL, span);
+
+            int sy = by + 46;
+            fill_pill(fb, 24, sy, span, 6, COL_LINE);
+            fill_rect(fb, 24 + span / 2, sy - 4, 1, 14, COL_DIM);
+            float t = (g + 12.0f) / 24.0f;
+            if (t < 0) t = 0; if (t > 1) t = 1;
+            int px = (int)(span * t), cx = span / 2;
+            uint16_t fillc = mseb_on ? COL_ACCENT : COL_DIM;
+            if (px > cx)      fill_pill(fb, 24 + cx, sy, px - cx, 6, fillc);
+            else if (px < cx) fill_pill(fb, 24 + px, sy, cx - px, 6, fillc);
+            fill_circle(fb, 24 + px, sy + 3, 11, fillc);
+
+            if (i < MSEB_BAND_N - 1)
+                fill_rect(fb, 0, by + MSEB_ROW_H - 1, FB_W, 1, COL_LINE);
+        }
         return;
     }
 
@@ -2738,6 +2863,7 @@ static int go_back(void) {
         case SC_RADIO:
         case SC_AUDIOBOOKS:
         case SC_EQ:
+        case SC_MSEB:
         case SC_SETTINGS:
         case SC_MUSIC_MENU:
             screen = SC_MENU; reset_scroll();
@@ -2795,6 +2921,18 @@ static int go_back(void) {
                 ab_book_n = ab_scan_books(ab_books, AB_MAX_BOOKS);
                 ab_rebuild_rows();
                 total = ab_book_n;
+            } else if (recent_mode) {
+                /* Recently added/heard: load_page() is a no-op here --
+                 * index_visible() is deliberately false for recent_mode, so
+                 * the facet-query path below would leave rows[]/row_n stale
+                 * against a freshly wrong `total`, rendering blank. Same
+                 * one-shot recompute the menu tap itself used to get here. */
+                screen = SC_ALBUMS; reset_scroll();
+                row_n = (recent_mode == RECENT_ADDED)
+                      ? lib_albums_recent_added(rows, RECENT_ALBUMS_N)
+                      : lib_albums_recent_heard(recent_heard_ts, rows, RECENT_ALBUMS_N);
+                row_base = 0;
+                total = row_n;
             } else {
                 /* BG7: tapping an album row overwrites cur_artist with that
                  * one album's own artist (needed so two artists sharing an
@@ -2916,26 +3054,14 @@ static int qs_bar_y(void)  { return STATUS_H + 74; }
 static int qs_wifi_y(void) { return STATUS_H + 130; }
 static int qs_bt_y(void)   { return qs_wifi_y() + QS_ROW_H; }
 static int qs_eq_y(void)   { return qs_bt_y() + QS_ROW_H; }
+static int qs_mseb_y(void) { return qs_eq_y() + QS_ROW_H; }
 
-/* The classic rune, drawn from its two crossed strokes. */
 static void draw_bt_icon(uint16_t *fb, int x, int y, uint16_t c) {
-    int cx = x + 8, top = y, bot = y + 22, mid = y + 11;
-    draw_line(fb, cx, top, cx, bot, c);
-    draw_line(fb, cx, top, cx + 8, mid - 5, c);
-    draw_line(fb, cx + 8, mid - 5, cx - 5, mid + 5, c);
-    draw_line(fb, cx, bot, cx + 8, mid + 5, c);
-    draw_line(fb, cx + 8, mid + 5, cx - 5, mid - 5, c);
+    draw_icon(fb, FB_W, FB_H, x, y, &icon_bt_qs, c);
 }
 
-/* Three arcs and a dot. */
 static void draw_wifi_icon(uint16_t *fb, int x, int y, uint16_t c) {
-    int cx = x + 11, cy = y + 20;
-    for (int r = 7; r <= 19; r += 6)
-        for (int dx = -r; dx <= r; dx++) {
-            int dy = (int)(sqrt((double)(r * r - dx * dx)) + 0.5);
-            if (dy > r / 2) fill_rect(fb, cx + dx, cy - dy, 2, 3, c);
-        }
-    fill_circle(fb, cx, cy - 1, 3, c);
+    draw_icon(fb, FB_W, FB_H, x, y, &icon_wifi_qs, c);
 }
 
 /* A small frequency-response squiggle with a control point at each vertex --
@@ -2943,12 +3069,15 @@ static void draw_wifi_icon(uint16_t *fb, int x, int y, uint16_t c) {
  * read as "generic audio/volume"; this reads as what the feature actually
  * is, a curve you shape at a few points. */
 static void draw_eq_icon(uint16_t *fb, int x, int y, uint16_t c) {
-    int px[5] = { 0, 6, 12, 18, 24 };
-    int py[5] = { 14, 17, 6, 11, 1 };
+    /* 1.45x the original points/radius, to sit at the same visual weight as
+     * the enlarged Wi-Fi/Bluetooth bitmaps in the same list -- see the Quick
+     * Settings row comments for why they all changed together. */
+    int px[5] = { 0, 9, 17, 26, 35 };
+    int py[5] = { 20, 25, 9, 16, 1 };
     for (int i = 0; i < 4; i++)
         draw_line(fb, x + px[i], y + py[i], x + px[i + 1], y + py[i + 1], c);
     for (int i = 0; i < 5; i++)
-        fill_circle(fb, x + px[i], y + py[i], 2, c);
+        fill_circle(fb, x + px[i], y + py[i], 3, c);
 }
 
 static void draw_quick_settings(uint16_t *fb) {
@@ -2967,16 +3096,35 @@ static void draw_quick_settings(uint16_t *fb) {
      * what stock shows. Coloured when on, so state reads without the toggle. */
     char nm[64];
     int wy = qs_wifi_y();
-    draw_wifi_icon(fb, 24, wy + 10, qs_wifi ? COL_ACCENT : COL_DIM);
-    draw_text(fb, 68, wy + 6, "Wi-Fi", qs_wifi ? COL_TEXT : COL_DIM, TEXT_PX_SMALL, 200);
+    /* +16, not +12: a bounding-box center undersells this icon's shape.
+     * Almost all of its ink is the arcs in the top two-thirds -- the dot is
+     * a handful of pixels -- so a box-centered placement put the visible
+     * mass level with "Wi-Fi" and left it reading as floating above "off"
+     * rather than spanning to it, even though the box itself matched the
+     * text block exactly. Placed by alpha-weighted centroid instead (row
+     * 11.7 of 34 in the bitmap), matched to Bluetooth's own weighted
+     * centroid (row 18 of 38 at its +10 offset -> 28 from the row top). */
+    draw_wifi_icon(fb, 24, wy + 16, qs_wifi ? COL_ACCENT : COL_DIM);
+    /* QS_LABEL_X, not the old 68: at its new, larger size the Wi-Fi icon's
+     * natural width (its source aspect ratio times the target height) puts
+     * its right edge exactly at 68 -- zero gap, reading as crowding into the
+     * "W". 76 clears it with room to spare. */
+    draw_text(fb, QS_LABEL_X, wy + 6, "Wi-Fi", qs_wifi ? COL_TEXT : COL_DIM, TEXT_PX_SMALL, 200);
     st_wifi_ssid(nm, sizeof(nm));
-    draw_text(fb, 68, wy + 32, qs_wifi ? (nm[0] ? nm : "not connected") : "off",
+    draw_text(fb, QS_LABEL_X, wy + 32, qs_wifi ? (nm[0] ? nm : "not connected") : "off",
               COL_DIM, TEXT_PX_SMALL, FB_W - 180);
     draw_toggle_switch(fb, wy, qs_wifi);
 
     int by2 = qs_bt_y();
-    draw_bt_icon(fb, 26, by2 + 10, qs_bt ? COL_ACCENT : COL_DIM);
-    draw_text(fb, 68, by2 + 6, "Bluetooth", qs_bt ? COL_TEXT : COL_DIM, TEXT_PX_SMALL, 200);
+    /* Block-centered vertically, same as Wi-Fi above. x=34, not the icon
+     * column's usual 24-26: measured on a real screenshot, this icon's own
+     * alpha-weighted horizontal centroid landed at x=38 against Wi-Fi's 46 --
+     * a real, visible 8px gap between the two icons' center lines, not
+     * merely a left-edge difference. Left-aligning icons of different
+     * natural widths does not make them share a center; +8 here matches
+     * this one's centroid to Wi-Fi's rather than its left edge. */
+    draw_bt_icon(fb, 34, by2 + 10, qs_bt ? COL_ACCENT : COL_DIM);
+    draw_text(fb, QS_LABEL_X, by2 + 6, "Bluetooth", qs_bt ? COL_TEXT : COL_DIM, TEXT_PX_SMALL, 200);
     st_bt_name(nm, sizeof(nm));
     if (qs_bt && nm[0]) {
         /* The codec and the headset's own battery used to sit on the Now
@@ -2990,30 +3138,44 @@ static void draw_quick_settings(uint16_t *fb) {
         char base[80];
         if (codec[0]) snprintf(base, sizeof(base), "%s \xc2\xb7 %s", nm, codec);
         else          snprintf(base, sizeof(base), "%s", nm);
-        draw_text(fb, 68, by2 + 32, base, COL_DIM, TEXT_PX_SMALL, FB_W - 180);
+        draw_text(fb, QS_LABEL_X, by2 + 32, base, COL_DIM, TEXT_PX_SMALL, FB_W - 180);
         if (batt >= 0) {
-            int tx = 68 + text_width(base, TEXT_PX_SMALL);
+            int tx = QS_LABEL_X + text_width(base, TEXT_PX_SMALL);
             draw_text(fb, tx, by2 + 32, " \xc2\xb7 ", COL_DIM, TEXT_PX_SMALL, FB_W - 180);
             tx += text_width(" \xc2\xb7 ", TEXT_PX_SMALL);
             draw_battery(fb, tx, by2 + 37, batt, 0);
             tx += 30;
             char pct[8];
             snprintf(pct, sizeof(pct), "%d%%", batt);
-            draw_text(fb, tx, by2 + 32, pct, COL_DIM, TEXT_PX_SMALL, FB_W - 180 - (tx - 68));
+            draw_text(fb, tx, by2 + 32, pct, COL_DIM, TEXT_PX_SMALL, FB_W - 180 - (tx - QS_LABEL_X));
         }
     } else {
-        draw_text(fb, 68, by2 + 32, qs_bt ? "not connected" : "off",
+        draw_text(fb, QS_LABEL_X, by2 + 32, qs_bt ? "not connected" : "off",
                   COL_DIM, TEXT_PX_SMALL, FB_W - 180);
     }
     draw_toggle_switch(fb, by2, qs_bt);
 
     int by3 = qs_eq_y();
     int on = eq_enabled();
-    draw_eq_icon(fb, 24, by3 + 6, on ? COL_ACCENT : COL_DIM);
-    draw_text(fb, 68, by3 + 6, "Parametric EQ", on ? COL_TEXT : COL_DIM, TEXT_PX_SMALL, 200);
-    draw_text(fb, 68, by3 + 32, eq_cur_path[0] ? eq_cur.name : "no profile",
+    /* Block-centered vertically, same as Wi-Fi/Bluetooth above (y was +6
+     * when the icon was smaller and merely aligned to the title line). x=29
+     * for the same centroid-matching reason as Bluetooth's +34 above --
+     * measured centroid 42 against Wi-Fi's 46, so +5. */
+    draw_eq_icon(fb, 29, by3 + 16, on ? COL_ACCENT : COL_DIM);
+    draw_text(fb, QS_LABEL_X, by3 + 6, "Parametric EQ", on ? COL_TEXT : COL_DIM, TEXT_PX_SMALL, 200);
+    draw_text(fb, QS_LABEL_X, by3 + 32, eq_cur_path[0] ? eq_cur.name : "no profile",
               COL_DIM, TEXT_PX_SMALL, FB_W - 180);
     draw_toggle_switch(fb, by3, on);
+
+    /* Same shape as the Parametric EQ row above -- a quick toggle, not a way
+     * in to editing the 9 bands (that stays under Parametric EQ in the main
+     * menu). Reuses the same squiggle icon: MSEB is still, visually, "an
+     * EQ" -- a distinct glyph for it would say otherwise. */
+    int by4 = qs_mseb_y();
+    draw_eq_icon(fb, 29, by4 + 16, mseb_on ? COL_ACCENT : COL_DIM);
+    draw_text(fb, QS_LABEL_X, by4 + 6, "MSEB", mseb_on ? COL_TEXT : COL_DIM, TEXT_PX_SMALL, 200);
+    draw_text(fb, QS_LABEL_X, by4 + 32, "HiBy tuning bands", COL_DIM, TEXT_PX_SMALL, FB_W - 180);
+    draw_toggle_switch(fb, by4, mseb_on);
 
     /* A grab handle, so it is obvious the panel goes back up. */
     fill_rect(fb, FB_W / 2 - 26, QS_H - 14, 52, 4, COL_LINE);
@@ -3239,6 +3401,12 @@ static void load_conf(void) {
      * path this app already tolerates. */
     if (eq_path_buf[0]) eq_switch_to(eq_path_buf);
     if (eq_on_saved >= 0) eq_set_enabled(eq_on_saved);
+    /* MSEB has its own file (MSEB_PATH), not a music.conf key -- there is
+     * nothing profile-like about it to switch between, just one fixed set of
+     * gains, so it does not need the eq_profile_path indirection above. */
+    mseb_load(mseb_gain, &mseb_on);
+    eq_set_mseb(mseb_on, mseb_gain);
+    recent_heard_load();   /* R30 -- its own file, not a music.conf key either */
 }
 
 /* Does this line set `key`? Length taken from the key itself rather than
@@ -3730,8 +3898,15 @@ static void scan_inputs(void) {
     fclose(f);
 }
 
-/* ---- app ----------------------------------------------------------------- */
-static int music_entry(void *a0, void *a1) {
+/* ---- app -------------------------------------------------------------
+ * Not `static`: the RP1-follow-on standalone build (standalone_main.c)
+ * calls this directly from its own main(), bypassing the tile-hijack
+ * trampoline entirely -- there is no launcher to hijack a tile from when
+ * this binary is not running inside hiby_player. is_hiby_player()'s own
+ * existing guard in music_init() already makes the constructor a safe
+ * no-op under a different process name, so nothing else here needed to
+ * change for that build to coexist with the normal LD_PRELOAD one. */
+int music_entry(void *a0, void *a1) {
     (void)a0; (void)a1;
     mlog("[music] entering app\n");
     load_conf();
@@ -3940,6 +4115,13 @@ static int music_entry(void *a0, void *a1) {
                         eq_profile_n = ep_scan(eq_profiles, EP_MAX_PROFILES);
                         sheet_open = 3;
                     }
+                } else if (y > qs_mseb_y() && y < qs_mseb_y() + QS_ROW_H) {
+                    /* No sheet to open for this one -- there's nothing to
+                     * pick, just the one fixed set of bands -- so the whole
+                     * row toggles, not just the switch end of it. */
+                    mseb_on = !mseb_on;
+                    eq_set_mseb(mseb_on, mseb_gain);
+                    mseb_save(mseb_gain, mseb_on);
                 } else if (y > QS_H) {
                     qs_open = 0;                    /* tapped away */
                 }
@@ -4128,6 +4310,24 @@ static int music_entry(void *a0, void *a1) {
                         eq_save_current();
                     }
                 }
+            } else if (screen == SC_MSEB) {
+                int ry_enabled = mseb_row_enabled_y();
+                if (y >= ry_enabled && y < ry_enabled + ROW_H) {
+                    mseb_on = !mseb_on;
+                    eq_set_mseb(mseb_on, mseb_gain);
+                    mseb_save(mseb_gain, mseb_on);
+                } else {
+                    int span = FB_W - 48;
+                    for (int i = 0; i < MSEB_BAND_N; i++) {
+                        int sy = mseb_band_row_y(i) + 46;
+                        if (y <= sy - 20 || y >= sy + 20) continue;
+                        int px = x - 24; if (px < 0) px = 0; if (px > span) px = span;
+                        mseb_gain[i] = -12.0f + 24.0f * (float)px / (float)span;
+                        eq_set_mseb(mseb_on, mseb_gain);
+                        mseb_save(mseb_gain, mseb_on);
+                        break;
+                    }
+                }
             } else if (screen == SC_EQ_BAND) {
                 eq_band_t *b = (eq_editing_band >= 0 && eq_editing_band < eq_cur.band_n)
                              ? &eq_cur.band[eq_editing_band] : NULL;
@@ -4214,6 +4414,8 @@ static int music_entry(void *a0, void *a1) {
                         }
                         screen = SC_EQ; reset_scroll();
                         mlog("[music] %d EQ profiles\n", eq_profile_n);
+                    } else if (idx == TOP_MSEB) {
+                        screen = SC_MSEB; reset_scroll();
                     } else if (idx == TOP_RADIO) {
                         station_n = radio_load(stations, RADIO_MAX);
                         screen = SC_RADIO; reset_scroll();
@@ -4224,10 +4426,31 @@ static int music_entry(void *a0, void *a1) {
                 } else if (screen == SC_MUSIC_MENU) {
                     if (idx >= MENU_N) { /* nothing there */ }
                     else if (idx == MENU_PLAYLISTS) {
+                        recent_mode = 0;
                         playlist_n = pl_list(playlists, PL_MAX);
                         screen = SC_PLAYLISTS; reset_scroll();
                         mlog("[music] %d playlists\n", playlist_n);
+                    } else if (idx == MENU_RECENT_ADDED || idx == MENU_RECENT_HEARD) {
+                        /* Not lib_albums()/load_page() -- this list is a
+                         * one-shot recency ranking, not something a facet or
+                         * an A-Z offset can page through, so it is computed
+                         * once here and handed to the same rows[]/row_at()
+                         * the normal album list already uses to draw and to
+                         * turn a tap into SC_TRACKS. */
+                        recent_mode = (idx == MENU_RECENT_ADDED) ? RECENT_ADDED : RECENT_HEARD;
+                        cur_facet = NULL;
+                        cur_facet_label = menu[idx].label;
+                        cur_artist[0] = '\0';
+                        albums_artist[0] = '\0';
+                        screen = SC_ALBUMS; reset_scroll();
+                        row_n = (recent_mode == RECENT_ADDED)
+                              ? lib_albums_recent_added(rows, RECENT_ALBUMS_N)
+                              : lib_albums_recent_heard(recent_heard_ts, rows, RECENT_ALBUMS_N);
+                        row_base = 0;
+                        total = row_n;
+                        mlog("[music] %s: %d\n", cur_facet_label, total);
                     } else if (menu[idx].column) {
+                        recent_mode = 0;
                         cur_facet = menu[idx].column;
                         cur_facet_label = menu[idx].label;
                         screen = SC_ARTISTS; reset_scroll();
@@ -4237,6 +4460,7 @@ static int music_entry(void *a0, void *a1) {
                     } else {
                         /* Albums lists the whole library, with no facet above
                          * it to go back to. */
+                        recent_mode = 0;
                         cur_facet = NULL;
                         cur_facet_label = menu[idx].label;
                         cur_artist[0] = '\0';
@@ -4656,6 +4880,18 @@ static int music_entry(void *a0, void *a1) {
                 }
             }
             if (eq_dragging || was) { dirty = 1; idle = 0; }
+        }
+
+        {
+            int was = mseb_dragging;
+            mseb_dragging = -1;
+            if (touch_down && screen == SC_MSEB) {
+                for (int i = 0; i < MSEB_BAND_N; i++) {
+                    int sy = mseb_band_row_y(i) + 46;
+                    if (touch_y > sy - 20 && touch_y < sy + 20) { mseb_dragging = i; break; }
+                }
+            }
+            if (mseb_dragging >= 0 || was >= 0) { dirty = 1; idle = 0; }
         }
 
         /* Press-and-hold on a track: fires under the finger, once. */

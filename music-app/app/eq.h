@@ -40,6 +40,35 @@ int  eq_enabled(void);
 void eq_set_profile(const eq_profile_t *p);
 void eq_get_profile(eq_profile_t *out);
 
+/* MSEB: HiBy's named tuning bands (see the Rockbox forum thread this was
+ * transcribed from -- 9 fixed-frequency, fixed-Q parametric bands, each
+ * describing what it does rather than its Hz, with only gain left free).
+ * Unlike the profile above, Fc/type/Q are not user data -- they are this
+ * fixed table, the actual specification, not tunable. */
+#define MSEB_BAND_N 9
+
+typedef struct {
+    const char *name;         /* "Bass extension" */
+    const char *freq_label;   /* "70 Hz shelf", for the UI subtitle */
+    eq_type_t   type;
+    float       fc;
+    float       q;
+} mseb_band_def_t;
+
+extern const mseb_band_def_t EQ_MSEB_BANDS[MSEB_BAND_N];
+
+/* MSEB and the profile can both be active. Rather than run both in full --
+ * which would need EQ_MAX_BANDS raised from 10 to as many as 19 and roughly
+ * double the cascade's measured CPU cost (8.5%->17% at 44.1kHz, 18.4%->37%
+ * at 96kHz, this file's own header) -- the total stays capped at
+ * EQ_MAX_BANDS. When MSEB is on, its 9 bands take the first slots and the
+ * profile is truncated to whatever is left (one band, today): MSEB wins the
+ * budget, chosen deliberately over doubling a cost this file has already
+ * measured once, on the same code path involved in BG32. */
+void eq_set_mseb(int enabled, const float gain_db[MSEB_BAND_N]);
+void eq_get_mseb(int *enabled, float gain_db[MSEB_BAND_N]);
+int  eq_mseb_enabled(void);
+
 /* Live edit of one band or the preamp, e.g. while a slider is being dragged.
  * Recomputes only that band's coefficients; does not reset filter memory, so
  * (like every real-time parametric EQ) a large jump mid-playback can click --

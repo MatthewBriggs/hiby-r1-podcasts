@@ -12,3 +12,6 @@ podcast-app/icon/compare.png
 
 # Build artifacts
 *.so
+
+# Device-local, contains API keys
+settings.txt

@@ -98,6 +98,15 @@ static int is_blank_mark(const char *v) {
 #define PODCAST_EXCL_SQL "path not like 'a:\\Podcasts\\%'"
 #define PODCAST_EXCL_FMT "path not like 'a:\\Podcasts\\%%'"
 
+/* Same story, same fix, for /Audiobooks -- confirmed 18 rows across 3 books
+ * on the live database, indexed by the stock scanner exactly like Podcasts
+ * was in BG45. Scoped to the lib_albums_recent_*() pair below for now, since that is
+ * what surfaced it (R30); the general Music-browsing queries above have the
+ * identical gap and are not touched here -- worth its own BG entry, not
+ * folded silently into an unrelated feature's diff. */
+#define AUDIOBOOK_EXCL_SQL "path not like 'a:\\Audiobooks\\%'"
+#define AUDIOBOOK_EXCL_FMT "path not like 'a:\\Audiobooks\\%%'"
+
 /* Builds the WHERE-clause body (just the boolean expression, no leading
  * "where ") for a facet filter, and reports whether a LIKE pattern still
  * needs binding. The blank-group sentinel can't be matched with LIKE 'x%'
@@ -237,6 +246,95 @@ int lib_albums_count(const char *column, const char *value) {
     int n = (sqlite3_step(st) == SQLITE_ROW) ? sqlite3_column_int(st, 0) : 0;
     sqlite3_finalize(st);
     return n;
+}
+
+/* R30. Every album's own add-time in one pass -- ctime is per-track; an
+ * album's is the newest track it has, same reasoning as lib_albums() using
+ * max(album_artist): a compilation added to piecemeal should count as
+ * "added" when its most recent track arrived, not its oldest.
+ * ALBUMS_RECENT_SCAN caps how many distinct albums this reads before
+ * ranking -- generous past the ~300 in the library this was built against
+ * (audiobook.h's AB_MAX_BOOKS is 256, the closest precedent in this codebase
+ * for "how big a library gets"), not a hard assumption it stays that size.
+ * Kept well short of a size that would matter for this device's memory
+ * budget: each entry is under 400 bytes, so this is under 200KB static.
+ *
+ * Excludes both Podcasts (BG45) and Audiobooks: both are indexed by the
+ * stock scanner into this same table alongside real music, and neither
+ * belongs in a Music-menu list -- Podcasts because it duplicates that
+ * section's own proper listing, Audiobooks because it has no download
+ * state, no resume marker, and no chapter structure once flattened into an
+ * ordinary "album" row here, the exact complaint BG45 made about Podcasts,
+ * confirmed the same way: 18 rows across 3 books on the live database. */
+#define ALBUMS_RECENT_SCAN 512
+typedef struct { char album[LIB_NAME_LEN]; char artist[LIB_NAME_LEN];
+                 int count; long long added; } recent_scan_row_t;
+
+static int recent_scan(recent_scan_row_t *scan, int max_scan) {
+    if (!g_db) return 0;
+    int n = 0;
+    const char *sql =
+        "select album, max(album_artist), count(*), max(ctime) from MEDIA_TABLE "
+        "where " PODCAST_EXCL_SQL " and " AUDIOBOOK_EXCL_SQL " group by album";
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(g_db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
+    while (n < max_scan && sqlite3_step(st) == SQLITE_ROW) {
+        copy_text(scan[n].album, sizeof(scan[n].album), sqlite3_column_text(st, 0));
+        if (is_blank(scan[n].album))
+            snprintf(scan[n].album, sizeof(scan[n].album), "Unknown album");
+        copy_text(scan[n].artist, sizeof(scan[n].artist), sqlite3_column_text(st, 1));
+        scan[n].count = sqlite3_column_int(st, 2);
+        scan[n].added = sqlite3_column_int64(st, 3);
+        n++;
+    }
+    sqlite3_finalize(st);
+    return n;
+}
+
+/* Partial selection sort by whatever `key[i]` holds: only the top `max` are
+ * ever read, and max is a top-10 list here, so there is no reason to fully
+ * sort a few hundred rows to get them. Rows with key <= 0 are excluded
+ * entirely rather than sorted to the bottom -- the caller passing heard
+ * timestamps relies on this so an unheard album never appears in "recently
+ * heard" just to pad out a short list; keys from ctime never hit this,
+ * since every row has a real add time. */
+static int recent_take(recent_scan_row_t *scan, long long *key, int n,
+                       lib_row_t *out, int max) {
+    int take = 0;
+    for (int i = 0; i < n && take < max; i++) {
+        int best = -1;
+        for (int j = i; j < n; j++)
+            if (key[j] > 0 && (best < 0 || key[j] > key[best])) best = j;
+        if (best < 0) break;   /* nothing left with a real timestamp */
+        if (best != i) {
+            recent_scan_row_t ts = scan[i]; scan[i] = scan[best]; scan[best] = ts;
+            long long tk = key[i]; key[i] = key[best]; key[best] = tk;
+        }
+        snprintf(out[take].name, sizeof(out[take].name), "%s", scan[i].album);
+        snprintf(out[take].owner, sizeof(out[take].owner), "%s", scan[i].artist);
+        out[take].count = scan[i].count;
+        take++;
+    }
+    return take;
+}
+
+int lib_albums_recent_added(lib_row_t *out, int max) {
+    if (max <= 0) return 0;
+    static recent_scan_row_t scan[ALBUMS_RECENT_SCAN];
+    static long long key[ALBUMS_RECENT_SCAN];
+    int n = recent_scan(scan, ALBUMS_RECENT_SCAN);
+    for (int i = 0; i < n; i++) key[i] = scan[i].added;
+    return recent_take(scan, key, n, out, max);
+}
+
+int lib_albums_recent_heard(long long (*heard_ts)(const char *album),
+                            lib_row_t *out, int max) {
+    if (!heard_ts || max <= 0) return 0;
+    static recent_scan_row_t scan[ALBUMS_RECENT_SCAN];
+    static long long key[ALBUMS_RECENT_SCAN];
+    int n = recent_scan(scan, ALBUMS_RECENT_SCAN);
+    for (int i = 0; i < n; i++) key[i] = heard_ts(scan[i].album);
+    return recent_take(scan, key, n, out, max);
 }
 
 /* The index stores paths as the player's own volume notation — every row is

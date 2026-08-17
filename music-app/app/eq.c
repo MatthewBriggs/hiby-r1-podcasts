@@ -17,14 +17,40 @@
 typedef struct { float b0, b1, b2, a1, a2; } coeffs_t;
 typedef struct { float z1, z2; } state_t;
 
+/* The actual MSEB specification, transcribed from the Rockbox forum thread
+ * (HiBy R1 topic, post #49, updated with the engineer's own figures). Fc and
+ * Q are fixed by that spec, not editable -- only gain_db varies, driven by
+ * eq_set_mseb() below. */
+const mseb_band_def_t EQ_MSEB_BANDS[MSEB_BAND_N] = {
+    { "Bass extension",    "70 Hz shelf",   EQ_LOW_SHELF,   70.0f, 0.7071f },
+    { "Bass texture",      "100 Hz",        EQ_PEAK,       100.0f, 0.85f   },
+    { "Note thickness",    "200 Hz",        EQ_PEAK,       200.0f, 0.6667f },
+    { "Voice",             "650 Hz",        EQ_PEAK,       650.0f, 0.4f    },
+    { "Female overtones",  "3.0 kHz",       EQ_PEAK,      3000.0f, 1.414f  },
+    { "Sibilance LF",      "5.8 kHz",       EQ_PEAK,      5800.0f, 1.0f    },
+    { "Sibilance HF",      "9.2 kHz",       EQ_PEAK,      9200.0f, 1.0f    },
+    { "Impulse response",  "7.5 kHz",       EQ_PEAK,      7500.0f, 0.4f    },
+    { "Air",               "10 kHz shelf",  EQ_HIGH_SHELF, 10000.0f, 0.7071f },
+};
+
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static int        g_enabled;
 static unsigned    g_rate = 44100;
-static eq_band_t   g_band[EQ_MAX_BANDS];
-static int         g_band_n;
+/* The profile's own bands -- what SC_EQ_BAND edits and what ep_save() writes.
+ * Separate from g_band[] below, which is the merged/active cascade actually
+ * fed to the biquads: g_band is derived from this plus g_mseb_*, not edited
+ * directly, since MSEB and the profile both contribute to it. */
+static eq_band_t   g_pband[EQ_MAX_BANDS];
+static int         g_pband_n;
 static float        g_preamp_db;
 static float        g_preamp_lin = 1.0f;
 static char         g_name[EQ_NAME_LEN];
+
+static float       g_mseb_gain[MSEB_BAND_N];
+static int         g_mseb_on;
+
+static eq_band_t   g_band[EQ_MAX_BANDS];    /* active cascade -- see recompute_locked() */
+static int         g_band_n;
 static coeffs_t      g_coeffs[EQ_MAX_BANDS];
 
 static state_t g_state[EQ_MAX_BANDS][EQ_MAX_CH];   /* audio-thread only */
@@ -75,8 +101,32 @@ static void design(coeffs_t *c, eq_type_t type, double rate, double fc,
 }
 
 /* Caller holds g_lock. Cheap enough (ten sin/cos/pow calls at most) to just
- * redo the whole set rather than track which single band changed. */
+ * redo the whole set rather than track which single band changed.
+ *
+ * Builds the ACTIVE cascade (g_band[]/g_band_n/g_coeffs[]) from the profile
+ * (g_pband[]) and MSEB (g_mseb_gain[]) together, rather than editing g_band
+ * directly the way earlier versions of this file did. When MSEB is on, its 9
+ * bands are written first and always fit (9 < EQ_MAX_BANDS); the profile
+ * then gets whatever budget remains, truncated rather than merged -- see
+ * eq.h's comment on eq_set_mseb() for why a hard cap was chosen over raising
+ * EQ_MAX_BANDS to run both in full. */
 static void recompute_locked(void) {
+    g_band_n = 0;
+    if (g_mseb_on) {
+        for (int i = 0; i < MSEB_BAND_N && g_band_n < EQ_MAX_BANDS; i++) {
+            eq_band_t *b = &g_band[g_band_n++];
+            b->type = EQ_MSEB_BANDS[i].type;
+            b->fc   = EQ_MSEB_BANDS[i].fc;
+            b->q    = EQ_MSEB_BANDS[i].q;
+            b->gain_db = g_mseb_gain[i];
+            b->on = 1;
+        }
+    }
+    int room = EQ_MAX_BANDS - g_band_n;
+    int take = g_pband_n < room ? g_pband_n : room;
+    memcpy(&g_band[g_band_n], g_pband, sizeof(g_band[0]) * (size_t)take);
+    g_band_n += take;
+
     for (int i = 0; i < g_band_n; i++)
         design(&g_coeffs[i], g_band[i].type, g_rate, g_band[i].fc,
               g_band[i].gain_db, g_band[i].q);
@@ -90,8 +140,8 @@ void eq_set_profile(const eq_profile_t *p) {
     pthread_mutex_lock(&g_lock);
     snprintf(g_name, sizeof(g_name), "%s", p->name);
     g_preamp_db = p->preamp_db;
-    g_band_n = p->band_n > EQ_MAX_BANDS ? EQ_MAX_BANDS : p->band_n;
-    memcpy(g_band, p->band, sizeof(g_band[0]) * (size_t)g_band_n);
+    g_pband_n = p->band_n > EQ_MAX_BANDS ? EQ_MAX_BANDS : p->band_n;
+    memcpy(g_pband, p->band, sizeof(g_pband[0]) * (size_t)g_pband_n);
     recompute_locked();
     pthread_mutex_unlock(&g_lock);
 }
@@ -100,19 +150,36 @@ void eq_get_profile(eq_profile_t *out) {
     pthread_mutex_lock(&g_lock);
     snprintf(out->name, sizeof(out->name), "%s", g_name);
     out->preamp_db = g_preamp_db;
-    out->band_n = g_band_n;
-    memcpy(out->band, g_band, sizeof(out->band[0]) * (size_t)g_band_n);
+    out->band_n = g_pband_n;
+    memcpy(out->band, g_pband, sizeof(out->band[0]) * (size_t)g_pband_n);
     pthread_mutex_unlock(&g_lock);
 }
 
 void eq_set_band(int i, const eq_band_t *b) {
     if (i < 0 || i >= EQ_MAX_BANDS) return;
     pthread_mutex_lock(&g_lock);
-    g_band[i] = *b;
-    if (i >= g_band_n) g_band_n = i + 1;
+    g_pband[i] = *b;
+    if (i >= g_pband_n) g_pband_n = i + 1;
     recompute_locked();
     pthread_mutex_unlock(&g_lock);
 }
+
+void eq_set_mseb(int enabled, const float gain_db[MSEB_BAND_N]) {
+    pthread_mutex_lock(&g_lock);
+    g_mseb_on = enabled;
+    if (gain_db) memcpy(g_mseb_gain, gain_db, sizeof(g_mseb_gain));
+    recompute_locked();
+    pthread_mutex_unlock(&g_lock);
+}
+
+void eq_get_mseb(int *enabled, float gain_db[MSEB_BAND_N]) {
+    pthread_mutex_lock(&g_lock);
+    if (enabled) *enabled = g_mseb_on;
+    if (gain_db) memcpy(gain_db, g_mseb_gain, sizeof(g_mseb_gain[0]) * MSEB_BAND_N);
+    pthread_mutex_unlock(&g_lock);
+}
+
+int eq_mseb_enabled(void) { return g_mseb_on; }
 
 void eq_set_preamp(float db) {
     pthread_mutex_lock(&g_lock);
