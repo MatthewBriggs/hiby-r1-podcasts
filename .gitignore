@@ -15,3 +15,6 @@ podcast-app/icon/compare.png
 
 # Device-local, contains API keys
 settings.txt
+
+# Built release assets, uploaded to GitHub Releases, not committed
+.release-staging/
