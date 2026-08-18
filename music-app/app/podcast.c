@@ -1,0 +1,448 @@
+/* podcast.c — see podcast.h. Ported from the standalone Podcasts app's
+ * podcast_hook.c; drawing, input, volume/lock and the tile-hijack machinery
+ * all dropped, since Library already owns all of that. */
+#include <ctype.h>
+#include <dirent.h>
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+#include <utime.h>
+
+#include "podcast.h"
+
+#define PODCAST_DIR "/data/mnt/sd_0/Podcasts"
+#define RESUME_DIR  "/data/mnt/sd_0/.podsync"
+#define RESUME_FILE RESUME_DIR "/resume.txt"
+#define SYNC_SCRIPT RESUME_DIR "/podsync_once.sh"
+#define PODSYNC_CURL RESUME_DIR "/curl"
+#define PODSYNC_CA   RESUME_DIR "/cacert.pem"
+#define DL_HDR_PATH  "/tmp/.pod_dl_headers"
+#define SYNC_LOG     "/tmp/.podsync_run.log"
+
+static void sort_feeds(pod_feed_t *items, int n) {
+    for (int i = 1; i < n; i++) {
+        pod_feed_t tmp = items[i];
+        int j = i - 1;
+        while (j >= 0 && strcasecmp(items[j].name, tmp.name) > 0) {
+            items[j + 1] = items[j];
+            j--;
+        }
+        items[j + 1] = tmp;
+    }
+}
+
+int pod_scan_feeds(pod_feed_t *out, int max) {
+    int n = 0;
+    DIR *d = opendir(PODCAST_DIR);
+    if (!d) return 0;
+    struct dirent *e;
+    while (n < max && (e = readdir(d))) {
+        if (e->d_name[0] == '.') continue;
+        char path[POD_PATH_LEN];
+        snprintf(path, sizeof(path), "%s/%s", PODCAST_DIR, e->d_name);
+        DIR *sub = opendir(path);
+        if (!sub) continue;
+        closedir(sub);
+        snprintf(out[n++].name, POD_NAME_LEN, "%s", e->d_name);
+    }
+    closedir(d);
+    sort_feeds(out, n);
+    return n;
+}
+
+/* ---- resume ---------------------------------------------------------- */
+
+int pod_resume_lookup(const char *path, int *dur_out) {
+    if (dur_out) *dur_out = 0;
+    FILE *f = fopen(RESUME_FILE, "r");
+    if (!f) return 0;
+    char line[POD_PATH_LEN + 48];
+    int ms = 0;
+    while (fgets(line, sizeof(line), f)) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+        char *t1 = strchr(line, '\t');
+        if (!t1) continue;
+        *t1 = '\0';
+        char *rest = t1 + 1;
+        char *t2 = strchr(rest, '\t');
+        int dur = 0;
+        char *pathp;
+        if (t2) { *t2 = '\0'; dur = atoi(rest); pathp = t2 + 1; }
+        else    { pathp = rest; }
+        if (strcmp(pathp, path) == 0) {
+            ms = atoi(line);
+            if (dur_out) *dur_out = dur;
+            break;
+        }
+    }
+    fclose(f);
+    return ms;
+}
+
+void pod_resume_store(const char *path, int ms, int dur) {
+    mkdir(RESUME_DIR, 0755);
+    char (*keep)[POD_PATH_LEN + 32] = malloc(sizeof(*keep) * 128);
+    if (!keep) return;
+    int n = 0;
+    FILE *f = fopen(RESUME_FILE, "r");
+    if (f) {
+        char line[POD_PATH_LEN + 32];
+        while (n < 127 && fgets(line, sizeof(line), f)) {
+            char probe[POD_PATH_LEN + 32];
+            snprintf(probe, sizeof(probe), "%s", line);
+            char *nl = strchr(probe, '\n');
+            if (nl) *nl = '\0';
+            char *t1 = strchr(probe, '\t');
+            if (t1) {
+                char *rest = t1 + 1;
+                char *t2 = strchr(rest, '\t');
+                char *pathp = t2 ? t2 + 1 : rest;
+                if (strcmp(pathp, path) == 0) continue;   /* replaced below */
+            }
+            snprintf(keep[n++], POD_PATH_LEN + 32, "%s", line);
+        }
+        fclose(f);
+    }
+    /* Write-then-rename, not truncate-in-place -- see podcast.h/the original
+     * app's comment: this runs every few seconds while playing, and this
+     * device does get its player OOM-killed, so a truncating write here has
+     * lost every saved resume position, not just the current one, in the
+     * window that used to be entered thousands of times a day. */
+    char tmp[sizeof(RESUME_FILE) + 8];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", RESUME_FILE);
+    f = fopen(tmp, "w");
+    if (f) {
+        if (ms > 3000 || ms == POD_FINISHED) fprintf(f, "%d\t%d\t%s\n", ms, dur, path);
+        for (int i = 0; i < n; i++) fputs(keep[i], f);
+        int ok = (fflush(f) == 0);
+        fclose(f);
+        if (!ok || rename(tmp, RESUME_FILE) != 0) unlink(tmp);
+    }
+    free(keep);
+}
+
+/* ---- episodes ---------------------------------------------------------- */
+
+/* Cached from the last pod_load_episodes() call, so pod_download_start(idx)
+ * can find that episode's name/url/feed-dir without the caller re-passing
+ * them -- same shape as the standalone app's single global episodes[]. */
+static char g_feed_dir[POD_PATH_LEN];
+static char g_ep_name[POD_MAX_ITEMS][POD_NAME_LEN];
+static char g_ep_url[POD_MAX_ITEMS][POD_PATH_LEN];
+static long g_ep_mtime[POD_MAX_ITEMS];
+static int  g_ep_n;
+
+static long parse_iso_date(const char *s) {
+    struct tm tmv;
+    memset(&tmv, 0, sizeof(tmv));
+    if (sscanf(s, "%d-%d-%d %d:%d:%d", &tmv.tm_year, &tmv.tm_mon, &tmv.tm_mday,
+               &tmv.tm_hour, &tmv.tm_min, &tmv.tm_sec) != 6)
+        return 0;
+    tmv.tm_year -= 1900;
+    tmv.tm_mon  -= 1;
+    tmv.tm_isdst = -1;
+    time_t t = mktime(&tmv);
+    return (t == (time_t)-1) ? 0 : (long)t;
+}
+
+static int is_audio_ext(const char *n) {
+    const char *d = strrchr(n, '.');
+    if (!d) return 0;
+    return !strcasecmp(d, ".mp3") || !strcasecmp(d, ".m4a") ||
+           !strcasecmp(d, ".m4b") || !strcasecmp(d, ".aac") ||
+           !strcasecmp(d, ".ogg") || !strcasecmp(d, ".opus") ||
+           !strcasecmp(d, ".wav") || !strcasecmp(d, ".flac");
+}
+
+static void sort_episodes(pod_episode_t *items, int n) {
+    /* Newest first by mtime -- download order for a local file, pubdate for
+     * a manifest-only one. Name-only sorting only looks right when titles
+     * happen to start with a number. */
+    for (int i = 1; i < n; i++) {
+        pod_episode_t tmp = items[i];
+        int j = i - 1;
+        while (j >= 0 && items[j].mtime < tmp.mtime) {
+            items[j + 1] = items[j];
+            j--;
+        }
+        items[j + 1] = tmp;
+    }
+}
+
+int pod_load_episodes(const char *feed, pod_episode_t *out, int max) {
+    int n = 0;
+    snprintf(g_feed_dir, sizeof(g_feed_dir), "%s/%s", PODCAST_DIR, feed);
+    DIR *d = opendir(g_feed_dir);
+    if (!d) return 0;
+    struct dirent *e;
+    /* Nothing is ever deleted automatically, so a long-running feed can
+     * exceed `max`. Once full, displace whichever entry is currently oldest
+     * rather than stopping -- readdir order on FAT32 is roughly creation
+     * order, not date order, so stopping early would hide new episodes
+     * behind old ones. */
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.') continue;
+        if (!is_audio_ext(e->d_name)) continue;
+
+        char path[POD_PATH_LEN];
+        snprintf(path, sizeof(path), "%s/%s", g_feed_dir, e->d_name);
+        struct stat st;
+        long mt = (stat(path, &st) == 0) ? (long)st.st_mtime : 0;
+
+        int slot;
+        if (n < max) {
+            slot = n++;
+        } else {
+            slot = 0;
+            for (int i = 1; i < max; i++)
+                if (out[i].mtime < out[slot].mtime) slot = i;
+            if (mt <= out[slot].mtime) continue;
+        }
+
+        snprintf(out[slot].path, POD_PATH_LEN, "%s", path);
+        out[slot].mtime = mt;
+        snprintf(out[slot].name, POD_NAME_LEN, "%s", e->d_name);
+        char *dot = strrchr(out[slot].name, '.');
+        if (dot) *dot = '\0';
+        out[slot].downloaded = 1;
+        out[slot].url[0] = '\0';
+    }
+    closedir(d);
+
+    /* R18: fold in episodes.tsv, the manifest podsync_once.sh writes of
+     * every episode currently in the feed's recent window, not just the
+     * ones fetched. Its `base` field is the same sanitize(title) the
+     * download filename uses, so a manifest entry that already has a local
+     * file needs no reimplementation of sanitize() in C to detect -- a
+     * plain strcmp against the name each local file was just given works. */
+    char manifest[POD_PATH_LEN];
+    snprintf(manifest, sizeof(manifest), "%s/episodes.tsv", g_feed_dir);
+    FILE *mf = fopen(manifest, "r");
+    if (mf) {
+        char line[1024];
+        while (n < max && fgets(line, sizeof(line), mf)) {
+            char *nl = strchr(line, '\n');
+            if (nl) *nl = '\0';
+            char *base = line;
+            char *url = strchr(base, '\t');
+            if (!url) continue;
+            *url++ = '\0';
+            char *date = strchr(url, '\t');
+            if (date) *date++ = '\0';
+
+            int known = 0;
+            for (int i = 0; i < n; i++)
+                if (!strcmp(out[i].name, base)) { known = 1; break; }
+            if (known) continue;
+
+            int slot = n++;
+            snprintf(out[slot].name, POD_NAME_LEN, "%s", base);
+            out[slot].path[0] = '\0';
+            out[slot].mtime = date ? parse_iso_date(date) : 0;
+            out[slot].downloaded = 0;
+            snprintf(out[slot].url, POD_PATH_LEN, "%s", url);
+        }
+        fclose(mf);
+    }
+
+    sort_episodes(out, n);
+    for (int i = 0; i < n; i++) {
+        if (out[i].downloaded)
+            out[i].resume_ms = pod_resume_lookup(out[i].path, &out[i].dur_ms);
+        else
+            out[i].resume_ms = 0, out[i].dur_ms = 0;
+        /* Cache for pod_download_start(idx). */
+        snprintf(g_ep_name[i], POD_NAME_LEN, "%s", out[i].name);
+        snprintf(g_ep_url[i], POD_PATH_LEN, "%s", out[i].url);
+        g_ep_mtime[i] = out[i].mtime;
+    }
+    g_ep_n = n;
+    return n;
+}
+
+/* ---- on-demand download (R18) -------------------------------------------- */
+
+static pid_t dl_pid = -1;
+static int   dl_slot = -1;
+static long  dl_bytes;
+static long  dl_total;
+static char  dl_part_path[POD_PATH_LEN];
+static char  dl_final_path[POD_PATH_LEN];
+static int   dl_ok;
+
+static const char *ext_for_url(const char *url) {
+    static char ext[8];
+    ext[0] = '\0';
+    const char *q = strpbrk(url, "?#");
+    const char *end = q ? q : url + strlen(url);
+    const char *dot = NULL;
+    for (const char *p = url; p < end; p++) if (*p == '.') dot = p;
+    if (dot) {
+        size_t n = 0;
+        for (const char *p = dot + 1; p < end && n < sizeof(ext) - 1; p++, n++)
+            ext[n] = (char)tolower((unsigned char)*p);
+        ext[n] = '\0';
+    }
+    static const char *ok[] = { "mp3", "m4a", "m4b", "aac", "ogg", "oga",
+                                 "opus", "wav", "flac", NULL };
+    for (int i = 0; ok[i]; i++) if (!strcmp(ext, ok[i])) return ext;
+    return "mp3";
+}
+
+void pod_download_start(int idx) {
+    if (dl_pid > 0) return;
+    if (idx < 0 || idx >= g_ep_n) return;
+    if (!g_ep_url[idx][0]) return;
+
+    const char *ext = ext_for_url(g_ep_url[idx]);
+    snprintf(dl_final_path, sizeof(dl_final_path), "%s/%s.%s",
+             g_feed_dir, g_ep_name[idx], ext);
+    snprintf(dl_part_path, sizeof(dl_part_path), "%s.part", dl_final_path);
+    unlink(dl_part_path);
+    unlink(DL_HDR_PATH);
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        execl(PODSYNC_CURL, PODSYNC_CURL, "-fsSL", "--cacert", PODSYNC_CA,
+              "--connect-timeout", "20", "--max-time", "900",
+              "-D", DL_HDR_PATH, "-o", dl_part_path, g_ep_url[idx],
+              (char *)NULL);
+        _exit(127);
+    }
+    if (pid > 0) {
+        dl_pid = pid;
+        dl_slot = idx;
+        dl_bytes = 0;
+        dl_total = 0;
+    }
+}
+
+int pod_download_active(void) { return dl_pid > 0; }
+int pod_download_slot(void)   { return dl_slot; }
+long pod_download_bytes(void) { return dl_bytes; }
+long pod_download_total(void) { return dl_total; }
+
+int pod_download_poll(void) {
+    if (dl_pid <= 0) return -1;
+
+    if (dl_total <= 0) {
+        FILE *hf = fopen(DL_HDR_PATH, "r");
+        if (hf) {
+            char line[256];
+            while (fgets(line, sizeof(line), hf)) {
+                long v;
+                if (sscanf(line, "Content-Length: %ld", &v) == 1 ||
+                    sscanf(line, "content-length: %ld", &v) == 1) {
+                    dl_total = v;
+                    break;
+                }
+            }
+            fclose(hf);
+        }
+    }
+    struct stat pst;
+    if (stat(dl_part_path, &pst) == 0) dl_bytes = (long)pst.st_size;
+
+    int status;
+    pid_t r = waitpid(dl_pid, &status, WNOHANG);
+    if (r == 0) return 0;
+
+    int ok = (r == dl_pid) && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    struct stat fst;
+    if (ok && (stat(dl_part_path, &fst) != 0 || fst.st_size <= 0)) ok = 0;
+
+    if (ok) {
+        rename(dl_part_path, dl_final_path);
+        if (dl_slot >= 0 && dl_slot < g_ep_n && g_ep_mtime[dl_slot] > 0) {
+            struct utimbuf ub;
+            ub.actime = ub.modtime = (time_t)g_ep_mtime[dl_slot];
+            utime(dl_final_path, &ub);
+        }
+    } else {
+        unlink(dl_part_path);
+    }
+    dl_ok = ok;
+    dl_pid = -1;
+    return 1;
+}
+
+/* ---- whole-feed sync ------------------------------------------------- */
+
+static pid_t update_pid = -1;
+static int   update_running_flag;
+static int   update_died_flag;
+
+void pod_update_start(void) {
+    if (update_running_flag) return;
+    unlink(SYNC_LOG);
+    pid_t pid = fork();
+    if (pid == 0) {
+        execl("/bin/sh", "sh", SYNC_SCRIPT, (char *)NULL);
+        _exit(127);
+    }
+    if (pid > 0) {
+        update_pid = pid;
+        update_died_flag = 0;
+        update_running_flag = 1;
+    }
+}
+
+int pod_update_running(void) { return update_running_flag; }
+int pod_update_died(void)    { return update_died_flag; }
+
+int pod_update_tail(char out[][POD_NAME_LEN], int max_lines) {
+    FILE *f = fopen(SYNC_LOG, "r");
+    if (!f) return 0;
+    char line[256];
+    int n = 0;
+    while (fgets(line, sizeof(line), f)) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+        if (!line[0]) continue;
+        if (strcmp(line, "__DONE__") == 0) { update_running_flag = 0; continue; }
+        if (n < max_lines) {
+            snprintf(out[n++], POD_NAME_LEN, "%s", line);
+        } else {
+            for (int i = 1; i < max_lines; i++)
+                memcpy(out[i - 1], out[i], POD_NAME_LEN);
+            snprintf(out[max_lines - 1], POD_NAME_LEN, "%s", line);
+        }
+    }
+    fclose(f);
+    return n;
+}
+
+void pod_update_reap(void) {
+    if (update_pid <= 0) return;
+    int status;
+    if (waitpid(update_pid, &status, WNOHANG) != update_pid) return;
+    update_pid = -1;
+    if (update_running_flag) {
+        update_running_flag = 0;
+        update_died_flag = 1;
+    }
+}
+
+/* ---- show notes ---------------------------------------------------------- */
+
+int pod_load_notes(const char *audio_path, char *out, int max_len) {
+    out[0] = '\0';
+    char p[POD_PATH_LEN];
+    snprintf(p, sizeof(p), "%s", audio_path);
+    char *dot = strrchr(p, '.');
+    if (!dot) return 0;
+    snprintf(dot, sizeof(p) - (size_t)(dot - p), ".txt");
+
+    FILE *f = fopen(p, "r");
+    if (!f) return 0;
+    size_t n = fread(out, 1, (size_t)max_len - 1, f);
+    fclose(f);
+    out[n] = '\0';
+    return (int)n;
+}

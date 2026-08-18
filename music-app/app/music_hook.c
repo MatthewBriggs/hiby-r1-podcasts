@@ -44,6 +44,7 @@
 #include "icons.h"
 #include "library.h"
 #include "audiobook.h"
+#include "podcast.h"
 #include "audio.h"
 #include "eq.h"
 #include "eqprofile.h"
@@ -91,7 +92,9 @@ static int button_lock_enabled;   /* off by default: a new gesture, opt in */
 #define TEXT_PX_BODY  30
 #define TEXT_PX_SMALL 22
 
-#define HEADER_H  62
+/* Was 62 -- widened so the header actions (MSEB's Reset, Podcasts' Sync)
+ * have a taller strip to land a tap in, not just a wider one. */
+#define HEADER_H  78
 /* Height of the status strip. Deliberately not STATUS_H-the-include-guard:
  * status.h used that name to guard itself, so whichever came second lost —
  * either this constant was redefined, or the header's contents were skipped
@@ -558,7 +561,7 @@ static void fill_rect_clip(uint16_t *fb, int x, int y, int w, int h, uint16_t c,
 #define PAGE_MAX 32
 
 typedef enum { SC_MENU = 0, SC_MUSIC_MENU, SC_ARTISTS, SC_ALBUMS, SC_TRACKS, SC_PLAYING,
-               SC_RADIO, SC_PLAYLISTS, SC_AUDIOBOOKS,
+               SC_RADIO, SC_PLAYLISTS, SC_AUDIOBOOKS, SC_PODCASTS, SC_POD_SYNC,
                SC_EQ, SC_EQ_BANDS, SC_EQ_BAND, SC_MSEB,
                SC_SETTINGS, SC_SETTINGS_THEME, SC_SETTINGS_ABOUT } screen_t;
 
@@ -569,6 +572,7 @@ typedef enum { SC_MENU = 0, SC_MUSIC_MENU, SC_ARTISTS, SC_ALBUMS, SC_TRACKS, SC_
 static const struct { const char *label; } top_menu[] = {
     { "Music" },
     { "Audiobooks" },
+    { "Podcasts" },
     { "Parametric EQ" },
     { "MSEB" },
     { "Radio" },
@@ -576,10 +580,11 @@ static const struct { const char *label; } top_menu[] = {
 };
 #define TOP_MUSIC      0
 #define TOP_AUDIOBOOKS 1
-#define TOP_EQ         2
-#define TOP_MSEB       3
-#define TOP_RADIO      4
-#define TOP_SETTINGS   5
+#define TOP_PODCASTS   2
+#define TOP_EQ         3
+#define TOP_MSEB       4
+#define TOP_RADIO      5
+#define TOP_SETTINGS   6
 #define TOP_N ((int)(sizeof(top_menu) / sizeof(top_menu[0])))
 
 /* Reached via "Music" from the main menu (SC_MUSIC_MENU). Each entry is a
@@ -741,6 +746,30 @@ static int eq_row_bands_y(void)   { return eq_curve_y() + 66; }
 #define MSEB_ROW_H 70
 static int mseb_row_enabled_y(void) { return CONTENT_Y; }
 static int mseb_band_row_y(int i) { return mseb_row_enabled_y() + ROW_H + i * MSEB_ROW_H; }
+
+/* Left edge of "BACK" itself -- shared by both header actions below so their
+ * tap zones can run right up to where BACK's own zone actually starts,
+ * rather than guessing at a fixed offset that drifts out of sync with the
+ * text the moment either label changes. */
+static int header_back_x(void) {
+    return FB_W - 24 - text_width("BACK", TEXT_PX_SMALL);
+}
+
+/* Left edge of the "Reset" header action, shared between the header's own
+ * draw and its tap zone so they cannot drift apart -- the same reason
+ * bar_y()/eq_row_*_y() above are functions rather than repeated literals.
+ * Positioned left of "BACK" with a 20px gap, both right-aligned inward from
+ * the usual 24px margin. */
+static int mseb_reset_x(void) {
+    int reset_w = text_width("Reset", TEXT_PX_SMALL);
+    return header_back_x() - 20 - reset_w;
+}
+
+/* Same idea as mseb_reset_x(), for SC_PODCASTS's "Sync" header action. */
+static int pod_sync_x(void) {
+    int sync_w = text_width("Sync", TEXT_PX_SMALL);
+    return header_back_x() - 20 - sync_w;
+}
 
 /* How long the device may sit locked with nothing playing before it goes into
  * its low-power idle. Minutes, and 0 means never. Declared up here with the
@@ -1061,6 +1090,47 @@ static int  ab_speed_permille = 1000;     /* persists across books; reset only b
 static ab_book_data_t ab_book;
 static char ab_playing[LIB_PATH_LEN];     /* the file the decoder actually has open */
 
+static int was_active;    /* to spot a track ending of its own accord */
+
+/* Podcasts. Feeds are a flat list, drawn and tapped exactly like
+ * SC_AUDIOBOOKS (pod_rows[]/row_at()); an episode list of one feed reuses
+ * SC_TRACKS exactly like a book's chapters do (`pod_list` alongside
+ * `ab_list`). Playback is deliberately NOT queued across a whole feed the
+ * way an album's tracks are -- queue_n stays 1, one episode at a time --
+ * since a feed mixes downloaded and not-yet-downloaded episodes and a
+ * podcast queue isn't something a listener expects to play straight
+ * through the way an album is. `podcast_mode` is what's *playing*, set and
+ * cleared beside audiobook_mode/radio_mode; `pod_list` is whether tracks[]
+ * currently holds one feed's episodes, same split as ab_list/audiobook_mode. */
+#define POD_MAX_FEEDS 64
+static pod_feed_t pod_feeds[POD_MAX_FEEDS];
+static lib_row_t  pod_rows[POD_MAX_FEEDS];   /* pod_feeds[], reshaped for the row-list draw code */
+static int        pod_feed_n;
+static pod_episode_t pod_eps[POD_MAX_ITEMS]; /* parallel to tracks[] while pod_list is set */
+static int        pod_ep_n;
+static char       cur_feed[POD_NAME_LEN];
+static int        podcast_mode;
+static int        pod_list;
+/* Show notes: raw text, wrapped and clipped at draw time. Loaded once, when
+ * an episode starts, not re-read every frame. */
+static char       pod_notes_text[8192];
+static int        pod_notes_avail;
+static int        pod_notes_showing;
+static int        pod_notes_scroll_px;
+static int        pod_notes_dragging;
+static int        pod_notes_down_y, pod_notes_start_px;
+
+/* SC_POD_SYNC: a dedicated screen for the whole-feed sync, per BACKLOG.md's
+ * L5 entry ("the UPDATE FEEDS screen, which streams live podsync subprocess
+ * output into its own screen") -- not folded into a toast or a status line
+ * on SC_PODCASTS, since a multi-feed sync can run long enough that the
+ * reader wants to see it's actually making progress, not just that it
+ * started. Filled from pod_update_tail() every tick while running (see the
+ * main loop), newest last, same as the fetcher's own log file reads. */
+#define POD_SYNC_LOG_N 10
+static char pod_sync_log[POD_SYNC_LOG_N][POD_NAME_LEN];
+static int  pod_sync_log_n;
+
 /* Parametric EQ. eq.c/eq.h own the live filter state applied in the audio
  * thread; this is the UI-side working copy, written to eq_set_band()/
  * eq_set_preamp() at the same call sites that update it locally, so the two
@@ -1355,8 +1425,81 @@ static void ab_rebuild_rows(void) {
     }
 }
 
+/* pod_feeds[] -> pod_rows[], same reasoning as ab_rebuild_rows() above. */
+static void pod_rebuild_rows(void) {
+    for (int i = 0; i < pod_feed_n; i++) {
+        snprintf(pod_rows[i].name, sizeof(pod_rows[i].name), "%s", pod_feeds[i].name);
+        pod_rows[i].count = 0;
+        pod_rows[i].owner[0] = '\0';
+    }
+}
+
+/* pod_eps[] -> tracks[], same reasoning as ab_load_book() mirroring chapters
+ * into tracks[] -- an undownloaded episode gets an empty path, same as any
+ * other lib_track_t whose file isn't there yet, so the tap handler is what
+ * has to check pod_eps[idx].downloaded, not audio_play() failing at runtime. */
+static void pod_rebuild_tracks(void) {
+    int max = (int)(sizeof(tracks) / sizeof(tracks[0]));
+    track_n = 0;
+    for (int i = 0; i < pod_ep_n && track_n < max; i++) {
+        lib_track_t *t = &tracks[track_n];
+        memset(t, 0, sizeof(*t));
+        snprintf(t->name, sizeof(t->name), "%s", pod_eps[i].name);
+        if (pod_eps[i].downloaded)
+            snprintf(t->path, sizeof(t->path), "%s", pod_eps[i].path);
+        t->dur_ms = pod_eps[i].dur_ms;
+        t->track = -1;
+        t->disc  = -1;
+        track_n++;
+    }
+}
+
+/* Mirrors ab_save_current_pos() exactly -- see its comment for why the
+ * audio_is_active() guard matters (audio_stop() zeroes g_pos_ms on the way
+ * out, and podcast_mode/cur_track/queue are static, carrying stale values
+ * into the next call otherwise). The last few seconds count as finished
+ * rather than a resumable position, so re-opening a just-completed episode
+ * starts over instead of resuming one second from the end. */
+static void pod_save_current_pos(void) {
+    if (!podcast_mode || !audio_is_active()) return;
+    if (cur_track < 0 || cur_track >= queue_n) return;
+    int pos = audio_pos_ms(), dur = audio_dur_ms();
+    if (dur > 0 && pos >= dur - 3000) pod_resume_store(queue[cur_track].path, POD_FINISHED, dur);
+    else pod_resume_store(queue[cur_track].path, pos, dur);
+}
+
+/* One episode, playing on its own -- see the comment by podcast_mode for why
+ * this doesn't queue the rest of the feed the way play_from_list() does for
+ * an album. Resumes from pod_resume_lookup() when there is a saved position;
+ * a POD_FINISHED episode restarts from 0, same as reaching the end of any
+ * other track leaves nothing to resume into. */
+static void pod_play_episode(int idx) {
+    if (idx < 0 || idx >= pod_ep_n || !pod_eps[idx].downloaded) return;
+    pod_save_current_pos();
+    radio_mode = 0;
+    audiobook_mode = 0;
+    podcast_mode = 1;
+    memcpy(&queue[0], &tracks[idx], sizeof(queue[0]));
+    queue_n = 1;
+    cur_track = 0;
+    q_album[0] = '\0';
+    q_artist[0] = '\0';
+    audio_set_next(NULL);
+    audio_play(pod_eps[idx].path);
+    art_request(pod_eps[idx].path);
+    was_active = 1;
+    int dur = 0;
+    int resume = pod_resume_lookup(pod_eps[idx].path, &dur);
+    if (resume > 0 && resume != POD_FINISHED) audio_seek_ms(resume);
+    pod_notes_avail = pod_load_notes(pod_eps[idx].path, pod_notes_text, sizeof(pod_notes_text)) > 0;
+    pod_notes_showing = 0;
+    pod_notes_scroll_px = 0;
+    mlog("[music] podcast episode %s\n", pod_eps[idx].name);
+}
+
 static void load_page(void) {
     if (screen == SC_AUDIOBOOKS) return;   /* ab_rows[] is already complete, no paging */
+    if (screen == SC_PODCASTS) return;     /* pod_rows[] likewise -- a folder count, not a query */
     if (!index_visible()) return;
 
     /* Keep a compact window around the viewport. The rows used to be fetched
@@ -1386,6 +1529,8 @@ static int page_covers_viewport(void) {
 static lib_row_t *row_at(int absolute) {
     if (screen == SC_AUDIOBOOKS)
         return (absolute >= 0 && absolute < ab_book_n) ? &ab_rows[absolute] : NULL;
+    if (screen == SC_PODCASTS)
+        return (absolute >= 0 && absolute < pod_feed_n) ? &pod_rows[absolute] : NULL;
     int local = absolute - row_base;
     return local >= 0 && local < row_n ? &rows[local] : NULL;
 }
@@ -1446,8 +1591,6 @@ static void draw_right_clip(uint16_t *fb, int y, const char *s, int clip_top, in
 /* Every route into playback goes through here: tapping a track, and the two
  * transport buttons. Keeping it in one place is what stops the artwork request
  * from being dropped on one path and not the others. */
-static int was_active;    /* to spot a track ending of its own accord */
-
 #define QUEUE_MAX ((int)(sizeof(queue) / sizeof(queue[0])))
 
 static void queue_follower(void);
@@ -1749,6 +1892,26 @@ static void draw_mini(uint16_t *fb) {
     fill_rect(fb, 0, by, FB_W, MINI_H, COL_HEADER);
     fill_rect(fb, 0, by, FB_W, 1, COL_LINE);
 
+    /* R32: a 1px position indicator at the very bottom edge of the screen --
+     * not the mini-player's own top border (already drawn above), the last
+     * row of the framebuffer itself, corner to corner. Display only, same
+     * as the full player's own scrub strip's dur/pos sourcing (draw_scrub_
+     * strip) but with no track/background under it and no scrub handling --
+     * this is glanceable position while browsing, not a second place to
+     * drag. Radio has no meaningful duration, so it draws nothing here
+     * rather than a bar that can never move. */
+    if (!radio_mode && cur_track >= 0 && cur_track < queue_n) {
+        lib_track_t *t = &queue[cur_track];
+        int dur = audio_dur_ms();
+        if (dur <= 0) dur = t->dur_ms;
+        if (dur > 0) {
+            int pos = audio_pos_ms();
+            int w = FB_W * pos / dur;
+            if (w > FB_W) w = FB_W;
+            if (w > 0) fill_rect(fb, 0, FB_H - 1, w, 1, COL_ACCENT);
+        }
+    }
+
     int thumb = 56, tx = 12, ty = by + (MINI_H - thumb) / 2;
     int text_x = 20;
     if (!radio_mode) {
@@ -1893,6 +2056,42 @@ static void draw_status(uint16_t *fb) {
     fill_rect(fb, 0, STATUS_H - 1, FB_W, 1, COL_LINE);
 }
 
+/* Word-wrapped, scrollable show notes -- drawn in place of the cover art
+ * within the same box while pod_notes_showing is set. Wrapped fresh at every
+ * draw off text_width() rather than pre-computed: the notes buffer is at
+ * most 8KB and this is the only place in the app that ever wraps a paragraph,
+ * so a real line-layout cache would be more code than the cost it avoids. */
+static void pod_draw_notes(uint16_t *fb, int x, int y, int w, int h) {
+    fill_rect(fb, x, y, w, h, COL_ROW);
+    const int lh = 30, px = TEXT_PX_SMALL;
+    int ty = y + 16 - pod_notes_scroll_px;
+    const char *p = pod_notes_text;
+    while (*p) {
+        while (*p == ' ') p++;
+        if (*p == '\n') { p++; ty += lh; continue; }   /* blank source line stays blank */
+        char line[256];
+        line[0] = '\0';
+        for (;;) {
+            const char *ws = p;
+            while (*p && *p != ' ' && *p != '\n') p++;
+            int wlen = (int)(p - ws);
+            if (wlen == 0) break;
+            char probe[300];
+            if (line[0]) snprintf(probe, sizeof(probe), "%s %.*s", line, wlen, ws);
+            else         snprintf(probe, sizeof(probe), "%.*s", wlen, ws);
+            if (line[0] && text_width(probe, px) > w - 32) { p = ws; break; }   /* rewind: this word starts the next line */
+            snprintf(line, sizeof(line), "%s", probe);
+            if (*p == '\n') { p++; break; }
+            while (*p == ' ') p++;
+            if (!*p) break;
+        }
+        if (line[0] && ty + lh > y && ty < y + h)
+            draw_text_clip(fb, x + 16, ty, line, COL_TEXT, px, w - 32, y, y + h);
+        ty += lh;
+        if (ty > y + h + 400) break;   /* far enough past the bottom to stop wrapping the rest */
+    }
+}
+
 static void draw_screen(uint16_t *fb) {
     fill_rect(fb, 0, 0, FB_W, FB_H, COL_BG);
     /* The player has no title bar at all: a strip saying "Now playing" over a
@@ -1925,6 +2124,8 @@ static void draw_screen(uint16_t *fb) {
     else if (screen == SC_RADIO)   { title = "Radio"; right = "BACK"; }
     else if (screen == SC_PLAYLISTS) { title = "Playlists"; right = "BACK"; }
     else if (screen == SC_AUDIOBOOKS) { title = "Audiobooks"; right = "BACK"; }
+    else if (screen == SC_PODCASTS)   { title = "Podcasts"; right = "BACK"; }
+    else if (screen == SC_POD_SYNC)   { title = "Updating feeds"; right = "BACK"; }
     else if (screen == SC_EQ)         { title = "Parametric EQ"; right = "BACK"; }
     else if (screen == SC_EQ_BANDS)   { title = "Bands"; right = "BACK"; }
     else if (screen == SC_MSEB)       { title = "MSEB"; right = "BACK"; }
@@ -1945,6 +2146,21 @@ static void draw_screen(uint16_t *fb) {
         int rw = text_width(right, TEXT_PX_SMALL);
         draw_text(fb, 18, STATUS_H + 14, title, COL_TEXT, TEXT_PX_TITLE, FB_W - rw - 40);
         draw_text(fb, FB_W - 24 - rw, STATUS_H + 20, right, COL_DIM, TEXT_PX_SMALL, FB_W);
+        /* MSEB's one extra header action: zero every band back to 0 dB.
+         * Doesn't touch Enabled -- "reset" clears the tuning, not the
+         * on/off state, which the user didn't ask to lose. */
+        if (screen == SC_MSEB)
+            draw_text(fb, mseb_reset_x(), STATUS_H + 20, "Reset", COL_DIM, TEXT_PX_SMALL, FB_W);
+        /* Podcasts' one extra header action: run .podsync/podsync_once.sh
+         * for every feed. Dimmed rather than hidden while it's already
+         * running, same convention a disabled control uses elsewhere in
+         * this app, since tapping it again would just fork a second sync
+         * over the first one's half-written files. */
+        if (screen == SC_PODCASTS) {
+            draw_text(fb, pod_sync_x(), STATUS_H + 20,
+                      pod_update_running() ? "Syncing" : "Sync",
+                      pod_update_running() ? COL_DIM : COL_ACCENT, TEXT_PX_SMALL, FB_W);
+        }
         draw_status(fb);
         fill_rect(fb, 0, CONTENT_Y - 1, FB_W, 1, COL_LINE);
     }
@@ -2238,8 +2454,26 @@ static void draw_screen(uint16_t *fb) {
         if (!t) return;
 
         int cy = 0, cx = (FB_W - ART_PX) / 2;
-        fill_rect(fb, cx, cy, ART_PX, ART_PX, COL_ROW);
-        blit_art(fb, cx, cy);
+        /* R? (podcast merge): the info circle toggles show notes in place of
+         * the cover art, within the same box -- see pod_draw_notes() and the
+         * matching tap zone below. Drawn only when a notes sidecar actually
+         * exists for this episode, per the user's spec: a circle with an
+         * "i", top right of the art. */
+        if (podcast_mode && pod_notes_showing) {
+            pod_draw_notes(fb, cx, cy, ART_PX, ART_PX);
+        } else {
+            fill_rect(fb, cx, cy, ART_PX, ART_PX, COL_ROW);
+            blit_art(fb, cx, cy);
+        }
+        if (podcast_mode && pod_notes_avail) {
+            /* Same ring-then-fill trick as the audiobook speed control
+             * above: two concentric fill_circle()s, since fill_circle only
+             * ever draws solid. */
+            int icx = cx + ART_PX - 34, icy = cy + 34;
+            fill_circle(fb, icx, icy, 18, COL_LINE);
+            fill_circle(fb, icx, icy, 16, COL_BG);
+            draw_text(fb, icx - 3, icy - TEXT_PX_BODY / 2 + 2, "i", COL_TEXT, TEXT_PX_BODY, FB_W);
+        }
         int ty = title_y();
         draw_scroll_title(fb, ty, t->name);
         /* The track's own artist wins when it has one -- q_artist is the
@@ -2247,16 +2481,22 @@ static void draw_screen(uint16_t *fb) {
          * (BG30: a compilation showed the album's artist for every track
          * instead of each one's real artist). Falls back to q_artist only
          * for a track with no artist tag of its own (e.g. a playlist entry
-         * pulled in from elsewhere) so the line is never simply blank. */
+         * pulled in from elsewhere) so the line is never simply blank.
+         * A podcast episode has no artist tag and an intentionally-empty
+         * q_artist (see pod_play_episode()), so this line is blank for one
+         * rather than showing the feed name twice. */
         draw_text(fb, 24, ty + 44, t->artist[0] ? t->artist : q_artist,
                   COL_DIM, TEXT_PX_BODY, FB_W - 24);
-        draw_text(fb, 24, ty + 82, q_album, COL_DIM, TEXT_PX_SMALL, FB_W - 110);
+        draw_text(fb, 24, ty + 82, podcast_mode ? cur_feed : q_album, COL_DIM, TEXT_PX_SMALL, FB_W - 110);
         /* Position in the queue, not the track's own number. Those are not the
          * same thing and showing one against the other produced "11 of 3" on a
          * playlist — and "11 of 9" on an album whose numbering has gaps, which
-         * this one does. */
-        snprintf(buf, sizeof(buf), "%d of %d", cur_track + 1, queue_n);
-        draw_right(fb, ty + 82, buf);
+         * this one does. A podcast episode is never queued alongside others
+         * (see podcast_mode's comment), so "1 of 1" would say nothing true. */
+        if (!podcast_mode) {
+            snprintf(buf, sizeof(buf), "%d of %d", cur_track + 1, queue_n);
+            draw_right(fb, ty + 82, buf);
+        }
 
         int pos = audio_pos_ms(), dur = audio_dur_ms();
         if (dur <= 0) dur = t->dur_ms;
@@ -2343,9 +2583,24 @@ static void draw_screen(uint16_t *fb) {
         if (devpct >= 0)
             draw_battery(fb, FB_W - 62 - 26, FB_H - 34 + TEXT_PX_SMALL / 2 - 6,
                         devpct, st_charging());
-        snprintf(buf, sizeof(buf), "%s  %d/%g kHz  %d kbps",
-                 track_format_name(t), t->bits, t->rate / 1000.0,
-                 t->bitrate / 1000);
+        /* A podcast episode comes from a folder walk, never the SQL index --
+         * same reasoning as the audiobook screen's own comment here: t->
+         * format/bits/rate are never populated for one (see pod_rebuild_
+         * tracks()), so track_format_name(t) would show a meaningless
+         * "FLAC 0/0 kHz 0 kbps" rather than the extension actually on disk. */
+        if (podcast_mode) {
+            char ext[16];
+            const char *dot = strrchr(t->path, '.');
+            snprintf(ext, sizeof(ext), "%s", dot && dot[1] ? dot + 1 : "");
+            for (char *p2 = ext; *p2; p2++) *p2 = (char)toupper((unsigned char)*p2);
+            int kbps = ab_file_bitrate_kbps(t->path, t->dur_ms);
+            if (kbps > 0) snprintf(buf, sizeof(buf), "%s  %d kbps", ext, kbps);
+            else          snprintf(buf, sizeof(buf), "%s", ext);
+        } else {
+            snprintf(buf, sizeof(buf), "%s  %d/%g kHz  %d kbps",
+                     track_format_name(t), t->bits, t->rate / 1000.0,
+                     t->bitrate / 1000);
+        }
         draw_text(fb, 24, FB_H - 34, buf, COL_ACCENT, TEXT_PX_SMALL,
                   FB_W - 62 - ow - riw - 36);
         return;
@@ -2358,8 +2613,17 @@ static void draw_screen(uint16_t *fb) {
             int idx = scroll + i;
             if (idx >= track_n) break;
             lib_track_t *t = &tracks[idx];
-            int playing = audio_is_active() && idx == cur_track &&
-                          !strcmp(cur_album, q_album) && !strcmp(cur_artist, q_artist);
+            /* pod_list: cur_track/queue[] identify the playing episode by a
+             * one-entry queue (see podcast_mode's comment), not by an index
+             * into this freshly-reloaded feed list -- idx == cur_track would
+             * just mark whichever episode happens to sort first. Matched by
+             * path instead, the same thing a fresh pod_load_episodes() call
+             * can't be expected to keep a stable index for. */
+            int playing = pod_list
+                ? (audio_is_active() && podcast_mode && cur_track == 0 &&
+                   queue_n > 0 && t->path[0] && !strcmp(t->path, queue[0].path))
+                : (audio_is_active() && idx == cur_track &&
+                   !strcmp(cur_album, q_album) && !strcmp(cur_artist, q_artist));
             if (playing) {
                 fill_rect_clip(fb, 0, y, FB_W, ROW_H, COL_ROW, CONTENT_Y, clip_bot);
                 fill_rect_clip(fb, 0, y, 4, ROW_H, COL_ACCENT, CONTENT_Y, clip_bot);
@@ -2376,10 +2640,32 @@ static void draw_screen(uint16_t *fb) {
              * allowance, and a duration string never needs more than that.
              * This was FB_W-150, leaving ~76px of clipped title unused for
              * no reason (BG10). */
+            /* Per BACKLOG.md's L5 entry: dimmed = not downloaded yet, the
+             * same visual language a disabled control uses elsewhere in
+             * this app, so the list reads at a glance which rows play and
+             * which only start a download. */
             draw_text_clip(fb, 68, y + 20, t->name,
-                          playing ? COL_ACCENT : COL_TEXT, TEXT_PX_BODY, FB_W - 110,
+                          playing ? COL_ACCENT
+                          : (pod_list && !pod_eps[idx].downloaded) ? COL_DIM
+                          : COL_TEXT,
+                          TEXT_PX_BODY, FB_W - 110,
                           CONTENT_Y, clip_bot);
-            if (t->dur_ms > 0) {
+            /* pod_list: an episode not yet downloaded has no duration to
+             * show (t->dur_ms is 0, same as any file that isn't there yet)
+             * -- show the download affordance in that slot instead, or its
+             * live progress if this is the one downloading right now. */
+            if (pod_list && !pod_eps[idx].downloaded) {
+                if (pod_download_active() && pod_download_slot() == idx) {
+                    long tot = pod_download_total();
+                    if (tot > 0)
+                        snprintf(buf, sizeof(buf), "%ld%%", pod_download_bytes() * 100 / tot);
+                    else
+                        snprintf(buf, sizeof(buf), "%ld KB", pod_download_bytes() / 1024);
+                } else {
+                    snprintf(buf, sizeof(buf), "Download");
+                }
+                draw_right_clip(fb, y + 22, buf, CONTENT_Y, clip_bot);
+            } else if (t->dur_ms > 0) {
                 fmt_dur(buf, sizeof(buf), t->dur_ms);
                 draw_right_clip(fb, y + 22, buf, CONTENT_Y, clip_bot);
             }
@@ -2388,7 +2674,7 @@ static void draw_screen(uint16_t *fb) {
         }
         if (sheet_note[0] && !mini_visible()) {
             draw_text(fb, 24, FB_H - 34, sheet_note, COL_ACCENT, TEXT_PX_SMALL, FB_W - 48);
-        } else if (track_n > 0 && !mini_visible() && !ab_list) {
+        } else if (track_n > 0 && !mini_visible() && !ab_list && !pod_list) {
             /* Chapters (audiobook_mode) reuses this screen but never the SQL
              * index -- t->format/bits/rate are never populated for them (see
              * audiobook.h), so this line would show a meaningless "FLAC
@@ -2398,6 +2684,23 @@ static void draw_screen(uint16_t *fb) {
                      track_format_name(t), t->bits, t->rate / 1000.0);
             draw_text(fb, 24, FB_H - 34, buf, COL_ACCENT, TEXT_PX_SMALL, FB_W - 24);
         }
+        return;
+    }
+
+    if (screen == SC_POD_SYNC) {
+        draw_text(fb, 24, y + 6, pod_update_running() ? "Syncing every feed..."
+                                : pod_update_died()    ? "Sync stopped early."
+                                                        : "Sync finished.",
+                  pod_update_died() ? RGB(230, 80, 70) : COL_DIM, TEXT_PX_BODY, FB_W - 48);
+        y += 46;
+        fill_rect(fb, 0, y - 1, FB_W, 1, COL_LINE);
+        for (int i = 0; i < pod_sync_log_n; i++) {
+            draw_text_clip(fb, 24, y + 14, pod_sync_log[i], COL_TEXT, TEXT_PX_SMALL,
+                           FB_W - 48, CONTENT_Y, clip_bot);
+            y += 40;
+        }
+        if (pod_sync_log_n == 0)
+            draw_text(fb, 24, y + 14, "Starting...", COL_DIM, TEXT_PX_SMALL, FB_W - 48);
         return;
     }
 
@@ -2835,11 +3138,23 @@ static int read_gesture(int fd, int *ox, int *oy) {
  * drift apart. Returns 0 when there is nowhere left to go, which at the top
  * level means leaving the app. */
 static int go_back(void) {
+    /* Show notes intercept, not guard: closing them has to happen *here*,
+     * ahead of everything else below, so both ways into "back" -- the edge
+     * swipe and the header BACK control, which both just call go_back() --
+     * close the notes first rather than leaving the player under them. Same
+     * "one definition of back" property the function comment above is
+     * about, just extended to a second thing back can mean on this screen. */
+    if (screen == SC_PLAYING && podcast_mode && pod_notes_showing) {
+        pod_notes_showing = 0;
+        return 1;
+    }
     /* Every way out of a screen goes through here, including all the way
      * out of the app (SC_MENU returning 0), so this is the one place that
      * needs to know about leaving rather than every call site. A no-op
-     * whenever a book isn't what's playing. */
+     * whenever a book isn't what's playing. Likewise pod_save_current_pos()
+     * for an episode. */
     ab_save_current_pos();
+    pod_save_current_pos();
     switch (screen) {
         case SC_MENU:
             return 0;
@@ -2862,12 +3177,28 @@ static int go_back(void) {
              * would overwrite it with the wrong one. */
             if (!played_from_browse)
                 snprintf(albums_artist, sizeof(albums_artist), "%s", q_artist);
+            /* q_album is deliberately left empty for a podcast episode (see
+             * pod_play_episode()) so the feed name has to come from
+             * cur_feed instead -- otherwise SC_TRACKS's header would show a
+             * blank title. And unlike a book's chapters, the queue copy above
+             * is NOT the full episode list here -- podcast_mode's queue is
+             * deliberately just the one playing episode (see its comment), so
+             * "back" has to re-fetch the feed rather than mirror the queue,
+             * or the list would collapse to a single row. */
+            if (podcast_mode) {
+                snprintf(cur_album, sizeof(cur_album), "%s", cur_feed);
+                pod_ep_n = pod_load_episodes(cur_feed, pod_eps, POD_MAX_ITEMS);
+                pod_rebuild_tracks();
+            }
             ab_list = audiobook_mode;
+            pod_list = podcast_mode;
+            pod_notes_showing = 0;
             screen = SC_TRACKS;
             reset_scroll();
             break;
         case SC_RADIO:
         case SC_AUDIOBOOKS:
+        case SC_PODCASTS:
         case SC_EQ:
         case SC_MSEB:
         case SC_SETTINGS:
@@ -2882,6 +3213,16 @@ static int go_back(void) {
             break;
         case SC_EQ_BANDS:
             screen = SC_EQ; reset_scroll();
+            break;
+        case SC_POD_SYNC:
+            /* Refreshed the same way opening Podcasts does -- a sync that's
+             * still running when the reader backs out of watching it may
+             * finish moments later with new feeds or episodes on disk that
+             * this list hasn't seen yet. */
+            screen = SC_PODCASTS; reset_scroll();
+            pod_feed_n = pod_scan_feeds(pod_feeds, POD_MAX_FEEDS);
+            pod_rebuild_rows();
+            total = pod_feed_n;
             break;
         case SC_SETTINGS_THEME:
         case SC_SETTINGS_ABOUT:
@@ -2922,7 +3263,12 @@ static int go_back(void) {
              * (when audiobook_mode) as Chapters -- same screen, same data
              * shape, but "back" has to land somewhere that makes sense for
              * whichever it is, not always the SQL album browser. */
-            if (ab_list) {
+            if (pod_list) {
+                screen = SC_PODCASTS; reset_scroll();
+                pod_feed_n = pod_scan_feeds(pod_feeds, POD_MAX_FEEDS);
+                pod_rebuild_rows();
+                total = pod_feed_n;
+            } else if (ab_list) {
                 screen = SC_AUDIOBOOKS; reset_scroll();
                 ab_book_n = ab_scan_books(ab_books, AB_MAX_BOOKS);
                 ab_rebuild_rows();
@@ -3771,11 +4117,13 @@ static int handle_keys(int fd, key_src_t src) {
             switch (ev.code) {
                 case KEY_PLAYPAUSE_:            /* the skip-forward button */
                     if (audiobook_mode) ab_play_chapter(cur_track + 1);
+                    else if (podcast_mode) audio_seek_ms(audio_pos_ms() + 30000);
                     else                play_index(cur_track + 1);
                     acted = 1; break;
                 case KEY_NEXTSONG_:             /* the skip-back button */
                 case KEY_PREVSONG_:
                     if (audiobook_mode) ab_play_chapter(cur_track - 1);
+                    else if (podcast_mode) audio_seek_ms(audio_pos_ms() - 30000);
                     else if (audio_pos_ms() > 3000) audio_seek_ms(0);
                     else play_index(cur_track - 1);
                     acted = 1;
@@ -3802,12 +4150,15 @@ static int handle_keys(int fd, key_src_t src) {
                 break;
             case KEY_NEXTSONG_:
                 if (audiobook_mode) ab_play_chapter(cur_track + 1);
+                else if (podcast_mode) audio_seek_ms(audio_pos_ms() + 30000);
                 else                play_index(cur_track + 1);
                 acted = 1;
                 break;
             case KEY_PREVSONG_:
                 /* Same rule as every other player: part-way in, previous means
-                 * back to the start of this track — or of this chapter. */
+                 * back to the start of this track — or of this chapter. A
+                 * podcast episode instead gets the same +/-30s ad-skip as its
+                 * on-screen transport (see the tap handler's comment). */
                 if (audiobook_mode) {
                     const ab_chapter_t *ch =
                         (cur_track >= 0 && cur_track < ab_book.chap_n)
@@ -3815,6 +4166,8 @@ static int handle_keys(int fd, key_src_t src) {
                     int64_t into = audio_pos_ms() - (ch ? ch->file_start_ms : 0);
                     if (into > 3000) audio_seek_ms((int)(ch ? ch->file_start_ms : 0));
                     else ab_play_chapter(cur_track - 1);
+                } else if (podcast_mode) {
+                    audio_seek_ms(audio_pos_ms() - 30000);
                 } else if (audio_pos_ms() > 3000) {
                     audio_seek_ms(0);
                 } else {
@@ -4058,6 +4411,18 @@ int music_entry(void *a0, void *a1) {
                  * a gap is otherwise only findable by ear. */
                 mlog("[music] fell back to restart at track %d\n", cur_track + 1);
                 play_index(cur_track + 1);
+            } else if (podcast_mode && cur_track >= 0 && cur_track < queue_n) {
+                /* An episode is never queued alongside a next one (see
+                 * podcast_mode's comment), so reaching the end just stops --
+                 * marked finished right away rather than left for the next
+                 * periodic save, so reopening it immediately after shows it
+                 * as done instead of resuming one tick's worth from the end.
+                 * Not pod_save_current_pos(): audio_is_active() is already
+                 * false here (that's what this whole block is gated on), and
+                 * pod_save_current_pos() deliberately no-ops in that state --
+                 * same reason ab_save_current_pos() has to be called before a
+                 * stop, not after. */
+                pod_resume_store(queue[cur_track].path, POD_FINISHED, 0);
             }
         }
         /* Also opened on a completed drag, not only by following the finger
@@ -4135,7 +4500,9 @@ int music_entry(void *a0, void *a1) {
             dirty = 1; idle = 0;
         } else if (g == 3) {
             /* Swipe in from the left edge: the way out of the player, which
-             * otherwise only offered the queue. */
+             * otherwise only offered the queue. go_back() itself closes show
+             * notes first when they're open, rather than leaving the player
+             * under them -- see its own comment. */
             if (!go_back()) running = 0;
             dirty = 1; idle = 0;
         } else if (index_visible() && touch_x >= FB_W - INDEX_TOUCH_W &&
@@ -4246,6 +4613,16 @@ int music_entry(void *a0, void *a1) {
             } else if (screen == SC_PLAYING && radio_mode && y >= STATUS_H) {
                 int cyy = 120 + 190;
                 if (y > cyy - 48 && y < cyy + 48) audio_toggle();
+            } else if (screen == SC_PLAYING && podcast_mode && pod_notes_avail &&
+                       y >= 16 && y < 52 && x >= FB_W - 52 && x < FB_W - 16) {
+                /* The info circle, top right of the art -- toggles show
+                 * notes in place of the cover. Checked ahead of the queue
+                 * corner / bar / transport zone below since it sits well
+                 * clear of all of them (near the top, they're all near the
+                 * bottom or mid-screen), but a dedicated branch is clearer
+                 * than folding a fourth special case into that one. */
+                pod_notes_showing = !pod_notes_showing;
+                pod_notes_scroll_px = 0;
             } else if (screen == SC_PLAYING && y >= STATUS_H) {
                 /* The queue control sits in the corner the header used to own. */
                 if (y > FB_H - 56 && x > FB_W - 76) { go_back(); }
@@ -4264,13 +4641,40 @@ int music_entry(void *a0, void *a1) {
 
                 int cyy = bary + 70;      /* BG40: matches the draw-side offset */
                 if (y > cyy - 48 && y < cyy + 48) {
-                    if (x < FB_W / 3)            play_index(cur_track - 1);
-                    else if (x > 2 * FB_W / 3)   play_index(cur_track + 1);
-                    else                          audio_toggle();
+                    /* A podcast episode is never queued alongside a next one
+                     * (see podcast_mode's comment), so the side zones are
+                     * +/-30s skip instead of prev/next track -- explicitly
+                     * kept distinct from the audiobook screen's +/-10s (see
+                     * BACKLOG.md's L5 entry): 30s is sized for skipping ads,
+                     * 10s for finding your place in narration. */
+                    if (podcast_mode) {
+                        if (x < FB_W / 3)            audio_seek_ms(audio_pos_ms() - 30000);
+                        else if (x > 2 * FB_W / 3)   audio_seek_ms(audio_pos_ms() + 30000);
+                        else                          audio_toggle();
+                    } else {
+                        if (x < FB_W / 3)            play_index(cur_track - 1);
+                        else if (x > 2 * FB_W / 3)   play_index(cur_track + 1);
+                        else                          audio_toggle();
+                    }
                 }
                 }
             } else if (y < CONTENT_Y) {
-                if (x > FB_W - 120) go_back();
+                /* mseb_reset_x()/pod_sync_x()'s own on-screen position sits
+                 * well left of the old fixed "FB_W - 120" boundary these
+                 * zones used to end at, which left a dead strip between the
+                 * end of "Reset"/"Sync" and where that boundary began --
+                 * landing there fell through to the BACK-zone check below
+                 * and quietly left the screen instead of hitting the button.
+                 * header_back_x() - 16 is precise: it reaches right up to
+                 * where BACK's own zone actually starts. */
+                if (screen == SC_MSEB && x >= mseb_reset_x() - 16 && x < header_back_x() - 16) {
+                    for (int i = 0; i < MSEB_BAND_N; i++) mseb_gain[i] = 0.0f;
+                    eq_set_mseb(mseb_on, mseb_gain);
+                    mseb_save(mseb_gain, mseb_on);
+                } else if (screen == SC_PODCASTS && x >= pod_sync_x() - 16 && x < header_back_x() - 16) {
+                    if (!pod_update_running()) { pod_update_start(); pod_sync_log_n = 0; }
+                    screen = SC_POD_SYNC; reset_scroll();
+                } else if (x > FB_W - 120) go_back();
             } else if (index_visible() && x >= FB_W - INDEX_TOUCH_W && y >= CONTENT_Y &&
                        y < index_bottom()) {
                 index_jump(y);
@@ -4287,6 +4691,11 @@ int music_entry(void *a0, void *a1) {
                     if (x > MINI_ZONE_SIDE)      audio_seek_ms(audio_pos_ms() + 10000);
                     else if (x > MINI_ZONE_PLAY) audio_toggle();
                     else if (x > MINI_ZONE_BACK) audio_seek_ms(audio_pos_ms() - 10000);
+                    else                          screen = SC_PLAYING;
+                } else if (podcast_mode) {
+                    if (x > MINI_ZONE_SIDE)      audio_seek_ms(audio_pos_ms() + 30000);
+                    else if (x > MINI_ZONE_PLAY) audio_toggle();
+                    else if (x > MINI_ZONE_BACK) audio_seek_ms(audio_pos_ms() - 30000);
                     else                          screen = SC_PLAYING;
                 } else {
                     if (x > MINI_ZONE_SIDE)      play_index(cur_track + 1);
@@ -4409,6 +4818,12 @@ int music_entry(void *a0, void *a1) {
                         screen = SC_AUDIOBOOKS; reset_scroll();
                         total = ab_book_n;
                         mlog("[music] %d audiobooks\n", ab_book_n);
+                    } else if (idx == TOP_PODCASTS) {
+                        pod_feed_n = pod_scan_feeds(pod_feeds, POD_MAX_FEEDS);
+                        pod_rebuild_rows();
+                        screen = SC_PODCASTS; reset_scroll();
+                        total = pod_feed_n;
+                        mlog("[music] %d podcast feeds\n", pod_feed_n);
                     } else if (idx == TOP_EQ) {
                         eq_profile_n = ep_scan(eq_profiles, EP_MAX_PROFILES);
                         /* First visit this session, nothing chosen yet: load
@@ -4492,7 +4907,20 @@ int music_entry(void *a0, void *a1) {
                     load_page();
                     mlog("[music] %s -> %d albums\n", cur_artist, total);
                 } else if (screen == SC_TRACKS && scroll + idx < track_n) {
-                    if (ab_list) {
+                    if (pod_list) {
+                        /* This list is one feed's episodes. An undownloaded
+                         * one starts its download instead of playing --
+                         * nothing to play yet -- one at a time, same as the
+                         * whole-feed sync below. */
+                        int pi = scroll + idx;
+                        if (pod_eps[pi].downloaded) {
+                            audio_set_speed(1000);
+                            screen = SC_PLAYING;
+                            pod_play_episode(pi);
+                        } else if (!pod_download_active()) {
+                            pod_download_start(pi);
+                        }
+                    } else if (ab_list) {
                         /* This list is the book's chapters. */
                         screen = SC_PLAYING;
                         ab_play_chapter(scroll + idx);
@@ -4519,6 +4947,7 @@ int music_entry(void *a0, void *a1) {
                     cur_artist[0] = '\0';
                     screen = SC_TRACKS; reset_scroll();
                     ab_list = 0;
+                    pod_list = 0;
                     mlog("[music] playlist %s: %d of %d found\n",
                          playlists[scroll + idx].name, track_n, got);
                 } else if (screen == SC_RADIO && scroll + idx < station_n) {
@@ -4547,6 +4976,7 @@ int music_entry(void *a0, void *a1) {
                     albums_scroll_px_saved = scroll_px;
                     screen = SC_TRACKS; reset_scroll();
                     ab_list = 0;
+                    pod_list = 0;
                     track_n = lib_tracks_for_album(cur_artist, cur_album,
                                                    tracks, (int)(sizeof(tracks)/sizeof(tracks[0])));
                     mlog("[music] %s -> %d tracks\n", cur_album, track_n);
@@ -4562,6 +4992,16 @@ int music_entry(void *a0, void *a1) {
                     ab_resume_book();
                     mlog("[music] %s -> %d chapters in %d file(s)\n",
                          cur_album, ab_book.chap_n, ab_book.file_n);
+                } else if (screen == SC_PODCASTS && scroll + idx < pod_feed_n) {
+                    snprintf(cur_feed, sizeof(cur_feed), "%s", pod_feeds[scroll + idx].name);
+                    pod_ep_n = pod_load_episodes(cur_feed, pod_eps, POD_MAX_ITEMS);
+                    pod_rebuild_tracks();
+                    snprintf(cur_album, sizeof(cur_album), "%s", cur_feed);
+                    cur_artist[0] = '\0';
+                    screen = SC_TRACKS; reset_scroll();
+                    ab_list = 0;
+                    pod_list = 1;
+                    mlog("[music] %s -> %d episodes\n", cur_feed, pod_ep_n);
                 } else if (screen == SC_EQ_BANDS && scroll + idx < eq_cur.band_n) {
                     /* The toggle's own strip (matching where it's drawn)
                      * flips the band without leaving the list; anywhere else
@@ -4609,7 +5049,32 @@ int music_entry(void *a0, void *a1) {
          * is trusting a clean exit, and a battery pull or a crash is exactly
          * what this exists to survive. Once every ~15s: cheap enough not to
          * matter, infrequent enough not to wear the card writing it. */
-        if (++ab_pos_tick >= 450) { ab_pos_tick = 0; ab_save_current_pos(); }
+        if (++ab_pos_tick >= 450) { ab_pos_tick = 0; ab_save_current_pos(); pod_save_current_pos(); }
+
+        /* Podcast downloads and whole-feed syncs both run as detached child
+         * processes (see podcast.c) -- polled and reaped every tick, cheap
+         * when idle since both are no-ops with nothing running. A completed
+         * download re-reads the feed from disk rather than patching pod_eps[]
+         * in place, the same one-shot recompute pattern SC_AUDIOBOOKS/
+         * SC_PODCASTS already use after a rescan. */
+        if (pod_download_poll() == 1 && pod_list) {
+            pod_ep_n = pod_load_episodes(cur_feed, pod_eps, POD_MAX_ITEMS);
+            pod_rebuild_tracks();
+            dirty = 1;
+        }
+        pod_update_reap();
+        if (pod_update_running()) {
+            pod_sync_log_n = pod_update_tail(pod_sync_log, POD_SYNC_LOG_N);
+            if (!pod_update_running() && (screen == SC_PODCASTS || screen == SC_POD_SYNC)) {
+                /* Just finished: the feed list on screen may have new
+                 * subfolders (a brand new feed) or new manifest-only
+                 * episodes -- refresh it the same way opening Podcasts does. */
+                pod_feed_n = pod_scan_feeds(pod_feeds, POD_MAX_FEEDS);
+                pod_rebuild_rows();
+                total = pod_feed_n;
+            }
+            dirty = 1;
+        }
 
         /* Pulling the headphones out should not carry on broadcasting to the
          * room. Only for the wired route — unplugging the jack says nothing
@@ -4828,6 +5293,29 @@ int music_entry(void *a0, void *a1) {
             list_velocity *= 0.90f;     /* friction: dead within about a second */
             if (list_velocity < 0.6f && list_velocity > -0.6f) inertia_active = 0;
             idle = 0;
+        }
+
+        /* Show-notes scrolling: no inertia, no row snapping -- it's free text
+         * in a fixed box, not a list, so the plain drag-follows-the-finger
+         * half of the list-scrolling trick above is all this needs. Clamped
+         * to [0, a generous upper bound] rather than measured exactly against
+         * the wrapped text's real height, which pod_draw_notes() only knows
+         * mid-draw -- an 8KB buffer can't wrap past roughly this many pixels
+         * of lines, so overscroll into blank space is bounded, not unbounded. */
+        {
+            int notes_active = screen == SC_PLAYING && podcast_mode && pod_notes_showing;
+            int was = pod_notes_dragging;
+            pod_notes_dragging = touch_down && notes_active && touch_y < ART_PX;
+            if (pod_notes_dragging && !was) {
+                pod_notes_down_y = live_y;
+                pod_notes_start_px = pod_notes_scroll_px;
+            } else if (pod_notes_dragging) {
+                int px = pod_notes_start_px + (pod_notes_down_y - live_y);
+                if (px < 0) px = 0;
+                if (px > 6000) px = 6000;
+                if (px != pod_notes_scroll_px) { pod_notes_scroll_px = px; dirty = 1; }
+                idle = 0;
+            }
         }
 
         /* Dragging a long title sideways. Relative, not absolute: the string

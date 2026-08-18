@@ -1025,10 +1025,6 @@ static void *pcm_open(unsigned rate, int channels, int deep, int want_fmt) {
         names[count] = plug;  fmts[count++] = FMT_S16_LE;     /* last resort */
     }
 
-    /* Negotiated buffer depth, carried out of the loop for the start_threshold
-     * decision below. Zero means the query was unavailable or failed. */
-    unsigned long bufsz = 0;
-
     for (unsigned i = 0; i < count; i++) {
         if (x_open(&pcm, names[i], SND_PCM_STREAM_PLAYBACK, 0) < 0 || !pcm) {
             pcm = NULL;
@@ -1054,15 +1050,6 @@ static void *pcm_open(unsigned rate, int channels, int deep, int want_fmt) {
         /* Which *device* was opened, not which index: the exact device now has
          * two candidate formats, so "i == 0" no longer means bit-perfect. Both
          * entries point at the same `exact` buffer, so this compares pointers. */
-        /* Must be read before x_hwp_free() below. Optional symbol (dlsym'd
-         * without SYM's hard failure), so both the pointer and the return
-         * value are checked -- a miss just leaves bufsz at 0 and the
-         * threshold decision falls back to the old behaviour. */
-        if (x_hwp_get_buffer_size) {
-            unsigned long bs = 0;
-            if (x_hwp_get_buffer_size(hw, &bs) >= 0 && bs > 0) bufsz = bs;
-        }
-
         g_exact = (!use_bt && names[i] == exact);
         g_out_fmt = fmts[i];
         g_out_rate = r;
@@ -1080,37 +1067,14 @@ static void *pcm_open(unsigned rate, int channels, int deep, int want_fmt) {
      * happily, took about eleven seconds of audio, and then parked forever in
      * wait_for_avail: the stream never started, so nothing ever drained. */
 
-    /* start_threshold 1 -- begin playing as soon as there is a frame rather
-     * than waiting for the buffer to fill -- is right for the internal DAC and
-     * for USB, where the transport has no jitter worth a cushion and the only
-     * thing a threshold buys is startup latency.
-     *
-     * It is wrong for A2DP. snd_pcm_recover() calls prepare(), which returns
-     * the stream to the un-started state, so with a threshold of 1 every
-     * recovery restarts playback on an empty buffer with no cushion at all --
-     * straight back to the edge of underrun on a transport that has real
-     * jitter. That turns a single dropout into a self-sustaining loop, which
-     * is what the log shows: underruns arriving not scattered but at a
-     * metronomic ~10/sec, thousands in a row (#129 through #2177 in one
-     * stretch), rather than the random spacing an external cause would give.
-     *
-     * Over Bluetooth, wait for the whole negotiated buffer instead. Costs up
-     * to one buffer of latency at track start and once per recovery -- a
-     * single gap, against a continuous stutter -- on a path that already
-     * carries a couple of hundred ms of transport latency regardless.
-     *
-     * Note this is not a difference from open_hiby_player, which sets no
-     * sw_params and so takes alsa-lib's default: that default is also 1. It
-     * is a fix on its own merits, not a missed trick from another player. */
+    /* start_threshold 1: begin playing as soon as there is a frame, rather
+     * than waiting for the buffer to fill. */
     void *sw = NULL;
     if (x_swp_malloc(&sw) >= 0 && sw) {
-        unsigned long thresh = (use_bt && bufsz > 0) ? bufsz : 1;
         x_swp_current(pcm, sw);
-        x_swp_set_start_threshold(pcm, sw, thresh);
+        x_swp_set_start_threshold(pcm, sw, 1);
         x_swp_apply(pcm, sw);
         x_swp_free(sw);
-        if (thresh > 1)
-            alog("[audio] start_threshold %lu frames (bt cushion)\n", thresh);
     }
     x_prepare(pcm);
     return pcm;
@@ -1207,6 +1171,34 @@ static void *write_pcm_frames(void *pcm, const char *p, snd_pcm_uframes_t left,
     return pcm;
 }
 
+/* The nice -8 above, but only when the output is NOT Bluetooth -- call after
+ * every pcm_open(), since only then is g_out_kind known, and the route can
+ * change mid-playback (jack plugged in, headset connected).
+ *
+ * On Bluetooth the encoder is a separate process. bluealsa does the LDAC
+ * encode on this same single core, to its own hard realtime deadline, and it
+ * sits *downstream* of us: starving it corrupts audio that has already left
+ * this process, where nothing here can clamp, dither or otherwise defend it.
+ * At nice -8 this thread wins every scheduling tie against that encoder, and
+ * every CPU-hungry thing added since (the EQ, WSOLA, the icon blits) takes
+ * its share from the encoder's slice rather than ours -- which is exactly
+ * the shape of a fault that grows more frequent as the app grows, on
+ * Bluetooth only, regardless of whether the EQ is even enabled.
+ *
+ * Nothing is given up by skipping it there. The boost exists for 96 kHz
+ * 24-bit decode running near realtime (BG12: 93% of one core); Bluetooth is
+ * rate-capped by bt_target_rate() and forced to S16_LE, and the logs show
+ * decode at 3-13% of one core on that path. This was outranking the encoder
+ * to protect headroom that was never in short supply. */
+static void apply_decode_priority(void) {
+    int bt = (g_out_kind == 2);
+    int want = bt ? 0 : -8;
+    if (setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), want) != 0)
+        alog("[audio] could not set decode priority %d\n", want);
+    else
+        alog("[audio] decode priority nice %d (%s)\n", want, bt ? "bt" : "local");
+}
+
 static void *worker(void *arg) {
     (void)arg;
 
@@ -1225,9 +1217,10 @@ static void *worker(void *arg) {
      * Niced up rather than SCHED_FIFO deliberately: this thread's write-retry
      * path can spin if recovery keeps failing, and a spinning realtime thread
      * on one core would lock the device out entirely -- far worse than the
-     * bug. A negative nice still gets preempted; it only wins the tie. */
-    if (setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), -8) != 0)
-        alog("[audio] could not raise decode priority\n");
+     * bug. A negative nice still gets preempted; it only wins the tie.
+     *
+     * Applied by apply_decode_priority() after the route is known rather than
+     * here, because it must NOT apply on Bluetooth -- see that function. */
 
     dec_t *d = &g_dec_slot[0];
     int slot = 0;
@@ -1247,6 +1240,7 @@ static void *worker(void *arg) {
     /* 24-bit sources are opened as S24_LE; everything else is 16 either way. */
     int want_fmt = (d->bits > 16) ? FMT_S24_LE : FMT_S16_LE;
     void *pcm = pcm_open(rate, ch, d->is_stream, want_fmt);
+    apply_decode_priority();
     if (!pcm) {
         dec_close(d);
         pthread_mutex_lock(&g_lock);
@@ -1340,6 +1334,7 @@ static void *worker(void *arg) {
                     pcm = pcm_open(rate, ch, d->is_stream,
                                    (d->bits > 16) ? FMT_S24_LE : FMT_S16_LE);
                     if (pcm) {
+                        apply_decode_priority();
                         hires = dec_is_wide(d) && g_out_kind != 2;
                         src_wide = dec_is_wide(d);
                         frame_bytes = hires ? (size_t)ch * 4 : (size_t)ch * sizeof(short);
@@ -1389,6 +1384,7 @@ static void *worker(void *arg) {
          * expects to happen. */
         if (!pcm) {
             pcm = pcm_open(rate, ch, d->is_stream, want_fmt);
+            if (pcm) apply_decode_priority();
             if (!pcm) {
                 alog("[audio] no output to resume on; staying paused\n");
                 pthread_mutex_lock(&g_lock);
@@ -1423,6 +1419,7 @@ static void *worker(void *arg) {
                 x_drop(pcm); x_close(pcm);
                 pcm = pcm_open(rate, ch, d->is_stream, want_fmt);
                 if (!pcm) break;
+                apply_decode_priority();
                 hires = dec_is_wide(d) && g_out_kind != 2;
                 src_wide = dec_is_wide(d);
                 frame_bytes = hires ? (size_t)ch * 4 : (size_t)ch * sizeof(short);
@@ -1565,6 +1562,7 @@ static void *worker(void *arg) {
                 want_fmt = hires ? FMT_S24_LE : FMT_S16_LE;
                 pcm = pcm_open(rate, ch, d->is_stream, want_fmt);
                 if (!pcm) break;
+                apply_decode_priority();
                 hires = hires && g_out_kind != 2;
                 eff_rate = g_out_rate;
                 eq_set_format(eff_rate, ch);
