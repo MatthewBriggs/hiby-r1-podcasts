@@ -50,9 +50,16 @@ static boolean (*x_finish)(j_decompress_ptr);
 static void (*x_destroy)(j_decompress_ptr);
 static void (*x_calc_dims)(j_decompress_ptr);
 
-/* Roughly half the free memory on an idle device, so a decode cannot crowd out
- * the player even at the worst moment. Anything larger loses its thumbnail. */
-#define COVER_MEM_BUDGET  (8 * 1024 * 1024)
+/* Was 8 MB, which rejected a perfectly ordinary 1400x1400 progressive cover
+ * (Apple's own documented *minimum* recommended podcast artwork size) --
+ * its coefficient array alone is 1400*1400*3*sizeof(JCOEF) = ~11.2 MB,
+ * comfortably over the old budget. 14 MB admits that (and a bit more
+ * headroom for slight variations) while staying nowhere near the
+ * documented OOM case this budget exists to prevent: 3000x3000 needs
+ * ~54 MB, still refused by a wide margin. Still roughly half the free
+ * memory on an idle device, so a decode cannot crowd out the player even
+ * at the worst moment; anything larger loses its thumbnail. */
+#define COVER_MEM_BUDGET  (14 * 1024 * 1024)
 #define COVER_MAX_DIM     8000
 
 static int g_tried;
@@ -108,9 +115,22 @@ static void on_message(j_common_ptr cinfo) { (void)cinfo; }   /* stay quiet */
  * anyway. */
 #define COVER_CACHE_DIR "/data/mnt/sd_0/.music_covers"
 
+/* Folded into the hash below so a change to what cover_load() actually
+ * produces -- like BG46's center-crop fix -- can't go on serving stale
+ * pre-change bitmaps forever. The staleness check in cover_cached()/
+ * load_cache() only compares against the source JPEG/folder's own mtime,
+ * which has no way to know the *code* that turned those bytes into pixels
+ * changed underneath it; a bumped version here is what actually invalidates
+ * every existing cache entry (they simply become unreachable orphans,
+ * cleaned up over time by prune_cache()'s normal LRU pruning). Bump this
+ * again any time cover_load()'s pixel output changes. */
+#define CACHE_VERSION "2"
+
 static void cache_path(const char *key, int px, char *out, size_t n) {
     unsigned long h = 5381;
     for (const unsigned char *p = (const unsigned char *)key; *p; p++)
+        h = ((h << 5) + h) ^ *p;
+    for (const unsigned char *p = (const unsigned char *)CACHE_VERSION; *p; p++)
         h = ((h << 5) + h) ^ *p;
     mkdir(COVER_CACHE_DIR, 0755);
     snprintf(out, n, "%s/%08lx.%d.r565", COVER_CACHE_DIR, h & 0xFFFFFFFFul, px);
@@ -265,6 +285,27 @@ uint16_t *cover_load(const char *jpeg_path, const char *cache_key, int px) {
         cinfo.image_width == 0 || cinfo.image_height == 0)
         longjmp(jerr.jump, 1);
 
+    /* BG46 follow-up: decline a source smaller than the target in either
+     * dimension rather than upscale it. Found live on a real file (a
+     * podcast episode's 320x320 embedded thumbnail, blown up to this
+     * screen's 480x480 Now Playing art): confirmed via direct instrumented
+     * logging of raw decoded bytes that this device's libjpeg9 returned
+     * literal zero-byte scanlines for whole interior row-bands on that
+     * file, with jpeg_read_scanlines still reporting success throughout
+     * and no warning raised -- a genuine device-library decode defect, not
+     * a bug in this file's own box-filter math (which was separately
+     * audited and fixed for a real off-by-something in the same session,
+     * but did not explain this). Declining it here falls through to
+     * art_candidate()'s next slot -- typically the feed's own folder
+     * image, usually higher-resolution than an embedded thumbnail anyway
+     * -- with no extra wiring needed, since the caller's retry loop
+     * already treats a NULL cover_load() as "try the next candidate". A
+     * blown-up-1.5x thumbnail was never going to look sharp regardless of
+     * the device bug, so this is the right call on image-quality grounds
+     * even for a file that wouldn't have hit it. */
+    if ((int)cinfo.image_width < px || (int)cinfo.image_height < px)
+        longjmp(jerr.jump, 1);
+
     if (cinfo.progressive_mode) {
         int64_t coeffs = (int64_t)cinfo.image_width * cinfo.image_height *
                          (cinfo.num_components > 0 ? cinfo.num_components : 3) *
@@ -328,28 +369,55 @@ uint16_t *cover_load(const char *jpeg_path, const char *cache_key, int px) {
     }
 
     int next_src_row = 0;
+    int rows = 0;        /* source rows currently folded into racc/gacc/bacc */
+    int have_rows = 0;   /* whether racc/gacc/bacc hold anything real yet */
     for (int y = 0; y < px; y++) {
         int row_end = (int)((int64_t)(y + 1) * side / px);
-        if (row_end <= next_src_row) row_end = next_src_row + 1;   /* upscaling: >=1 row */
         if (row_end > side) row_end = side;
 
-        memset(racc, 0, (size_t)w * sizeof(long));
-        memset(gacc, 0, (size_t)w * sizeof(long));
-        memset(bacc, 0, (size_t)w * sizeof(long));
-        int rows = 0;
-        while (next_src_row < row_end && cinfo.output_scanline < cinfo.output_height) {
-            JSAMPROW rp = row;
-            x_read_scanlines(&cinfo, &rp, 1);
-            for (int sx = 0; sx < w; sx++) {
-                const JSAMPLE *p = row + (size_t)sx * comps;
-                racc[sx] += p[0];
-                gacc[sx] += comps > 1 ? p[1] : p[0];
-                bacc[sx] += comps > 2 ? p[2] : p[0];
+        /* Upscaling (side < px, an embedded thumbnail smaller than the
+         * target size -- routine for a podcast episode's own art, unlike
+         * the large album covers this box-filter was written for) means
+         * row_end often does not advance past next_src_row for several
+         * consecutive output rows in a row: several output rows legitimately
+         * share the same single source row. The old code forced at least
+         * one new source row to be read on *every* output row regardless
+         * ("upscaling: >=1 row"), which is wrong -- it drained the source
+         * roughly px/side times faster than it should, so the source ran
+         * out with a third or more of the output still unwritten, and
+         * those remaining rows silently divided a freshly-zeroed
+         * accumulator by a forced rows=1, i.e. rendered solid black. The
+         * fix: only start a new accumulation window (and only force a
+         * single row's worth of real data) when there is genuinely new
+         * source data to fold in, or nothing has been read yet at all;
+         * otherwise simply reuse racc/gacc/bacc/rows as they already are
+         * from the last output row that did read something. */
+        if (row_end > next_src_row || !have_rows) {
+            if (row_end <= next_src_row) row_end = next_src_row + 1;
+            if (row_end > side) row_end = side;
+
+            memset(racc, 0, (size_t)w * sizeof(long));
+            memset(gacc, 0, (size_t)w * sizeof(long));
+            memset(bacc, 0, (size_t)w * sizeof(long));
+            rows = 0;
+            while (next_src_row < row_end && cinfo.output_scanline < cinfo.output_height) {
+                JSAMPROW rp = row;
+                x_read_scanlines(&cinfo, &rp, 1);
+                for (int sx = 0; sx < w; sx++) {
+                    const JSAMPLE *p = row + (size_t)sx * comps;
+                    racc[sx] += p[0];
+                    gacc[sx] += comps > 1 ? p[1] : p[0];
+                    bacc[sx] += comps > 2 ? p[2] : p[0];
+                }
+                next_src_row++;
+                rows++;
             }
-            next_src_row++;
-            rows++;
+            if (rows == 0) rows = 1;   /* source exhausted; average of nothing is 0, not a crash */
+            have_rows = 1;
         }
-        if (rows == 0) rows = 1;   /* source exhausted; average of nothing is 0, not a crash */
+        /* else: no new source row for this output row -- racc/gacc/bacc/
+         * rows are exactly what the last output row that did read left
+         * them as, which is exactly what an upscaled row should show. */
 
         for (int x = 0; x < px; x++) {
             int col_start = x_off + (int)((int64_t)x * side / px);

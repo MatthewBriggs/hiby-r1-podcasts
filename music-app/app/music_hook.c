@@ -771,15 +771,18 @@ static int pod_sync_x(void) {
     return header_back_x() - 20 - sync_w;
 }
 
-/* BG47: offsets of the podcast player's skip arcs from the transport row's
- * centre -- shared between the draw code and the tap handler, same reason
- * bar_y() is a function rather than a repeated literal. OFF1 is +/-10s,
- * OFF2 is +/-30s. */
-#define POD_SKIP_OFF1 65
-#define POD_SKIP_OFF2 125
-/* Centre x of the podcast speed ring, left of the -30s arc with the same
- * gap the audiobook screen's own ring leaves before its nearer skip arc. */
-static int pod_speed_x(int mid) { return mid - POD_SKIP_OFF2 - 50; }
+/* BG47 (revised): just two skip arcs now, -10s left of play/pause and +30s
+ * right of it -- not the symmetric +/-10/+/-30 four-button set this
+ * started as. 96, not the original 70: matches the audiobook screen's own
+ * skip-arc offset exactly, per explicit request to space these out the
+ * same way that screen does. Offset shared between the draw code and the
+ * tap handler, same reason bar_y() is a function rather than a repeated
+ * literal. */
+#define POD_SKIP_OFF 96
+/* Centre x of the podcast speed ring -- mid - 96 - 70, exactly the
+ * audiobook screen's own scx formula (see its comment: "96 must match the
+ * skip rings' offset above"), not just the same gap. */
+static int pod_speed_x(int mid) { return mid - POD_SKIP_OFF - 70; }
 
 /* How long the device may sit locked with nothing playing before it goes into
  * its low-power idle. Minutes, and 0 means never. Declared up here with the
@@ -2552,28 +2555,24 @@ static void draw_screen(uint16_t *fb) {
         int mid = FB_W / 2;
 
         if (podcast_mode) {
-            /* BG47: the same -30/-10/+10/+30 skip set the standalone
-             * podcast app used -- "10s is what you reach for after missing
-             * a sentence, 30s is for skipping an ad" -- drawn in this app's
-             * own arc style (draw_skip_arc(), already used by the
-             * audiobook screen's +/-10s) rather than that app's plain
-             * rectangular buttons. Speed control is ported from that same
-             * audiobook screen: the identical concentric-ring control and
-             * cycling behaviour, backed by its own pod_speed_permille
-             * rather than ab_speed_permille -- separate modes, no reason a
-             * podcast's chosen speed should share state with a book's.
-             * POD_SKIP_OFF1/OFF2 are shared with the tap handler below so
-             * the two cannot drift apart -- same reasoning as bar_y(). */
-            draw_skip_arc(fb, mid - POD_SKIP_OFF2, cyy, 26, 0, COL_TEXT);
-            draw_skip_arc(fb, mid - POD_SKIP_OFF1, cyy, 26, 0, COL_TEXT);
-            draw_skip_arc(fb, mid + POD_SKIP_OFF1, cyy, 26, 1, COL_TEXT);
-            draw_skip_arc(fb, mid + POD_SKIP_OFF2, cyy, 26, 1, COL_TEXT);
-            const char *n30 = "30", *n10 = "10";
-            int w30 = text_width(n30, TEXT_PX_BODY), w10 = text_width(n10, TEXT_PX_BODY);
-            draw_text(fb, mid - POD_SKIP_OFF2 - w30 / 2, cyy - TEXT_PX_BODY / 2 + 2, n30, COL_TEXT, TEXT_PX_BODY, FB_W);
-            draw_text(fb, mid - POD_SKIP_OFF1 - w10 / 2, cyy - TEXT_PX_BODY / 2 + 2, n10, COL_TEXT, TEXT_PX_BODY, FB_W);
-            draw_text(fb, mid + POD_SKIP_OFF1 - w10 / 2, cyy - TEXT_PX_BODY / 2 + 2, n10, COL_TEXT, TEXT_PX_BODY, FB_W);
-            draw_text(fb, mid + POD_SKIP_OFF2 - w30 / 2, cyy - TEXT_PX_BODY / 2 + 2, n30, COL_TEXT, TEXT_PX_BODY, FB_W);
+            /* BG47 (revised): just two skip arcs -- -10s left of play/pause,
+             * +30s right of it, per explicit correction away from the
+             * original symmetric +/-10/+/-30 four-button set. Drawn in this
+             * app's own arc style (draw_skip_arc(), already used by the
+             * audiobook screen's +/-10s). Speed control is unchanged from
+             * before: ported from that same audiobook screen's concentric-
+             * ring control and cycling behaviour, backed by its own
+             * pod_speed_permille rather than ab_speed_permille -- separate
+             * modes, no reason a podcast's chosen speed should share state
+             * with a book's. POD_SKIP_OFF is shared with the tap handler
+             * below so the two cannot drift apart -- same reasoning as
+             * bar_y(). */
+            draw_skip_arc(fb, mid - POD_SKIP_OFF, cyy, 26, 0, COL_TEXT);
+            draw_skip_arc(fb, mid + POD_SKIP_OFF, cyy, 26, 1, COL_TEXT);
+            const char *n10 = "10", *n30 = "30";
+            int w10 = text_width(n10, TEXT_PX_BODY), w30 = text_width(n30, TEXT_PX_BODY);
+            draw_text(fb, mid - POD_SKIP_OFF - w10 / 2, cyy - TEXT_PX_BODY / 2 + 2, n10, COL_TEXT, TEXT_PX_BODY, FB_W);
+            draw_text(fb, mid + POD_SKIP_OFF - w30 / 2, cyy - TEXT_PX_BODY / 2 + 2, n30, COL_TEXT, TEXT_PX_BODY, FB_W);
 
             int scx = pod_speed_x(mid), scy = cyy;
             fill_circle(fb, scx, scy, 22, COL_LINE);
@@ -4703,31 +4702,27 @@ int music_entry(void *a0, void *a1) {
 
                 int cyy = bary + 70;      /* BG40: matches the draw-side offset */
                 if (y > cyy - 48 && y < cyy + 48) {
-                    /* BG47: real hit zones under the drawn arcs/ring, not
-                     * blind thirds -- boundaries are the midpoints between
-                     * adjacent element centres, same POD_SKIP_OFF1/OFF2/
-                     * pod_speed_x() the draw side uses so the two cannot
-                     * drift apart. A podcast episode is never queued
-                     * alongside a next one (see podcast_mode's comment), so
-                     * this replaces prev/next track entirely rather than
-                     * sharing the zone with it. */
+                    /* BG47 (revised): real hit zones under the drawn arcs/
+                     * ring, not blind thirds -- boundaries are the
+                     * midpoints between adjacent element centres, same
+                     * POD_SKIP_OFF/pod_speed_x() the draw side uses so the
+                     * two cannot drift apart. Just two skip zones now
+                     * (-10s, +30s), not the original four. A podcast
+                     * episode is never queued alongside a next one (see
+                     * podcast_mode's comment), so this replaces prev/next
+                     * track entirely rather than sharing the zone with it. */
                     if (podcast_mode) {
                         int mid = FB_W / 2;
-                        int x30 = mid - POD_SKIP_OFF2, x10 = mid - POD_SKIP_OFF1;
-                        int xp10 = mid + POD_SKIP_OFF1, xp30 = mid + POD_SKIP_OFF2;
+                        int x10 = mid - POD_SKIP_OFF, xp30 = mid + POD_SKIP_OFF;
                         int xspd = pod_speed_x(mid);
-                        if (x < (xspd + x30) / 2) {
+                        if (x < (xspd + x10) / 2) {
                             pod_speed_permille += 100;
                             if (pod_speed_permille > 2000) pod_speed_permille = 1000;
                             audio_set_speed(pod_speed_permille);
-                        } else if (x < (x30 + x10) / 2) {
-                            audio_seek_ms(audio_pos_ms() - 30000);
                         } else if (x < (x10 + mid) / 2) {
                             audio_seek_ms(audio_pos_ms() - 10000);
-                        } else if (x < (mid + xp10) / 2) {
+                        } else if (x < (mid + xp30) / 2) {
                             audio_toggle();
-                        } else if (x < (xp10 + xp30) / 2) {
-                            audio_seek_ms(audio_pos_ms() + 10000);
                         } else {
                             audio_seek_ms(audio_pos_ms() + 30000);
                         }
