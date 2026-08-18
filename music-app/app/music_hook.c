@@ -783,6 +783,11 @@ static int pod_sync_x(void) {
  * audiobook screen's own scx formula (see its comment: "96 must match the
  * skip rings' offset above"), not just the same gap. */
 static int pod_speed_x(int mid) { return mid - POD_SKIP_OFF - 70; }
+/* Centre x of the show-notes info icon -- mirrors pod_speed_x() on the
+ * other side of the transport row, same gap past the +30s arc that the
+ * speed ring leaves before the -10s one. Moved here from the top-right
+ * corner of the cover art per explicit request. */
+static int pod_info_x(int mid) { return mid + POD_SKIP_OFF + 70; }
 
 /* How long the device may sit locked with nothing playing before it goes into
  * its low-power idle. Minutes, and 0 means never. Declared up here with the
@@ -1653,6 +1658,7 @@ static void play_station(int i) {
     }
     radio_mode = 1;
     audiobook_mode = 0;
+    podcast_mode = 0;
     audio_set_speed(1000);           /* a stream has no WSOLA use for it */
     snprintf(radio_name, sizeof(radio_name), "%s", stations[i].name);
     art_request("");                 /* clears whatever art was showing */
@@ -1670,6 +1676,7 @@ static void queue_follower(void) {
 static void play_index(int i) {
     radio_mode = 0;
     audiobook_mode = 0;
+    podcast_mode = 0;
     if (i < 0 || i >= queue_n) return;
     cur_track = i;
     audio_play(queue[i].path);
@@ -1736,6 +1743,7 @@ static void ab_play_chapter(int i) {
     if (i < 0 || i >= ab_book.chap_n || i >= track_n) return;
     audiobook_mode = 1;
     radio_mode = 0;
+    podcast_mode = 0;
     if (queue_n != track_n) {
         memcpy(queue, tracks, sizeof(queue[0]) * (size_t)track_n);
         queue_n = track_n;
@@ -2482,25 +2490,14 @@ static void draw_screen(uint16_t *fb) {
         if (!t) return;
 
         int cy = 0, cx = (FB_W - ART_PX) / 2;
-        /* R? (podcast merge): the info circle toggles show notes in place of
-         * the cover art, within the same box -- see pod_draw_notes() and the
-         * matching tap zone below. Drawn only when a notes sidecar actually
-         * exists for this episode, per the user's spec: a circle with an
-         * "i", top right of the art. */
+        /* The info icon (drawn further down, in the transport row) toggles
+         * show notes in place of the cover art, within the same box -- see
+         * pod_draw_notes() and the matching tap zone below. */
         if (podcast_mode && pod_notes_showing) {
             pod_draw_notes(fb, cx, cy, ART_PX, ART_PX);
         } else {
             fill_rect(fb, cx, cy, ART_PX, ART_PX, COL_ROW);
             blit_art(fb, cx, cy);
-        }
-        if (podcast_mode && pod_notes_avail) {
-            /* Same ring-then-fill trick as the audiobook speed control
-             * above: two concentric fill_circle()s, since fill_circle only
-             * ever draws solid. */
-            int icx = cx + ART_PX - 34, icy = cy + 34;
-            fill_circle(fb, icx, icy, 18, COL_LINE);
-            fill_circle(fb, icx, icy, 16, COL_BG);
-            draw_text(fb, icx - 3, icy - TEXT_PX_BODY / 2 + 2, "i", COL_TEXT, TEXT_PX_BODY, FB_W);
         }
         int ty = title_y();
         draw_scroll_title(fb, ty, t->name);
@@ -2580,6 +2577,18 @@ static void draw_screen(uint16_t *fb) {
             snprintf(buf, sizeof(buf), "%.1f\xc3\x97", pod_speed_permille / 1000.0);
             int sw = text_width(buf, TEXT_PX_SMALL);
             draw_text(fb, scx - sw / 2, scy - TEXT_PX_SMALL / 2 + 2, buf, COL_TEXT, TEXT_PX_SMALL, FB_W);
+
+            /* Show-notes info icon, right of the +30s arc -- moved here
+             * from the top-right corner of the cover art per explicit
+             * request. Same ring-then-fill trick as the speed control just
+             * drawn: two concentric fill_circle()s, since fill_circle only
+             * ever draws solid. */
+            if (pod_notes_avail) {
+                int icx = pod_info_x(mid), icy = cyy;
+                fill_circle(fb, icx, icy, 22, COL_LINE);
+                fill_circle(fb, icx, icy, 20, COL_BG);
+                draw_text(fb, icx - 3, icy - TEXT_PX_BODY / 2 + 2, "i", COL_TEXT, TEXT_PX_BODY, FB_W);
+            }
         } else {
             /* previous: triangle against a bar */
             fill_triangle(fb, mid - 128, cyy, 34, -1, COL_TEXT);
@@ -4674,16 +4683,6 @@ int music_entry(void *a0, void *a1) {
             } else if (screen == SC_PLAYING && radio_mode && y >= STATUS_H) {
                 int cyy = 120 + 190;
                 if (y > cyy - 48 && y < cyy + 48) audio_toggle();
-            } else if (screen == SC_PLAYING && podcast_mode && pod_notes_avail &&
-                       y >= 16 && y < 52 && x >= FB_W - 52 && x < FB_W - 16) {
-                /* The info circle, top right of the art -- toggles show
-                 * notes in place of the cover. Checked ahead of the queue
-                 * corner / bar / transport zone below since it sits well
-                 * clear of all of them (near the top, they're all near the
-                 * bottom or mid-screen), but a dedicated branch is clearer
-                 * than folding a fourth special case into that one. */
-                pod_notes_showing = !pod_notes_showing;
-                pod_notes_scroll_px = 0;
             } else if (screen == SC_PLAYING && y >= STATUS_H) {
                 /* The queue control sits in the corner the header used to own. */
                 if (y > FB_H - 56 && x > FB_W - 76) { go_back(); }
@@ -4715,6 +4714,7 @@ int music_entry(void *a0, void *a1) {
                         int mid = FB_W / 2;
                         int x10 = mid - POD_SKIP_OFF, xp30 = mid + POD_SKIP_OFF;
                         int xspd = pod_speed_x(mid);
+                        int xicon = pod_info_x(mid);
                         if (x < (xspd + x10) / 2) {
                             pod_speed_permille += 100;
                             if (pod_speed_permille > 2000) pod_speed_permille = 1000;
@@ -4723,8 +4723,11 @@ int music_entry(void *a0, void *a1) {
                             audio_seek_ms(audio_pos_ms() - 10000);
                         } else if (x < (mid + xp30) / 2) {
                             audio_toggle();
-                        } else {
+                        } else if (!pod_notes_avail || x < (xp30 + xicon) / 2) {
                             audio_seek_ms(audio_pos_ms() + 30000);
+                        } else {
+                            pod_notes_showing = !pod_notes_showing;
+                            pod_notes_scroll_px = 0;
                         }
                     } else {
                         if (x < FB_W / 3)            play_index(cur_track - 1);
