@@ -771,6 +771,16 @@ static int pod_sync_x(void) {
     return header_back_x() - 20 - sync_w;
 }
 
+/* BG47: offsets of the podcast player's skip arcs from the transport row's
+ * centre -- shared between the draw code and the tap handler, same reason
+ * bar_y() is a function rather than a repeated literal. OFF1 is +/-10s,
+ * OFF2 is +/-30s. */
+#define POD_SKIP_OFF1 65
+#define POD_SKIP_OFF2 125
+/* Centre x of the podcast speed ring, left of the -30s arc with the same
+ * gap the audiobook screen's own ring leaves before its nearer skip arc. */
+static int pod_speed_x(int mid) { return mid - POD_SKIP_OFF2 - 50; }
+
 /* How long the device may sit locked with nothing playing before it goes into
  * its low-power idle. Minutes, and 0 means never. Declared up here with the
  * layout rather than down with the rest of the config, because the settings
@@ -1111,6 +1121,11 @@ static int        pod_ep_n;
 static char       cur_feed[POD_NAME_LEN];
 static int        podcast_mode;
 static int        pod_list;
+/* BG47: separate from ab_speed_permille on purpose -- persists across
+ * episodes the same way ab_speed_permille persists across books, but a
+ * podcast's chosen speed has no reason to leak into or be overwritten by
+ * an audiobook's. */
+static int        pod_speed_permille = 1000;
 /* Show notes: raw text, wrapped and clipped at draw time. Loaded once, when
  * an episode starts, not re-read every frame. */
 static char       pod_notes_text[8192];
@@ -1464,6 +1479,12 @@ static void pod_save_current_pos(void) {
     if (!podcast_mode || !audio_is_active()) return;
     if (cur_track < 0 || cur_track >= queue_n) return;
     int pos = audio_pos_ms(), dur = audio_dur_ms();
+    /* BG48/BG49's root cause reaches here too: audio_dur_ms() is always 0
+     * for MP3 (see pod_probe_dur()'s comment in podcast.c), so without this
+     * fallback the dur>0 check below could never see a real duration and an
+     * episode could never be marked POD_FINISHED, only ever a plain resume
+     * position -- same fallback the draw/seek code already uses. */
+    if (dur <= 0) dur = queue[cur_track].dur_ms;
     if (dur > 0 && pos >= dur - 3000) pod_resume_store(queue[cur_track].path, POD_FINISHED, dur);
     else pod_resume_store(queue[cur_track].path, pos, dur);
 }
@@ -1485,6 +1506,7 @@ static void pod_play_episode(int idx) {
     q_album[0] = '\0';
     q_artist[0] = '\0';
     audio_set_next(NULL);
+    audio_set_speed(pod_speed_permille);
     audio_play(pod_eps[idx].path);
     art_request(pod_eps[idx].path);
     was_active = 1;
@@ -2063,7 +2085,10 @@ static void draw_status(uint16_t *fb) {
  * so a real line-layout cache would be more code than the cost it avoids. */
 static void pod_draw_notes(uint16_t *fb, int x, int y, int w, int h) {
     fill_rect(fb, x, y, w, h, COL_ROW);
-    const int lh = 30, px = TEXT_PX_SMALL;
+    /* BG50: 20% bigger than TEXT_PX_SMALL (22 -> 26), line height scaled to
+     * match rather than left at the old 30px, which read as cramped once
+     * the glyphs themselves grew. */
+    const int lh = 36, px = 26;
     int ty = y + 16 - pod_notes_scroll_px;
     const char *p = pod_notes_text;
     while (*p) {
@@ -2526,12 +2551,44 @@ static void draw_screen(uint16_t *fb) {
         int cyy = by + 70;                       /* centre line of the transport */
         int mid = FB_W / 2;
 
-        /* previous: triangle against a bar */
-        fill_triangle(fb, mid - 128, cyy, 34, -1, COL_TEXT);
-        fill_rect(fb, mid - 128 - 15 - 5, cyy - 17, 5, 34, COL_TEXT);
-        /* next: mirrored */
-        fill_triangle(fb, mid + 128, cyy, 34, +1, COL_TEXT);
-        fill_rect(fb, mid + 128 + 15, cyy - 17, 5, 34, COL_TEXT);
+        if (podcast_mode) {
+            /* BG47: the same -30/-10/+10/+30 skip set the standalone
+             * podcast app used -- "10s is what you reach for after missing
+             * a sentence, 30s is for skipping an ad" -- drawn in this app's
+             * own arc style (draw_skip_arc(), already used by the
+             * audiobook screen's +/-10s) rather than that app's plain
+             * rectangular buttons. Speed control is ported from that same
+             * audiobook screen: the identical concentric-ring control and
+             * cycling behaviour, backed by its own pod_speed_permille
+             * rather than ab_speed_permille -- separate modes, no reason a
+             * podcast's chosen speed should share state with a book's.
+             * POD_SKIP_OFF1/OFF2 are shared with the tap handler below so
+             * the two cannot drift apart -- same reasoning as bar_y(). */
+            draw_skip_arc(fb, mid - POD_SKIP_OFF2, cyy, 26, 0, COL_TEXT);
+            draw_skip_arc(fb, mid - POD_SKIP_OFF1, cyy, 26, 0, COL_TEXT);
+            draw_skip_arc(fb, mid + POD_SKIP_OFF1, cyy, 26, 1, COL_TEXT);
+            draw_skip_arc(fb, mid + POD_SKIP_OFF2, cyy, 26, 1, COL_TEXT);
+            const char *n30 = "30", *n10 = "10";
+            int w30 = text_width(n30, TEXT_PX_BODY), w10 = text_width(n10, TEXT_PX_BODY);
+            draw_text(fb, mid - POD_SKIP_OFF2 - w30 / 2, cyy - TEXT_PX_BODY / 2 + 2, n30, COL_TEXT, TEXT_PX_BODY, FB_W);
+            draw_text(fb, mid - POD_SKIP_OFF1 - w10 / 2, cyy - TEXT_PX_BODY / 2 + 2, n10, COL_TEXT, TEXT_PX_BODY, FB_W);
+            draw_text(fb, mid + POD_SKIP_OFF1 - w10 / 2, cyy - TEXT_PX_BODY / 2 + 2, n10, COL_TEXT, TEXT_PX_BODY, FB_W);
+            draw_text(fb, mid + POD_SKIP_OFF2 - w30 / 2, cyy - TEXT_PX_BODY / 2 + 2, n30, COL_TEXT, TEXT_PX_BODY, FB_W);
+
+            int scx = pod_speed_x(mid), scy = cyy;
+            fill_circle(fb, scx, scy, 22, COL_LINE);
+            fill_circle(fb, scx, scy, 20, COL_BG);
+            snprintf(buf, sizeof(buf), "%.1f\xc3\x97", pod_speed_permille / 1000.0);
+            int sw = text_width(buf, TEXT_PX_SMALL);
+            draw_text(fb, scx - sw / 2, scy - TEXT_PX_SMALL / 2 + 2, buf, COL_TEXT, TEXT_PX_SMALL, FB_W);
+        } else {
+            /* previous: triangle against a bar */
+            fill_triangle(fb, mid - 128, cyy, 34, -1, COL_TEXT);
+            fill_rect(fb, mid - 128 - 15 - 5, cyy - 17, 5, 34, COL_TEXT);
+            /* next: mirrored */
+            fill_triangle(fb, mid + 128, cyy, 34, +1, COL_TEXT);
+            fill_rect(fb, mid + 128 + 15, cyy - 17, 5, 34, COL_TEXT);
+        }
 
         fill_circle(fb, mid, cyy, 42, COL_ACCENT);
         if (audio_is_paused()) {
@@ -2593,7 +2650,12 @@ static void draw_screen(uint16_t *fb) {
             const char *dot = strrchr(t->path, '.');
             snprintf(ext, sizeof(ext), "%s", dot && dot[1] ? dot + 1 : "");
             for (char *p2 = ext; *p2; p2++) *p2 = (char)toupper((unsigned char)*p2);
-            int kbps = ab_file_bitrate_kbps(t->path, t->dur_ms);
+            /* BG48: dur, not t->dur_ms -- t->dur_ms only ever comes from a
+             * saved resume record (see pod_rebuild_tracks()), which is 0 for
+             * any episode that has never been played before. `dur` is the
+             * same live audio_dur_ms()-with-fallback the position bar above
+             * already uses, and it's what's actually known right now. */
+            int kbps = ab_file_bitrate_kbps(t->path, dur);
             if (kbps > 0) snprintf(buf, sizeof(buf), "%s  %d kbps", ext, kbps);
             else          snprintf(buf, sizeof(buf), "%s", ext);
         } else {
@@ -4641,16 +4703,34 @@ int music_entry(void *a0, void *a1) {
 
                 int cyy = bary + 70;      /* BG40: matches the draw-side offset */
                 if (y > cyy - 48 && y < cyy + 48) {
-                    /* A podcast episode is never queued alongside a next one
-                     * (see podcast_mode's comment), so the side zones are
-                     * +/-30s skip instead of prev/next track -- explicitly
-                     * kept distinct from the audiobook screen's +/-10s (see
-                     * BACKLOG.md's L5 entry): 30s is sized for skipping ads,
-                     * 10s for finding your place in narration. */
+                    /* BG47: real hit zones under the drawn arcs/ring, not
+                     * blind thirds -- boundaries are the midpoints between
+                     * adjacent element centres, same POD_SKIP_OFF1/OFF2/
+                     * pod_speed_x() the draw side uses so the two cannot
+                     * drift apart. A podcast episode is never queued
+                     * alongside a next one (see podcast_mode's comment), so
+                     * this replaces prev/next track entirely rather than
+                     * sharing the zone with it. */
                     if (podcast_mode) {
-                        if (x < FB_W / 3)            audio_seek_ms(audio_pos_ms() - 30000);
-                        else if (x > 2 * FB_W / 3)   audio_seek_ms(audio_pos_ms() + 30000);
-                        else                          audio_toggle();
+                        int mid = FB_W / 2;
+                        int x30 = mid - POD_SKIP_OFF2, x10 = mid - POD_SKIP_OFF1;
+                        int xp10 = mid + POD_SKIP_OFF1, xp30 = mid + POD_SKIP_OFF2;
+                        int xspd = pod_speed_x(mid);
+                        if (x < (xspd + x30) / 2) {
+                            pod_speed_permille += 100;
+                            if (pod_speed_permille > 2000) pod_speed_permille = 1000;
+                            audio_set_speed(pod_speed_permille);
+                        } else if (x < (x30 + x10) / 2) {
+                            audio_seek_ms(audio_pos_ms() - 30000);
+                        } else if (x < (x10 + mid) / 2) {
+                            audio_seek_ms(audio_pos_ms() - 10000);
+                        } else if (x < (mid + xp10) / 2) {
+                            audio_toggle();
+                        } else if (x < (xp10 + xp30) / 2) {
+                            audio_seek_ms(audio_pos_ms() + 10000);
+                        } else {
+                            audio_seek_ms(audio_pos_ms() + 30000);
+                        }
                     } else {
                         if (x < FB_W / 3)            play_index(cur_track - 1);
                         else if (x > 2 * FB_W / 3)   play_index(cur_track + 1);

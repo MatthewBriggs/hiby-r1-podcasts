@@ -312,11 +312,26 @@ uint16_t *cover_load(const char *jpeg_path, const char *cache_key, int px) {
         longjmp(jerr.jump, 1);
     }
 
+    /* BG46: center-crop to a square before the box-filter runs, rather than
+     * mapping source width and source height independently to px*px, which
+     * stretched each axis by a different factor whenever the source wasn't
+     * already square. Album/book covers are conventionally square so this
+     * never showed; podcast artwork routinely isn't. y_off rows of top
+     * margin are read and discarded (scanlines can't be seeked backward);
+     * x_off is folded into the column mapping below, no row cost either way. */
+    int side = w < h ? w : h;
+    int y_off = (h - side) / 2;
+    int x_off = (w - side) / 2;
+    for (int i = 0; i < y_off && cinfo.output_scanline < cinfo.output_height; i++) {
+        JSAMPROW rp = row;
+        x_read_scanlines(&cinfo, &rp, 1);
+    }
+
     int next_src_row = 0;
     for (int y = 0; y < px; y++) {
-        int row_end = (int)((int64_t)(y + 1) * h / px);
+        int row_end = (int)((int64_t)(y + 1) * side / px);
         if (row_end <= next_src_row) row_end = next_src_row + 1;   /* upscaling: >=1 row */
-        if (row_end > h) row_end = h;
+        if (row_end > side) row_end = side;
 
         memset(racc, 0, (size_t)w * sizeof(long));
         memset(gacc, 0, (size_t)w * sizeof(long));
@@ -337,10 +352,10 @@ uint16_t *cover_load(const char *jpeg_path, const char *cache_key, int px) {
         if (rows == 0) rows = 1;   /* source exhausted; average of nothing is 0, not a crash */
 
         for (int x = 0; x < px; x++) {
-            int col_start = (int)((int64_t)x * w / px);
-            int col_end = (int)((int64_t)(x + 1) * w / px);
+            int col_start = x_off + (int)((int64_t)x * side / px);
+            int col_end = x_off + (int)((int64_t)(x + 1) * side / px);
             if (col_end <= col_start) col_end = col_start + 1;
-            if (col_end > w) col_end = w;
+            if (col_end > x_off + side) col_end = x_off + side;
             long rs = 0, gs = 0, bs = 0;
             for (int sx = col_start; sx < col_end; sx++) {
                 rs += racc[sx]; gs += gacc[sx]; bs += bacc[sx];

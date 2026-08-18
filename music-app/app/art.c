@@ -298,6 +298,15 @@ int art_candidate(const char *track_path, int n, char *out, size_t out_n,
         fclose(f);
         if (rc != 0) return ART_SKIP;
         snprintf(out, out_n, "%s", ART_SCRATCH);
+        /* BG46: keyed by the file, not the folder -- nothing guarantees
+         * every track/episode sharing a folder embeds the same picture
+         * (a podcast feed's episodes routinely don't; some classical
+         * compilations embed per-track art too), and a folder key made the
+         * first decode in a folder silently stick as every other file's
+         * "embedded" art from then on. The folder-image fallback slots
+         * below are correctly folder-keyed still -- those genuinely are
+         * one image shared by everything in the folder. */
+        snprintf(key, key_n, "%s", track_path);
         return 0;
     }
 

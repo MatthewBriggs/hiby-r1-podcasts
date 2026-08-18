@@ -14,6 +14,7 @@
 #include <utime.h>
 
 #include "podcast.h"
+#include "audio.h"
 
 #define PODCAST_DIR "/data/mnt/sd_0/Podcasts"
 #define RESUME_DIR  "/data/mnt/sd_0/.podsync"
@@ -151,6 +152,63 @@ static long parse_iso_date(const char *s) {
     return (t == (time_t)-1) ? 0 : (long)t;
 }
 
+/* BG48/BG49: an episode's duration/seek/bitrate were all silently 0. Root
+ * cause: audio.c's MP3 open deliberately leaves the decoded frame count at
+ * 0 rather than scan a VBR file whole to get it (see dec_open()'s own
+ * comment on that), so audio_dur_ms() never has an answer for MP3 either --
+ * a library track gets its duration from audio_probe_dur_ms(path,
+ * bitrate_bps), which for MP3 only estimates from filesize/bitrate, and
+ * that bitrate comes from the SQL index's own ID3 read at scan time. A
+ * podcast episode was never scanned, so there is no bitrate anywhere to
+ * pass it. This reads the *first* MPEG frame header directly (skipping any
+ * ID3v2 tag first -- routine on a podcast MP3, and often sizeable with
+ * embedded cover art, so scanning through it risked a spurious sync-word
+ * match in tag data) to get a real bitrate straight from the file, the same
+ * "no full decode" trade audio_probe_dur_ms() already documents for its own
+ * estimate. CBR-exact; a VBR file's true average can differ from its first
+ * frame, same caveat that estimate already carries. */
+static int pod_mp3_kbps(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    unsigned char hdr[10];
+    long off = 0;
+    if (fread(hdr, 1, 10, f) == 10 && !memcmp(hdr, "ID3", 3)) {
+        long sz = ((long)(hdr[6] & 0x7f) << 21) | ((long)(hdr[7] & 0x7f) << 14) |
+                  ((long)(hdr[8] & 0x7f) << 7)  |  (long)(hdr[9] & 0x7f);
+        off = 10 + sz;
+    }
+    fseek(f, off, SEEK_SET);
+    unsigned char buf[4096];
+    size_t n = fread(buf, 1, sizeof(buf), f);
+    fclose(f);
+    static const int v1l3[16] = { 0, 32, 40, 48, 56, 64, 80, 96,
+                                  112,128,160,192,224,256,320,  0 };
+    static const int v2l3[16] = { 0,  8, 16, 24, 32, 40, 48, 56,
+                                   64, 80, 96,112,128,144,160,  0 };
+    for (size_t i = 0; i + 4 <= n; i++) {
+        if (buf[i] != 0xFF || (buf[i + 1] & 0xE0) != 0xE0) continue;
+        int ver   = (buf[i + 1] >> 3) & 3;   /* 3 = MPEG1, 2/0 = MPEG2/2.5 */
+        int layer = (buf[i + 1] >> 1) & 3;   /* 1 = Layer III */
+        if (layer != 1) continue;
+        int bri = (buf[i + 2] >> 4) & 0xF;
+        if (bri == 0 || bri == 15) continue;
+        int kbps = (ver == 3) ? v1l3[bri] : v2l3[bri];
+        if (kbps > 0) return kbps;
+    }
+    return 0;
+}
+
+/* Probes duration once per episode -- cheap (a header read, no full decode;
+ * see audio_probe_dur_ms()'s and pod_mp3_kbps()'s own comments) but no
+ * reason to redo it on every pod_load_episodes() call once an episode has
+ * an answer. */
+static void pod_probe_dur(pod_episode_t *e) {
+    if (!e->downloaded || e->dur_ms > 0) return;
+    const char *dot = strrchr(e->path, '.');
+    int kbps = (dot && !strcasecmp(dot, ".mp3")) ? pod_mp3_kbps(e->path) : 0;
+    e->dur_ms = audio_probe_dur_ms(e->path, kbps * 1000);
+}
+
 static int is_audio_ext(const char *n) {
     const char *d = strrchr(n, '.');
     if (!d) return 0;
@@ -253,10 +311,12 @@ int pod_load_episodes(const char *feed, pod_episode_t *out, int max) {
 
     sort_episodes(out, n);
     for (int i = 0; i < n; i++) {
-        if (out[i].downloaded)
+        if (out[i].downloaded) {
             out[i].resume_ms = pod_resume_lookup(out[i].path, &out[i].dur_ms);
-        else
-            out[i].resume_ms = 0, out[i].dur_ms = 0;
+            pod_probe_dur(&out[i]);
+        } else {
+            out[i].resume_ms = 0; out[i].dur_ms = 0;
+        }
         /* Cache for pod_download_start(idx). */
         snprintf(g_ep_name[i], POD_NAME_LEN, "%s", out[i].name);
         snprintf(g_ep_url[i], POD_PATH_LEN, "%s", out[i].url);
