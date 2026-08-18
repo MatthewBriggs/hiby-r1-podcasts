@@ -867,7 +867,7 @@ static int set_row_about_y(void) { return set_row_theme_y() + ROW_H; }
  * pushed by hand, not by CI against a tagged commit), so this stays a
  * literal that a human edits; the discipline is remembering to, not the
  * mechanism. */
-#define LIBRARY_VERSION "0.15"
+#define LIBRARY_VERSION "0.16"
 
 static void about_kernel(char *out, size_t n) {
     struct utsname u;
