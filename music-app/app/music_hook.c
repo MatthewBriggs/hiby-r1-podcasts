@@ -1925,14 +1925,37 @@ static void draw_mini(uint16_t *fb) {
     fill_rect(fb, 0, by, FB_W, MINI_H, COL_HEADER);
     fill_rect(fb, 0, by, FB_W, 1, COL_LINE);
 
-    /* R32: a 1px position indicator at the very bottom edge of the screen --
-     * not the mini-player's own top border (already drawn above), the last
-     * row of the framebuffer itself, corner to corner. Display only, same
-     * as the full player's own scrub strip's dur/pos sourcing (draw_scrub_
-     * strip) but with no track/background under it and no scrub handling --
-     * this is glanceable position while browsing, not a second place to
-     * drag. Radio has no meaningful duration, so it draws nothing here
-     * rather than a bar that can never move. */
+    /* BG55: flush against the screen, not floating with a gap on every
+     * side -- that gap (COL_HEADER showing all the way around the art) was
+     * what read as an unwanted frame, not an actual stroke drawn on it.
+     * Bottom-left corner of the art sits in the bottom-left corner of the
+     * screen (tx=0, bottom edge at FB_H); the thumbnail is taller than
+     * MINI_H so its top edge overhangs above the bar's own top border,
+     * rather than sitting inset within it on every side. */
+    int thumb = MINI_H + 8, tx = 0, ty = FB_H - thumb;
+    int text_x = 20;
+    if (!radio_mode) {
+        /* COL_ROW (the full player's own art placeholder) is the same value
+         * as this bar's COL_HEADER background, so it would be invisible
+         * here specifically -- COL_LINE instead, for real contrast against
+         * the bar while art loads or when a track has none. */
+        fill_rect(fb, tx, ty, thumb, thumb, COL_LINE);
+        blit_art_scaled(fb, tx, ty, thumb);
+        text_x = tx + thumb + 16;
+    }
+
+    /* R32: a position indicator at the very bottom edge of the screen --
+     * not the mini-player's own top border (drawn above), the last rows of
+     * the framebuffer itself, corner to corner. Display only, same as the
+     * full player's own scrub strip's dur/pos sourcing (draw_scrub_strip)
+     * but with no track/background under it and no scrub handling -- this
+     * is glanceable position while browsing, not a second place to drag.
+     * Radio has no meaningful duration, so it draws nothing here rather
+     * than a bar that can never move. Drawn *after* the art thumbnail
+     * above (BG55's flush-bottom art reaches this same row on its left
+     * side), so it's never the art that ends up covering the bar -- 2px
+     * thick, not the original 1, so it survives sitting this close to the
+     * bezel. */
     if (!radio_mode && cur_track >= 0 && cur_track < queue_n) {
         lib_track_t *t = &queue[cur_track];
         int pos, dur;
@@ -1958,20 +1981,8 @@ static void draw_mini(uint16_t *fb) {
         if (dur > 0) {
             int w = FB_W * pos / dur;
             if (w > FB_W) w = FB_W;
-            if (w > 0) fill_rect(fb, 0, FB_H - 1, w, 1, COL_ACCENT);
+            if (w > 0) fill_rect(fb, 0, FB_H - 2, w, 2, COL_ACCENT);
         }
-    }
-
-    int thumb = 56, tx = 12, ty = by + (MINI_H - thumb) / 2;
-    int text_x = 20;
-    if (!radio_mode) {
-        /* COL_ROW (the full player's own art placeholder) is the same value
-         * as this bar's COL_HEADER background, so it would be invisible
-         * here specifically -- COL_LINE instead, for real contrast against
-         * the bar while art loads or when a track has none. */
-        fill_rect(fb, tx, ty, thumb, thumb, COL_LINE);
-        blit_art_scaled(fb, tx, ty, thumb);
-        text_x = tx + thumb + 12;
     }
 
     /* Text clips before whichever control cluster is narrowest for this

@@ -833,6 +833,11 @@ static void find_bt_mixer(void) {
         }
     }
     pclose(p);
+    /* BG59: silent before this -- a headset that never negotiates AVRCP
+     * absolute volume left no trace anywhere that this ever ran, let alone
+     * that it found nothing. Logged once per attempt (this only runs when
+     * bt_mixer is already empty, so it can't spam once one is found). */
+    if (!bt_mixer[0]) alog("[audio] bt: no AVRCP mixer control found (amixer -D bluealsa scontrols empty)\n");
 }
 
 static int bt_read_pct(void) {
@@ -1378,7 +1383,23 @@ static void *worker(void *arg) {
     for (;;) {
         pthread_mutex_lock(&g_lock);
         int run = g_running, paused = g_paused;
-        int vol = audio_using_bt() ? 100 : g_vol;   /* the mixer does it on BT */
+        /* BG59: "the mixer does it on BT" is only true once a real AVRCP
+         * mixer control has actually been found (bt_mixer[0], set by
+         * find_bt_mixer() in audio_bt_volume_service() on the bt_poll
+         * thread) -- some headsets never negotiate AVRCP absolute volume at
+         * all, in which case bt_mixer stays empty forever and that write
+         * path is permanently a no-op. Forcing vol=100 unconditionally in
+         * that case meant volume control did *nothing* over Bluetooth: not
+         * the mixer (never found), and not software gain either (skipped
+         * because Bluetooth was assumed to always have a working mixer) --
+         * matching exactly the reported symptom of the on-screen slider
+         * moving with no audible change. Falling back to software scaling
+         * when there's no confirmed mixer keeps volume control working
+         * either way. bt_mixer[0] is read here without bt_vol_lock: it's a
+         * single byte's worth of "is this empty," set from one thread and
+         * read from another, and a stale read for one tick just means this
+         * check catches up next tick, not a real race. */
+        int vol = (audio_using_bt() && bt_mixer[0]) ? 100 : g_vol;
         int seek = g_seek_to_ms; g_seek_to_ms = -1;
         int speed = g_speed;
         int have_table = g_seek_pending_ready;
