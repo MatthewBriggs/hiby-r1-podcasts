@@ -1,0 +1,6 @@
+font.ttf is Noto Sans Regular, by Google, licensed under the SIL Open Font
+License 1.1: https://openfontlicense.org
+
+Used as the on-device UI font (R35) for its broad, consistent Latin +
+Cyrillic coverage, in place of the CJK-oriented msyh.ttf that shipped with
+the stock firmware.

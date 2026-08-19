@@ -1,0 +1,21 @@
+WiFi
+# Enter SSID and password below it:
+#
+YourSSID
+YourPassword
+
+Radio
+# Enter Name and Radio URL below it, one station per pair of lines
+#
+My Station
+http://example.com/stream.mp3
+
+LastFM
+# API key, followed by secret. Get these at https://www.last.fm/api/account/create
+YOUR_LASTFM_API_KEY
+YOUR_LASTFM_SECRET
+
+Spotify
+# Client ID, followed by client secret. Get these at https://developer.spotify.com/dashboard
+YOUR_SPOTIFY_CLIENT_ID
+YOUR_SPOTIFY_CLIENT_SECRET

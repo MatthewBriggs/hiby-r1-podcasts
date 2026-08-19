@@ -1,12 +1,15 @@
-/* text.c — antialiased text via stb_truetype, using a font already on the device.
+/* text.c — antialiased text via stb_truetype.
  *
  * The 5x7 bitmap font this replaces was uppercase-only ASCII, so German and
  * Swedish episode titles lost their accents ("träumen" -> "TRAUMEN").
  *
  * Font choice is constrained: /usr/resource/fonts/default.otf is CFF/PostScript
  * ("OTTO"), which stb_truetype cannot parse — it only handles `glyf` outlines.
- * msyh.ttf (Microsoft YaHei) is TrueType, covers Latin-1, and is already
- * present, so nothing has to be shipped.
+ * R35: the UI font is now Noto Sans, shipped as podcast_res/font.ttf and
+ * pushed alongside the .so, chosen for broad, consistent Latin+Cyrillic
+ * coverage instead of msyh.ttf's CJK-first metrics. msyh.ttf (Microsoft
+ * YaHei) and the on-device Korean.ttf remain as fallbacks if the bundled
+ * font is ever missing from a device.
  *
  * Glyphs are rasterised on first use and cached per (size, codepoint); the UI
  * only uses a handful of sizes and a few hundred characters.
@@ -28,19 +31,24 @@
 #include "text.h"
 
 #define MAX_SIZES   4
-/* Two ranges: Latin (0..0x24F) plus General Punctuation (0x2000..0x206F), which
- * carries the en/em dashes, curly quotes and ellipses that podcast titles are
- * full of. A flat array up to 0x2070 would be mostly empty, so the punctuation
- * block is folded in just above the Latin one. */
+/* Three ranges, packed contiguously so the glyph cache stays a flat array
+ * instead of a sparse map: Latin (0..0x24F), Cyrillic (0x0400..0x04FF, R35 —
+ * covers Russian/Ukrainian/Serbian tags and titles), and General Punctuation
+ * (0x2000..0x206F), which carries the en/em dashes, curly quotes and
+ * ellipses that podcast titles are full of. */
 #define LATIN_CP    0x250
+#define CYR_BASE    0x400
+#define CYR_LEN     0x100
 #define PUNCT_BASE  0x2000
 #define PUNCT_LEN   0x70
-#define MAX_CP      (LATIN_CP + PUNCT_LEN)
+#define MAX_CP      (LATIN_CP + CYR_LEN + PUNCT_LEN)
 
 static int cp_slot(unsigned cp) {
     if (cp < LATIN_CP) return (int)cp;
+    if (cp >= CYR_BASE && cp < CYR_BASE + CYR_LEN)
+        return (int)(LATIN_CP + (cp - CYR_BASE));
     if (cp >= PUNCT_BASE && cp < PUNCT_BASE + PUNCT_LEN)
-        return (int)(LATIN_CP + (cp - PUNCT_BASE));
+        return (int)(LATIN_CP + CYR_LEN + (cp - PUNCT_BASE));
     return -1;
 }
 
@@ -64,9 +72,9 @@ static size_cache_t g_sizes[MAX_SIZES];
 static int g_size_count;
 
 static const char *FONT_CANDIDATES[] = {
+    "/usr/data/podcast_res/font.ttf",   /* Noto Sans, bundled by us (R35) */
     "/usr/resource/fonts/msyh.ttf",
     "/usr/resource/fonts/Korean.ttf",
-    "/usr/data/podcast_res/font.ttf",   /* optional override */
 };
 
 int text_init(void) {

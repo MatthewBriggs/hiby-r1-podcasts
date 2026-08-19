@@ -58,7 +58,7 @@ static int file_exists(const char *p) {
     return stat(p, &st) == 0 && st.st_size > 0;
 }
 
-static void album_dir(const char *track, char *out, size_t n) {
+void album_dir(const char *track, char *out, size_t n) {
     snprintf(out, n, "%s", track);
     char *slash = strrchr(out, '/');
     if (slash) *slash = '\0';

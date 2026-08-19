@@ -19,4 +19,9 @@
  * blank panel. */
 int art_candidate(const char *track_path, int n, char *out, size_t out_n,
                   char *key, size_t key_n);
+
+/* The folder containing `track` (everything up to the last '/'). Exposed for
+ * R23's Last.fm fallback, which needs to know where to save a fetched cover
+ * -- the same folder any other candidate above would have looked in. */
+void album_dir(const char *track, char *out, size_t n);
 #endif

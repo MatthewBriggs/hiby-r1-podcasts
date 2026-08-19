@@ -52,6 +52,8 @@
 #include "recent.h"
 #include "cover.h"
 #include "art.h"
+#include "lastfm.h"
+#include "spotify.h"
 #include "status.h"
 #include "radio.h"
 #include "playlist.h"
@@ -152,6 +154,12 @@ static void mlog(const char *fmt, ...) {
 static pthread_mutex_t art_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint16_t *art_bits;            /* ART_PX * ART_PX, or NULL */
 static char      art_want[512];       /* track the loader should be showing */
+/* R23: artist/album to search Last.fm with if no local art turns up for
+ * art_want -- empty from any caller that shouldn't trigger that fallback
+ * at all (podcasts, audiobooks, radio: none of these are "albums" Last.fm
+ * would sensibly match against). */
+static char      art_want_artist[LIB_NAME_LEN];
+static char      art_want_album[LIB_NAME_LEN];
 /* Bluetooth codec and battery are read on their own thread. They were read
  * from the drawing path, and both shell out — bluealsa-cli and dbus-send. A
  * D-Bus call that blocks (a headset dropping mid-query will do it) then takes
@@ -282,9 +290,11 @@ static int art_seq(void) {
 
 static void *art_worker(void *arg) {
     (void)arg;
-    char track[512];
+    char track[512], artist[LIB_NAME_LEN], album[LIB_NAME_LEN];
     pthread_mutex_lock(&art_lock);
     snprintf(track, sizeof(track), "%s", art_want);
+    snprintf(artist, sizeof(artist), "%s", art_want_artist);
+    snprintf(album, sizeof(album), "%s", art_want_album);
     pthread_mutex_unlock(&art_lock);
 
     char jpg[512], key[512];
@@ -302,6 +312,49 @@ static void *art_worker(void *arg) {
         bits = cover_load(jpg, key, ART_PX);
     }
 
+    /* R23: every local candidate is exhausted -- try Last.fm first, then
+     * Spotify, if there's an artist/album to search with at all (empty for
+     * anything that isn't a regular music track -- see art_want_artist/
+     * album's own comment), a network to reach either with, and at least
+     * one of the two has an API key/credentials configured. Last.fm goes
+     * first: no auth round trip needed for a plain read, so a hit there is
+     * cheaper. Spotify is the fallback specifically because its search
+     * matches oddly-titled live/bootleg/reissue releases (checked live:
+     * Last.fm had no match at all for a Velvet Underground bootleg volume,
+     * exactly this shape of title) that Last.fm's fan-tagged database
+     * often doesn't carry, the same reason Navidrome itself chains
+     * multiple agents rather than trusting one. Saved as this album's own
+     * cover.jpg, so every other track of it (this session and every one
+     * after) finds it the ordinary folder-image way from here on -- this
+     * only ever runs once per album, not once per track. A miss from both
+     * is remembered with one sentinel file so a real "no match anywhere"
+     * doesn't retry (and re-hit both APIs) every single time the album is
+     * opened. */
+    if (!bits && artist[0] && album[0] && st_net_up() &&
+        (lastfm_has_key() || spotify_has_key())) {
+        char dir[512], dest[560], nomatch[580];
+        album_dir(track, dir, sizeof(dir));
+        snprintf(dest, sizeof(dest), "%s/cover.jpg", dir);
+        snprintf(nomatch, sizeof(nomatch), "%s/.cover_no_match", dir);
+        struct stat nm_st;
+        if (stat(nomatch, &nm_st) != 0) {
+            int ok = lastfm_has_key() && lastfm_fetch_cover(artist, album, dest) == 0;
+            const char *source = "lastfm";
+            if (!ok && spotify_has_key() && spotify_fetch_cover(artist, album, dest) == 0) {
+                ok = 1;
+                source = "spotify";
+            }
+            if (ok) {
+                bits = cover_load(dest, dir, ART_PX);
+                mlog("[music] %s: cover fetched for %s / %s\n", source, artist, album);
+            } else {
+                FILE *f = fopen(nomatch, "w");
+                if (f) fclose(f);
+                mlog("[music] art: no match anywhere for %s / %s\n", artist, album);
+            }
+        }
+    }
+
     pthread_mutex_lock(&art_lock);
     /* Discard if the user has already moved on to another track. */
     if (strcmp(track, art_want) != 0) { free(bits); }
@@ -313,7 +366,10 @@ static void *art_worker(void *arg) {
 /* Defined with the rest of the Now Playing layout, further down. */
 static void title_reset(void);
 
-static void art_request(const char *track) {
+/* artist/album: only a regular music track has both -- pass "" from
+ * anywhere else (podcasts, audiobooks, radio) to leave the Last.fm
+ * fallback in art_worker() off for those. */
+static void art_request(const char *track, const char *artist, const char *album) {
     /* New track, new title: a scroll position carried over from the last one
      * would leave the new name starting halfway along. Called from every path
      * that changes what is playing, chapters included. */
@@ -324,6 +380,8 @@ static void art_request(const char *track) {
     art_bits = NULL;
     art_seq_v++;
     snprintf(art_want, sizeof(art_want), "%s", track);
+    snprintf(art_want_artist, sizeof(art_want_artist), "%s", artist ? artist : "");
+    snprintf(art_want_album, sizeof(art_want_album), "%s", album ? album : "");
     pthread_mutex_unlock(&art_lock);
     if (pthread_create(&art_thread, NULL, art_worker, NULL) == 0)
         art_thread_valid = 1;
@@ -867,7 +925,7 @@ static int set_row_about_y(void) { return set_row_theme_y() + ROW_H; }
  * pushed by hand, not by CI against a tagged commit), so this stays a
  * literal that a human edits; the discipline is remembering to, not the
  * mechanism. */
-#define LIBRARY_VERSION "0.16"
+#define LIBRARY_VERSION "0.17"
 
 static void about_kernel(char *out, size_t n) {
     struct utsname u;
@@ -1516,7 +1574,7 @@ static void pod_play_episode(int idx) {
     audio_set_next(NULL);
     audio_set_speed(pod_speed_permille);
     audio_play(pod_eps[idx].path);
-    art_request(pod_eps[idx].path);
+    art_request(pod_eps[idx].path, "", "");
     was_active = 1;
     int dur = 0;
     int resume = pod_resume_lookup(pod_eps[idx].path, &dur);
@@ -1661,7 +1719,7 @@ static void play_station(int i) {
     podcast_mode = 0;
     audio_set_speed(1000);           /* a stream has no WSOLA use for it */
     snprintf(radio_name, sizeof(radio_name), "%s", stations[i].name);
-    art_request("");                 /* clears whatever art was showing */
+    art_request("", "", "");         /* clears whatever art was showing */
     audio_play(stations[i].url);
     was_active = 1;
     mlog("[music] station %s\n", stations[i].name);
@@ -1680,7 +1738,12 @@ static void play_index(int i) {
     if (i < 0 || i >= queue_n) return;
     cur_track = i;
     audio_play(queue[i].path);
-    art_request(queue[i].path);
+    /* R23: the track's own artist wins when it has one, same reasoning
+     * Now Playing's display already uses (BG30) -- q_artist is the
+     * album's artist and can genuinely differ per track (a compilation).
+     * Last.fm matches on the album though, so q_album, not the track's
+     * own title, is always the right second half of the pair. */
+    art_request(queue[i].path, queue[i].artist[0] ? queue[i].artist : q_artist, q_album);
     queue_follower();
     was_active = 1;
     /* R30's "recently heard" side. q_album is the queue's album, set by
@@ -1758,7 +1821,7 @@ static void ab_play_chapter(int i) {
     if (strcmp(ab_playing, path) != 0 || !audio_is_active()) {
         snprintf(ab_playing, sizeof(ab_playing), "%s", path);
         audio_play(path);
-        art_request(path);
+        art_request(path, "", "");
     }
     audio_seek_ms((int)ab_book.chap[i].file_start_ms);
     audio_set_next(ab_next_file(i));
@@ -2705,6 +2768,20 @@ static void draw_screen(uint16_t *fb) {
     }
 
     if (screen == SC_TRACKS) {
+        /* R36: mark disc boundaries in a multi-disc album -- ab_list/pod_list
+         * rows all carry disc == -1 (audiobook.c/podcast.c never set it), so
+         * they normalise to the same value and multi_disc is always false
+         * for chapters and episodes, exactly as it should be. Single-disc
+         * albums are also excluded on purpose: every track there would
+         * otherwise show the same "[1]" marker for no reason. */
+        int multi_disc = 0;
+        if (!ab_list && !pod_list && track_n > 1) {
+            int first_disc = tracks[0].disc > 0 ? tracks[0].disc : 1;
+            for (int i = 1; i < track_n; i++) {
+                int d = tracks[i].disc > 0 ? tracks[i].disc : 1;
+                if (d != first_disc) { multi_disc = 1; break; }
+            }
+        }
         /* Reached from Now Playing this doubles as the queue, so the playing
          * track is marked wherever the list is entered from. */
         for (int i = 0; i < vis_rows(); i++) {
@@ -2728,9 +2805,25 @@ static void draw_screen(uint16_t *fb) {
             }
             /* The number the file states. Blank rather than a dash when the
              * file does not say, which is rare now it is read from tags. */
+            int disc = t->disc > 0 ? t->disc : 1;
+            int disc_start = multi_disc &&
+                (idx == 0 || (tracks[idx - 1].disc > 0 ? tracks[idx - 1].disc : 1) != disc);
+            /* Two fixed columns when multi_disc, so every track number lines
+             * up regardless of which rows happen to carry a disc marker --
+             * the disc digit only occupies its own column on the first
+             * track of each disc, the track column itself never moves. */
+            int track_x = multi_disc ? 44 : 20;
+            if (disc_start) {
+                char discbuf[8];
+                snprintf(discbuf, sizeof(discbuf), "%d", disc);
+                /* right_edge is an absolute clip x, not a width -- 40, not
+                 * 20, so the disc digit itself has room to draw. */
+                draw_text_clip(fb, 20, y + 22, discbuf, COL_ACCENT, TEXT_PX_SMALL, 40, CONTENT_Y, clip_bot);
+            }
             if (t->track > 0) snprintf(buf, sizeof(buf), "%d", t->track);
             else              buf[0] = '\0';
-            draw_text_clip(fb, 20, y + 22, buf, COL_DIM, TEXT_PX_SMALL, 56, CONTENT_Y, clip_bot);
+            draw_text_clip(fb, track_x, y + 22, buf, COL_DIM, TEXT_PX_SMALL,
+                          track_x + 36, CONTENT_Y, clip_bot);
             /* FB_W - 110, matching every other row in this file that reserves
              * space for a short right-aligned figure (album/track counts):
              * index_visible() is false on this screen, so draw_right_clip's
@@ -4467,7 +4560,7 @@ int music_entry(void *a0, void *a1) {
                     cur_track = j;
                     snprintf(ab_playing, sizeof(ab_playing), "%s",
                              ab_book.files[ab_book.chap[j].file]);
-                    art_request(ab_playing);
+                    art_request(ab_playing, "", "");
                     mlog("[music] rolled into %s\n", ab_book.chap[j].title);
                     dirty = 1;
                 }
@@ -4475,7 +4568,9 @@ int music_entry(void *a0, void *a1) {
             } else if (adv > 0) {
                 for (int i = 0; i < adv && cur_track + 1 < queue_n; i++) {
                     cur_track++;
-                    art_request(queue[cur_track].path);
+                    art_request(queue[cur_track].path,
+                                queue[cur_track].artist[0] ? queue[cur_track].artist : q_artist,
+                                q_album);
                     mlog("[music] rolled into %s\n", queue[cur_track].name);
                     dirty = 1;
                 }
@@ -4910,10 +5005,14 @@ int music_entry(void *a0, void *a1) {
                     save_conf();
                 }
             } else {
-                /* +scroll_px: the row under a tap follows the same visual
-                 * offset the drag applied when the list is not at a row
-                 * boundary. Always 0 on SC_MENU, which never scrolls. */
-                int idx = (y - CONTENT_Y + scroll_px) / ROW_H;
+                /* No +scroll_px: BG2 made rows page instead of slide, so a
+                 * row's drawn position never reflects scroll_px, only
+                 * `scroll` (see draw_screen()'s own comment on this). Adding
+                 * it back here reintroduced BG2's bug one level up — with a
+                 * fractional drag still pending, this idx pointed one row
+                 * past whatever was actually drawn under the finger, so a
+                 * tap opened the row below the one that was visibly tapped. */
+                int idx = (y - CONTENT_Y) / ROW_H;
                 if (screen == SC_MENU) {
                     if (idx >= TOP_N) { /* nothing there */ }
                     else if (idx == TOP_MUSIC) {
@@ -5516,7 +5615,7 @@ int music_entry(void *a0, void *a1) {
             long held = (now.tv_sec - touch_at.tv_sec) * 1000L +
                         (now.tv_nsec - touch_at.tv_nsec) / 1000000L;
             if (held >= HOLD_MS) {
-                int idx = scroll + (touch_y - CONTENT_Y + scroll_px) / ROW_H;
+                int idx = scroll + (touch_y - CONTENT_Y) / ROW_H;   /* see idx above */
                 hold_fired = 1;
                 if (idx < track_n) {
                     sheet_open = 1;

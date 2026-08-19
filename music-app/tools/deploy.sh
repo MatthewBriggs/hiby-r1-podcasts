@@ -16,8 +16,23 @@ command -v "$ADB" >/dev/null 2>&1 ||
     ADB=/opt/homebrew/share/android-commandlinetools/platform-tools/adb
 SO="${1:-$(dirname "$0")/../app/libmusic_hook.so}"
 TARGET=/usr/data/libpodcast_hook.so
+FONT="$(dirname "$0")/../fonts/font.ttf"
+FONT_TARGET=/usr/data/podcast_res/font.ttf
 
 [ -f "$SO" ] || { echo "no such build: $SO" >&2; exit 1; }
+
+# R35: text.c looks for the UI font here first. Push it whenever it's out of
+# date on the device, same md5-verify pattern as the .so, so a font update
+# can't silently no-op.
+if [ -f "$FONT" ]; then
+    fwant=$(md5 -q "$FONT" 2>/dev/null || md5sum "$FONT" | cut -d' ' -f1)
+    fgot=$($ADB shell "md5sum $FONT_TARGET 2>/dev/null" | tr -d '\r' | cut -d' ' -f1)
+    if [ "$fwant" != "$fgot" ]; then
+        $ADB shell "mkdir -p $(dirname "$FONT_TARGET")"
+        $ADB push "$FONT" "$FONT_TARGET" >/dev/null
+        echo "pushed font.ttf"
+    fi
+fi
 
 $ADB push "$SO" "$TARGET.new" >/dev/null
 echo "pushed $(basename "$SO")"
