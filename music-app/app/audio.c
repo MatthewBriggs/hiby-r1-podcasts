@@ -1110,6 +1110,89 @@ static int open_any(dec_t *d, const char *path) {
     return rc;
 }
 
+/* ---- MP3 seek table (background-built) ------------------------------------
+ * BG53: dr_mp3's default seek is brute-force -- with no index it decodes
+ * forward from wherever the stream currently sits (or from the very start,
+ * for a backward seek) to reach the target, real decode work proportional
+ * to how far into the file the target is, run synchronously inside the
+ * seek call itself. That's why a deep seek -- including a skip button,
+ * which is just a seek relative to the current position -- could stall the
+ * worker thread, and with it the position clock and playback both, for
+ * several seconds: "the bar jumps and then returns to its original
+ * position" was actually the display freezing at the pre-seek value while
+ * this ran, not a revert (confirmed by sequential screenshots after one
+ * tap: frozen, then landed correctly, then continued forward with no
+ * bounce back).
+ *
+ * dr_mp3 also supports binding a seek table (drmp3_bind_seek_table()) that
+ * turns the same call into an O(1) lookup plus a small bounded decode
+ * within one segment -- but building it costs a pass through the whole
+ * file's frame headers first, cheap per frame but proportional to file
+ * length, and a podcast episode runs long. Doing that synchronously at
+ * track-open would trade "seeking is occasionally slow" for "starting
+ * every track is slow", which is worse: most tracks are listened to start
+ * to finish without ever being seeked.
+ *
+ * So it's built in the background, on its own detached thread, against a
+ * *separate* drmp3 instance opened on the same file -- never touching the
+ * live playback decoder directly, since dr_mp3 has no internal thread
+ * safety of its own and the worker thread is continuously reading from it.
+ * The finished table crosses threads as a single pointer handoff through
+ * g_lock, and only the worker thread itself ever calls
+ * drmp3_bind_seek_table() on its own decoder, from its own main loop,
+ * alongside the other per-tick state it already checks there each pass.
+ * If the track has changed by the time a build finishes, the result is
+ * discarded rather than published (checked against g_path under the same
+ * lock), so a background build for a track skipped a second after it
+ * started can never clobber whatever the *current* track is doing. */
+#define MP3_SEEK_POINTS 400   /* ~1500 points/hour of audio; the residual
+                                * decode after a seek-table hit is bounded by
+                                * the spacing between points, not by how deep
+                                * into the file the target is */
+
+static drmp3_seek_point *g_seek_pending_points;
+static drmp3_uint32      g_seek_pending_count;
+static int               g_seek_pending_ready;
+
+static void *mp3_seektable_worker(void *arg) {
+    char *path = (char *)arg;
+    drmp3 tmp;
+    if (drmp3_init_file(&tmp, path, NULL)) {
+        drmp3_uint32 count = MP3_SEEK_POINTS;
+        drmp3_seek_point *points = malloc((size_t)count * sizeof(drmp3_seek_point));
+        if (points && drmp3_calculate_seek_points(&tmp, &count, points)) {
+            pthread_mutex_lock(&g_lock);
+            if (!strcmp(g_path, path)) {
+                free(g_seek_pending_points);
+                g_seek_pending_points = points;
+                g_seek_pending_count = count;
+                g_seek_pending_ready = 1;
+                points = NULL;   /* ownership transferred */
+            }
+            pthread_mutex_unlock(&g_lock);
+        }
+        free(points);   /* NULL-safe: frees only if not transferred above */
+        drmp3_uninit(&tmp);
+    }
+    free(path);
+    return NULL;
+}
+
+/* Kicks off a background build for `d` if it turned out to be MP3 -- call
+ * right after any open_any() that might have opened one, initial track and
+ * gapless advance alike. Fire-and-forget: detached, self-validates against
+ * g_path before publishing (see mp3_seektable_worker()), so nothing here
+ * ever needs joining or cancelling. */
+static void mp3_seektable_kickoff(dec_t *d, const char *path) {
+    if (d->kind != DEC_MP3) return;
+    char *pcopy = malloc(strlen(path) + 1);
+    if (!pcopy) return;
+    strcpy(pcopy, path);
+    pthread_t t;
+    if (pthread_create(&t, NULL, mp3_seektable_worker, pcopy) == 0) pthread_detach(t);
+    else free(pcopy);
+}
+
 /* Two slots, swapped by pointer at a track boundary. The decoders are third
  * party structs; moving one by assignment would work today and quietly stop
  * working the day one of them holds a pointer into itself. */
@@ -1224,6 +1307,15 @@ static void *worker(void *arg) {
 
     dec_t *d = &g_dec_slot[0];
     int slot = 0;
+    /* Discard any pending seek table a previous, since-abandoned session
+     * left behind (e.g. a track whose pcm_open() below failed after its
+     * table had already started building) -- nothing will ever consume it
+     * otherwise, since only this loop, below, ever does. */
+    pthread_mutex_lock(&g_lock);
+    free(g_seek_pending_points);
+    g_seek_pending_points = NULL; g_seek_pending_count = 0; g_seek_pending_ready = 0;
+    pthread_mutex_unlock(&g_lock);
+    drmp3_seek_point *bound_points = NULL;   /* currently bound to d->mp3, if any; owned here */
     if (open_any(d, g_path) != 0) {
         alog("[audio] cannot decode %s\n", g_path);
         pthread_mutex_lock(&g_lock);
@@ -1231,6 +1323,7 @@ static void *worker(void *arg) {
         pthread_mutex_unlock(&g_lock);
         return NULL;
     }
+    mp3_seektable_kickoff(d, g_path);
     int ch = d->channels > 0 ? d->channels : 2;
     unsigned rate = d->rate ? d->rate : 44100;   /* the source's own rate -- seek/duration/polling always key off this, never eff_rate */
     pthread_mutex_lock(&g_lock);
@@ -1288,8 +1381,27 @@ static void *worker(void *arg) {
         int vol = audio_using_bt() ? 100 : g_vol;   /* the mixer does it on BT */
         int seek = g_seek_to_ms; g_seek_to_ms = -1;
         int speed = g_speed;
+        int have_table = g_seek_pending_ready;
+        drmp3_seek_point *tbl_points = g_seek_pending_points;
+        drmp3_uint32 tbl_count = g_seek_pending_count;
+        if (have_table) { g_seek_pending_ready = 0; g_seek_pending_points = NULL; }
         pthread_mutex_unlock(&g_lock);
         if (!run) break;
+
+        /* BG53: bind a finished background seek table the moment it's
+         * ready. d->mp3 is only ever touched from this thread, so this is
+         * the one safe place to call drmp3_bind_seek_table() -- see the
+         * comment above mp3_seektable_worker(). */
+        if (have_table) {
+            if (d->kind == DEC_MP3) {
+                free(bound_points);
+                drmp3_bind_seek_table(&d->mp3, tbl_count, tbl_points);
+                bound_points = tbl_points;
+            } else {
+                free(tbl_points);   /* shouldn't happen, but the track could
+                                      * in principle have changed kind */
+            }
+        }
 
         /* Every 512 chunks (~5.5 s at 192 kHz, ~24 s at 44.1) compare this
          * thread's own CPU time against wall time. Two clock_gettime calls
@@ -1533,7 +1645,10 @@ static void *worker(void *arg) {
                 alog("[audio] cannot decode %s\n", nextp);
                 break;
             }
+            mp3_seektable_kickoff(nd, nextp);
             dec_close(d);
+            free(bound_points);
+            bound_points = NULL;   /* new track: its own table, if any, arrives via the loop above */
             d = nd;
             slot ^= 1;
 
@@ -1681,6 +1796,7 @@ static void *worker(void *arg) {
         x_close(pcm);
     }
     dec_close(d);
+    free(bound_points);
     pthread_mutex_lock(&g_lock);
     g_active = 0; g_running = 0; g_paused = 0;
     pthread_mutex_unlock(&g_lock);

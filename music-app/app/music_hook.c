@@ -1935,10 +1935,27 @@ static void draw_mini(uint16_t *fb) {
      * rather than a bar that can never move. */
     if (!radio_mode && cur_track >= 0 && cur_track < queue_n) {
         lib_track_t *t = &queue[cur_track];
-        int dur = audio_dur_ms();
-        if (dur <= 0) dur = t->dur_ms;
+        int pos, dur;
+        /* BG56: audio_dur_ms()/audio_pos_ms() are file-scoped, not
+         * chapter-scoped -- for a multi-chapter book that's the position
+         * and length of the whole file (often the whole book), not the
+         * chapter actually playing. This is the same chapter-relative
+         * math the full player's own Now Playing screen already uses
+         * (see its book/chapter bar code) -- the mini player just never
+         * got it, so its glanceable bar was quietly showing book
+         * progress the whole time. */
+        if (audiobook_mode && cur_track < ab_book.chap_n) {
+            const ab_chapter_t *ch = &ab_book.chap[cur_track];
+            dur = (int)ch->dur_ms;
+            if (dur <= 0) dur = audio_dur_ms();   /* one-file-one-chapter book */
+            pos = (int)(audio_pos_ms() - ch->file_start_ms);
+            if (pos < 0) pos = 0;
+        } else {
+            dur = audio_dur_ms();
+            if (dur <= 0) dur = t->dur_ms;
+            pos = audio_pos_ms();
+        }
         if (dur > 0) {
-            int pos = audio_pos_ms();
             int w = FB_W * pos / dur;
             if (w > FB_W) w = FB_W;
             if (w > 0) fill_rect(fb, 0, FB_H - 1, w, 1, COL_ACCENT);
@@ -5059,17 +5076,28 @@ int music_entry(void *a0, void *a1) {
                                                    tracks, (int)(sizeof(tracks)/sizeof(tracks[0])));
                     mlog("[music] %s -> %d tracks\n", cur_album, track_n);
                 } else if (screen == SC_AUDIOBOOKS && scroll + idx < ab_book_n) {
-                    ab_save_current_pos();       /* whatever was playing, before it's overwritten */
                     ab_book_t *b = &ab_books[scroll + idx];
-                    ab_load_book(b);
-                    audiobook_mode = 1;
-                    audio_set_speed(ab_speed_permille);
-                    ab_playing[0] = '\0';        /* force a real open */
-                    queue_n = 0;                 /* force the mirror into queue[] */
-                    screen = SC_PLAYING;
-                    ab_resume_book();
-                    mlog("[music] %s -> %d chapters in %d file(s)\n",
-                         cur_album, ab_book.chap_n, ab_book.file_n);
+                    if (audiobook_mode && !strcmp(b->dir, ab_book.dir)) {
+                        /* BG57: tapping the book already playing should behave
+                         * like tapping the mini player -- straight to Now
+                         * Playing, exactly where it is -- not reopen it as if
+                         * freshly chosen. ab_load_book()/ab_resume_book()
+                         * exist to *start* a book; calling them here would
+                         * rescan the chapters and reseek to the last *saved*
+                         * position, discarding whatever's actually mid-play. */
+                        screen = SC_PLAYING;
+                    } else {
+                        ab_save_current_pos();   /* whatever was playing, before it's overwritten */
+                        ab_load_book(b);
+                        audiobook_mode = 1;
+                        audio_set_speed(ab_speed_permille);
+                        ab_playing[0] = '\0';    /* force a real open */
+                        queue_n = 0;             /* force the mirror into queue[] */
+                        screen = SC_PLAYING;
+                        ab_resume_book();
+                        mlog("[music] %s -> %d chapters in %d file(s)\n",
+                             cur_album, ab_book.chap_n, ab_book.file_n);
+                    }
                 } else if (screen == SC_PODCASTS && scroll + idx < pod_feed_n) {
                     snprintf(cur_feed, sizeof(cur_feed), "%s", pod_feeds[scroll + idx].name);
                     pod_ep_n = pod_load_episodes(cur_feed, pod_eps, POD_MAX_ITEMS);
