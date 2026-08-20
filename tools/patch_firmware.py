@@ -267,8 +267,9 @@ def need(tool):
 # present, run the player once, reboot when it exits. There is no anchor to
 # key an incremental patch off, so build_vanilla_supervisor() below
 # constructs the complete replacement directly instead, reusing the mod's
-# own already-shipped supervisor loop (app/hiby_player.sh in this repo) as
-# the reference for the parts that are proven -- the crash-counting shape,
+# own already-shipped supervisor loop (as it existed in a mod-based
+# yetisoldier Audiobook Mod install) as the reference for the parts that are
+# proven -- the crash-counting shape,
 # DEV_HOOK_GIVEUP, HEALTHY_RUN -- with three differences: vanilla's own batd
 # preamble is kept rather than introduced, HOOK_LIB is dropped entirely (the
 # yetisoldier Audiobook Mod's own separate tile hijack has no reason to exist
@@ -420,7 +421,8 @@ def patch_script(text):
             die(f"{SCRIPT}: expected exactly one {name} anchor, found "
                 f"{text.count(anchor)}. This firmware's supervisor differs from "
                 f"the 2.0.25/2.0.26 releases this was written against; patch it "
-                f"by hand using app/hiby_player.sh as the reference.")
+                f"by hand, using ANCHOR_CONFIG/ANCHOR_LAUNCH/ANCHOR_COUNT above "
+                f"as the reference for what each anchor expects.")
     # STARTED has to be set before wait, so the counter anchor absorbs both.
     text = text.replace(ANCHOR_CONFIG, INSERT_CONFIG)
     text = text.replace(ANCHOR_LAUNCH, INSERT_LAUNCH)
@@ -812,8 +814,8 @@ def main():
             die(f"{SCRIPT} matches neither the mod's supervisor shape nor "
                 f"vanilla's bare one — this firmware's {SCRIPT} has changed "
                 f"from what this tool knows. Patch it by hand, using "
-                f"app/hiby_player.sh (mod-based) or build_vanilla_supervisor() "
-                f"(vanilla) as the reference.")
+                f"patch_script() (mod-based) or build_vanilla_supervisor() "
+                f"(vanilla) above as the reference.")
         with open(target, "w") as fh:
             fh.write(patched)
         print(f"patched {SCRIPT} ({kind} base, "

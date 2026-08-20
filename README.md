@@ -1,38 +1,29 @@
 # Library & Podcasts for the HiBy R1
 
-Two apps that turn a stock HiBy R1 into a real platform: **Library** — music,
-audiobooks, parametric EQ and internet radio, replacing the stock **Stream
-media** tile — and **Podcasts**, on the tile where **About** used to be.
-Neither patches the stock binary; both `LD_PRELOAD` into `hiby_player` and
-re-point a launcher tile's callback at themselves.
+One app that turns a stock HiBy R1 into a real platform: music, audiobooks,
+parametric EQ, internet radio and podcasts, replacing the stock **About**
+tile. It doesn't patch the stock binary — it `LD_PRELOAD`s into `hiby_player`
+and re-points a launcher tile's callback at itself.
 
-Library chain-loads Podcasts at startup, so with both installed you get one
-coherent app with two more tiles than stock, not two things fighting for the
-same slot.
-
-<p align="center">
-  <img src="podcast-app/docs/screenshots/01-launcher-tiles.png" width="240" alt="Launcher with the Podcasts tile">
-  <img src="podcast-app/docs/screenshots/02-feeds.png" width="240" alt="Feed list">
-  <img src="podcast-app/docs/screenshots/05-playing.png" width="240" alt="Now playing">
-</p>
+This used to be two separate apps sharing the device (Library on Stream
+media, a standalone Podcasts app chain-loaded onto About). Podcasts is built
+into Library directly now, so that second app was retired; Library moved
+onto the About tile in its place, and Stream media is untouched, back to its
+stock behaviour.
 
 ## What you get
 
-**Library** (`music-app/`) — browse by album artist, album, artist or genre
-straight from the stock media index; gapless playback; FLAC, MP3, WAV, M4A,
-OGG Vorbis and Opus; a **Now Playing** screen with full track detail and
-output route; a dedicated **Audiobooks** section (folder-scoped, remembers
-position); a built-in **parametric EQ** with EqualizerAPO profile support;
-**internet radio** (direct streams and HLS); output to jack, USB DAC or
-Bluetooth chosen automatically; hardware key mapping that accounts for the
-unit's mislabeled buttons; auto screen lock and **auto shutdown** after an
-idle period; quick settings pulled down from the status strip; playlists as
-plain `.m3u` files.
-
-**Podcasts** (`podcast-app/`) — subscriptions in a plain text file, updated
-on demand; MP3 playback with real transport (±10s/±30s, play/pause); speed
-0.5–2.0× with pitch preserved (WSOLA); per-episode resume across reboots;
-scrollable show notes; cover art per feed; full Latin text rendering.
+Browse by album artist, album, artist or genre straight from the stock media
+index; gapless playback; FLAC, MP3, WAV, M4A, OGG Vorbis and Opus; a **Now
+Playing** screen with full track detail and output route; a dedicated
+**Audiobooks** section (folder-scoped, remembers position); a built-in
+**parametric EQ** with EqualizerAPO profile support; **internet radio**
+(direct streams and HLS); **podcasts** — subscriptions in a plain text file,
+updated on demand, per-episode resume across reboots, scrollable show notes,
+cover art per feed; output to jack, USB DAC or Bluetooth chosen
+automatically; hardware key mapping that accounts for the unit's mislabeled
+buttons; auto screen lock and **auto shutdown** after an idle period; quick
+settings pulled down from the status strip; playlists as plain `.m3u` files.
 
 ## Requirements
 
@@ -47,16 +38,16 @@ scrollable show notes; cover art per feed; full Latin text rendering.
 - On the host: Python with `pycdlib`, and `squashfs-tools`, to patch the
   image; [Zig](https://ziglang.org/) if you're building from source.
 
-> Both apps' tile-hijack addresses are read out of one specific `hiby_player`
+> The tile-hijack addresses are read out of one specific `hiby_player`
 > binary. On a different firmware build they will point somewhere else, and
-> each app declines to arm itself rather than guess — see
+> the app declines to arm itself rather than guess — see
 > [Porting](#porting-to-another-firmware-build).
 
 ## Install
 
-Two halves: a firmware flash, then pushing the apps themselves. Both hooks
-are loaded by `/usr/bin/hiby_player.sh`, which lives on a read-only squashfs
-and **cannot be pushed to the device** — it has to go in through a firmware
+Two halves: a firmware flash, then pushing the app itself. The hook is
+loaded by `/usr/bin/hiby_player.sh`, which lives on a read-only squashfs and
+**cannot be pushed to the device** — it has to go in through a firmware
 image.
 
 ### 1. Patch your firmware
@@ -81,11 +72,10 @@ which files changed:
 ```
 
 It must end with `RESULT: image verifies`. The changed files are the
-supervisor script (rebuilt from a bare vanilla `hiby_player.sh` — see
-[`podcast-app/app/hiby_player.sh`](podcast-app/app/hiby_player.sh), kept in
-the repo for reference), the mount script, `bt_init` (adds Bluetooth headset
-battery reporting), the About-tile re-enable, and the internet-radio layout
-swap.
+supervisor script (rebuilt from a bare vanilla `hiby_player.sh` —
+`build_vanilla_supervisor()` in `tools/patch_firmware.py` is the reference
+for its shape), the mount script, `bt_init` (adds Bluetooth headset battery
+reporting), the About-tile re-enable, and the internet-radio layout swap.
 
 Flash it the way you'd flash any `.upt` — copy it to the SD card and use the
 player's own firmware update — then come back for the second half.
@@ -95,54 +85,44 @@ player's own firmware update — then come back for the second half.
 > future firmware release changes that script again, patch it by hand using
 > `podcast-app/app/hiby_player.sh` as the reference.
 
-### 2. Install the apps
+### 2. Install the app
 
-Build both (or take the `.so` files from a release):
+Build it (or take the `.so` file from a release):
 
 ```bash
 cd music-app/app && ./build.sh
-cd ../../podcast-app/app && ./build.sh
 ```
 
-The firmware preloads exactly one library from `/usr/data`, so Library takes
-that slot and chain-loads Podcasts from a second one:
+The firmware preloads exactly one library from `/usr/data`:
 
 ```bash
 adb push music-app/app/libmusic_hook.so /usr/data/libpodcast_hook.so
 adb shell chmod 755 /usr/data/libpodcast_hook.so
 ```
 
-```bash
-adb push podcast-app/app/libpodcast_hook.so /usr/data/libpodcast_hook.so.real
-adb shell chmod 755 /usr/data/libpodcast_hook.so.real
-```
+(`libpodcast_hook.so` predates this app absorbing Podcasts — the device only
+looks at the path, so it's left as-is rather than renamed for cosmetics.)
 
-(The `libpodcast_hook.so` name on Library's own slot is legacy — it predates
-Library absorbing the Podcasts hand-off — but the device only looks at the
-path, so it's left as-is rather than renamed for cosmetics.)
-
-Push the icons:
+Push the icon:
 
 ```bash
-adb push music-app/icon/stream_media.png music-app/icon/stream_media_s.png /usr/data/music_res/
-adb shell mkdir -p /usr/data/podcast_res
-adb push podcast-app/icon/out/about.png podcast-app/icon/out/about_s.png /usr/data/podcast_res/
+adb push music-app/icon/about.png music-app/icon/about_s.png /usr/data/music_res/
 ```
 
-Always check both objects load before rebooting; a link error otherwise costs
+Always check the object loads before rebooting; a link error otherwise costs
 a boot cycle:
 
 ```bash
 adb shell 'LD_PRELOAD=/usr/data/libpodcast_hook.so /bin/true'
 ```
 
-Podcasts also needs its fetcher and dependencies on the card — `curl` is a
+Podcasts needs its fetcher and dependencies on the card — `curl` is a
 **static mipsel build you must supply**, since busybox's `wget` only offers
 legacy TLS ciphers that every modern podcast host rejects:
 
 ```bash
 adb shell mkdir -p /data/mnt/sd_0/.podsync
-adb push podcast-app/app/podsync_once.sh podcast-app/app/parse_rss.awk /data/mnt/sd_0/.podsync/
+adb push music-app/podsync/podsync_once.sh music-app/podsync/parse_rss.awk /data/mnt/sd_0/.podsync/
 ```
 
 The device has **no CA store at all** and `/etc` is read-only, so curl needs
@@ -163,12 +143,12 @@ feed rather than an expired trust store.
 Write your subscriptions, then reboot:
 
 ```bash
-adb push podcast-app/app/feeds.txt /data/mnt/sd_0/.podsync/feeds.txt
+adb push music-app/podsync/feeds.txt.example /data/mnt/sd_0/.podsync/feeds.txt
 adb shell sync && adb shell reboot
 ```
 
-Two tiles come back: **Stream media** as Library (music note icon, same
-position as stock), and **About** as **Podcasts** (microphone icon).
+**About** comes back as **Library** (music note icon, same position as
+stock); **Stream media** is untouched, back to its stock behaviour.
 
 ## Using it
 
@@ -196,40 +176,37 @@ nothing is ever deleted automatically.
 
 ## Building
 
-Both apps cross-compile with [Zig](https://ziglang.org/) — no toolchain to
-install, and it targets the R1's ancient glibc directly:
+Cross-compiles with [Zig](https://ziglang.org/) — no toolchain to install,
+and it targets the R1's ancient glibc directly:
 
 ```bash
 cd music-app/app && ./build.sh
-cd podcast-app/app && ./build.sh
 ```
 
-Launcher icons are generated, not drawn by hand:
+The launcher icon is generated, not drawn by hand:
 
 ```bash
 python3 music-app/icon/make_icon.py music-app/icon
-python3 podcast-app/icon/make_icon.py podcast-app/icon/out
 ```
 
 ## How it works
 
-The short version; [`podcast-app/STATUS.md`](podcast-app/STATUS.md) has the
-full account for Podcasts.
-
 - **Getting in.** A launcher tile's name string and its callback live in
   different 96-byte `.data` records — for a name at `S`, the callback is at
-  `S + 0x48`. The callback may **not** point into the injected `.so` or the
-  launcher silently fails to render at all, so a MIPS trampoline is written
-  into a zeroed `.rodata` code cave and the tile is pointed there.
-- **Owning the screen.** Each app takes the framebuffer (`mmap /dev/fb0`,
+  `S + 0x48`. The About tile shows up at two callback addresses in
+  `hiby_player`'s data, both patched so it's caught wherever the launcher
+  reads it from. The callback may **not** point into the injected `.so` or
+  the launcher silently fails to render at all, so a MIPS trampoline is
+  written into a zeroed `.rodata` code cave and the tile is pointed there.
+- **Owning the screen.** The app takes the framebuffer (`mmap /dev/fb0`,
   page flipping via `FBIOPAN_DISPLAY`) and `EVIOCGRAB`s the touch and key
   nodes while active, so input does not leak through to the launcher
-  underneath. Each runs its own frame loop rather than blocking the player's
+  underneath. It runs its own frame loop rather than blocking the player's
   UI thread.
-- **Fail-safe hooking.** Both hooks check that the tile callback they're
-  about to overwrite still holds the value they expect before touching
-  anything. A mismatched firmware build degrades to the stock tile rather
-  than a bricked launcher.
+- **Fail-safe hooking.** The hook checks that the tile callback it's about
+  to overwrite still holds the value it expects before touching anything. A
+  mismatched firmware build degrades to the stock tile rather than a
+  bricked launcher.
 - **Volume.** The CS43131's volume registers aren't wired on this device, so
   wired output scales samples in software; Bluetooth is different — bluealsa
   exposes a real mixer, and that gets driven instead.
@@ -239,20 +216,18 @@ full account for Podcasts.
 - Podcasts plays **MP3 only** — no AAC, M4A/M4B, Opus or FLAC episodes.
 - Long titles clip at the right edge instead of ellipsing.
 - English UI only; other languages fall back to stock labels where a string
-  had to be rewritten (Podcasts' tile label).
+  had to be rewritten (the tile label).
 - Tile-hijack addresses are hardcoded per firmware build — see
   [Porting](#porting-to-another-firmware-build).
 
 ## Porting to another firmware build
 
-Each app reads its tile-hijack addresses out of one specific `hiby_player`:
-`TILE_CB`/`TILE_CB_ORIG` in
-[`music-app/app/music_hook.c`](music-app/app/music_hook.c), and
-`ABOUT_CB_2`/`ABOUT_CB_ORIG`/`CAVE_ADDR` in
-[`podcast-app/app/podcast_hook.c`](podcast-app/app/podcast_hook.c). Each
-constructor verifies the callback holds the value it expects and refuses to
-patch anything if it does not, so a mismatched build degrades to the stock
-tile instead of a bricked launcher.
+The app reads its tile-hijack addresses out of one specific `hiby_player`:
+`ABOUT_CB_1`/`ABOUT_CB_2`/`ABOUT_CB_ORIG`/`CAVE_ADDR` in
+[`music-app/app/music_hook.c`](music-app/app/music_hook.c). The constructor
+verifies the callback holds the value it expects and refuses to patch
+anything if it does not, so a mismatched build degrades to the stock tile
+instead of a bricked launcher.
 
 ## Licence
 

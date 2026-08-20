@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """Draw the Library launcher icon in the stock theme's style.
 
+This app moved from the Stream media tile onto the About tile (retiring the
+standalone Podcasts app that used to live there), so this writes about.png/
+about_s.png now instead of stream_media.png/stream_media_s.png -- same
+artwork either way, only the destination filenames the launcher expects
+changed.
+
 Measured from the shipped theme2 icons rather than guessed: 140x140, an opaque
 black field, a grey (87,87,91) rounded square of half-extent 60 and corner
 radius 50 centred in the tile, and a single flat-coloured glyph. Each app gets
@@ -115,5 +121,5 @@ def write_png(path, rows):
 
 if __name__ == "__main__":
     out = sys.argv[1] if len(sys.argv) > 1 else "."
-    write_png(f"{out}/stream_media.png", render(False))
-    write_png(f"{out}/stream_media_s.png", render(True))
+    write_png(f"{out}/about.png", render(False))
+    write_png(f"{out}/about_s.png", render(True))

@@ -882,16 +882,14 @@ static int bt_read_pct(void) {
  * g_vol update so the display still feels instant. */
 static pthread_mutex_t bt_vol_lock = PTHREAD_MUTEX_INITIALIZER;
 static int bt_vol_pending;            /* 1 = a write is waiting to be applied */
-static int bt_vol_pending_is_delta;
 static int bt_vol_pending_abs;
-static int bt_vol_pending_delta;
 
 void audio_volume_set(int pct) {
     if (pct < 0) pct = 0;
     if (pct > 100) pct = 100;
     if (!audio_using_bt()) { audio_set_volume(pct); return; }
     pthread_mutex_lock(&bt_vol_lock);
-    bt_vol_pending = 1; bt_vol_pending_is_delta = 0; bt_vol_pending_abs = pct;
+    bt_vol_pending = 1; bt_vol_pending_abs = pct;
     pthread_mutex_unlock(&bt_vol_lock);
     pthread_mutex_lock(&g_lock); g_vol = pct; pthread_mutex_unlock(&g_lock);
 }
@@ -904,27 +902,33 @@ void audio_volume_step(int delta) {
         audio_set_volume(v);
         return;
     }
-    pthread_mutex_lock(&bt_vol_lock);
-    /* Accumulate rather than overwrite (BG23): the background thread only
-     * drains this every ~100ms, plus however long the amixer round-trip
-     * itself takes, and a real button press easily fires several times
-     * inside that window. Overwriting meant every press but the last one
-     * before a drain was silently dropped from what actually reached the
-     * mixer, while g_vol below had already counted all of them -- so the
-     * readback that followed snapped the display back down, which is what
-     * "jumps around" actually was. Same-direction repeats now add up; a
-     * pending absolute set (from the slider) still just takes the delta
-     * fresh, since there's no meaningful way to accumulate onto a target
-     * value instead of a step. */
-    if (bt_vol_pending && bt_vol_pending_is_delta) bt_vol_pending_delta += delta;
-    else bt_vol_pending_delta = delta;
-    bt_vol_pending = 1; bt_vol_pending_is_delta = 1;
-    pthread_mutex_unlock(&bt_vol_lock);
+    /* g_vol accumulates every press even though the background thread only
+     * drains every ~100ms (BG23) -- several presses easily land inside that
+     * window, and overwriting instead of accumulating dropped all but the
+     * last one from what reached the mixer while g_vol had already counted
+     * them all, which is what "jumps around" originally was.
+     *
+     * What actually got sent to the mixer was a *relative* amixer step
+     * ("+35%"), computed against bluealsa's own current raw value on
+     * whatever internal (likely non-linear/dB) curve it uses -- not against
+     * g_vol's clean linear accumulation. Batching several quick presses
+     * into one big relative jump could land on a very different raw value
+     * than doing them one at a time would have: confirmed live, seven
+     * presses accumulating to g_vol=100 sent as a single "35%+" read back
+     * at 65%, an outright drop after raising the volume -- "two volume
+     * controls" disagreeing, exactly as reported. Pushing g_vol's own
+     * already-correct absolute value as the target instead keeps the same
+     * coalescing (multiple presses before a drain still collapse into one
+     * write) but the real mixer can never diverge from what's on screen,
+     * whatever its own step curve does internally. */
     pthread_mutex_lock(&g_lock);
     int v = g_vol + delta;
     if (v < 0) v = 0; if (v > 100) v = 100;
     g_vol = v;
     pthread_mutex_unlock(&g_lock);
+    pthread_mutex_lock(&bt_vol_lock);
+    bt_vol_pending = 1; bt_vol_pending_abs = v;
+    pthread_mutex_unlock(&bt_vol_lock);
 }
 
 /* True if a write is waiting, so the background thread can check cheaply
@@ -944,10 +948,9 @@ int audio_bt_volume_pending(void) {
 void audio_bt_volume_service(void) {
     if (!audio_using_bt()) return;
 
-    int pending, is_delta, abs_val, delta;
+    int pending, abs_val;
     pthread_mutex_lock(&bt_vol_lock);
-    pending = bt_vol_pending; is_delta = bt_vol_pending_is_delta;
-    abs_val = bt_vol_pending_abs; delta = bt_vol_pending_delta;
+    pending = bt_vol_pending; abs_val = bt_vol_pending_abs;
     bt_vol_pending = 0;
     pthread_mutex_unlock(&bt_vol_lock);
 
@@ -956,12 +959,12 @@ void audio_bt_volume_service(void) {
 
     if (pending) {
         char cmd[224];
-        if (is_delta)
-            snprintf(cmd, sizeof(cmd), "amixer -D bluealsa sset '%s' %d%%%c >/dev/null 2>&1",
-                     bt_mixer, delta < 0 ? -delta : delta, delta < 0 ? '-' : '+');
-        else
-            snprintf(cmd, sizeof(cmd), "amixer -D bluealsa sset '%s' %d%% >/dev/null 2>&1",
-                     bt_mixer, abs_val);
+        /* Always an absolute target, never a relative step -- see
+         * audio_volume_step()'s comment for why a batched relative step
+         * against the mixer's own current value could disagree with g_vol
+         * by tens of percent. */
+        snprintf(cmd, sizeof(cmd), "amixer -D bluealsa sset '%s' %d%% >/dev/null 2>&1",
+                 bt_mixer, abs_val);
         if (system(cmd) == -1) return;
     }
 
@@ -1359,6 +1362,27 @@ static void *worker(void *arg) {
      * instead. */
     unsigned eff_rate = g_out_rate;
     eq_set_format(eff_rate, ch);
+
+    /* Every track opens a brand new bluealsa PCM connection (pcm_open()
+     * above), and bluealsa resets its own mixer to a default level on each
+     * new connection -- independent of the AVRCP-adjacent control this app
+     * already tracks in bt_mixer/g_vol. audio_bt_volume_service() always
+     * reads that mixer back and trusts it (correct: the headset's own
+     * buttons move it without an event reaching this app at all), so
+     * without this, the first readback after a track change silently
+     * overwrote g_vol with bluealsa's reset default -- reported live as
+     * "volume reverts to where it was" on every track/album change while on
+     * Bluetooth. Re-pushing the last-known volume onto the fresh stream's
+     * mixer here, before that first readback can happen, keeps the level
+     * the user actually chose instead of losing it to the reconnect. */
+    if (g_out_kind == 2) {
+        pthread_mutex_lock(&g_lock);
+        int cur_vol = g_vol;
+        pthread_mutex_unlock(&g_lock);
+        pthread_mutex_lock(&bt_vol_lock);
+        bt_vol_pending = 1; bt_vol_pending_abs = cur_vol;
+        pthread_mutex_unlock(&bt_vol_lock);
+    }
 
     /* Two buffers, because the two paths carry different sample sizes. Only
      * the lossless formats above 16 bits use the wide one; MP3 and AAC decode

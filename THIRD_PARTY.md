@@ -2,16 +2,6 @@
 
 ## Vendored sources
 
-### Podcasts (`podcast-app/`)
-
-| Path | Project | Licence |
-|---|---|---|
-| `podcast-app/app/vendor/minimp3.h`, `podcast-app/app/vendor/minimp3_ex.h` | [minimp3](https://github.com/lieff/minimp3) by lieff | CC0-1.0 (public domain) |
-| `podcast-app/app/vendor/stb_truetype.h` | [stb](https://github.com/nothings/stb) by Sean Barrett | Public domain / MIT |
-| `podcast-app/app/vendor/jpeg9/*.h` | [libjpeg 9](https://ijg.org/) by the Independent JPEG Group | IJG licence |
-
-### Library (`music-app/`)
-
 | Path | Project | Licence |
 |---|---|---|
 | `music-app/app/vendor/dr_flac.h`, `dr_mp3.h`, `dr_wav.h`, `dr_impl.c` | [dr_libs](https://github.com/mackron/dr_libs) by David Reid | Public domain / MIT-0 |
@@ -19,7 +9,14 @@
 | `music-app/app/vendor/ogg/*` | [libogg](https://www.xiph.org/ogg/) (Xiph.Org) | BSD-style |
 | `music-app/app/vendor/opus/*.h` | [libopus](https://opus-codec.org/) (Xiph.Org / IETF) | BSD-style |
 | `music-app/app/vendor/vorbis/codec.h` | [libvorbis](https://xiph.org/vorbis/) (Xiph.Org) | BSD-style |
+| `music-app/app/vendor/stb_truetype.h` | [stb](https://github.com/nothings/stb) by Sean Barrett | Public domain / MIT |
+| `music-app/app/vendor/jpeg9/*.h` | [libjpeg 9](https://ijg.org/) by the Independent JPEG Group | IJG licence |
 | `music-app/tools/icons/*.svg` | [Font Awesome Free](https://fontawesome.com) by Fonticons, Inc. | CC BY 4.0 (icons) |
+
+(This app used to share the device with a separate standalone Podcasts app,
+retired once Podcasts was absorbed into this one directly — it vendored its
+own copy of minimp3 for MP3 decoding, which went with it. This app's own MP3
+decoding has always gone through `dr_mp3.h` above.)
 
 The Font Awesome SVGs are source assets, not shipped as SVG: they are
 rasterized offline by `music-app/tools/icons/gen_icons.py` into 8-bit
@@ -103,8 +100,7 @@ early on while working out how the firmware image is packed.
 ## Not included
 
 HiBy's own resources — the stock launcher icons, the `.ini` string tables, and
-the firmware itself — are not redistributed here. Both tiles' icons are drawn
-from scratch (`podcast-app/icon/make_icon.py`, `music-app/icon/make_icon.py`),
-and Podcasts' label is produced at runtime by rewriting a single string in
-whatever `settings.ini` the installed firmware provides. Nothing in this
-repository is HiBy's.
+the firmware itself — are not redistributed here. The tile icon is drawn from
+scratch (`music-app/icon/make_icon.py`), and its label is produced at runtime
+by rewriting a single string in whatever `settings.ini` the installed
+firmware provides. Nothing in this repository is HiBy's.

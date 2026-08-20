@@ -1,6 +1,6 @@
 # HiBy R1 — Library
 
-A music and radio app for the HiBy R1, replacing the stock **Stream media**
+A music, radio and podcast app for the HiBy R1, replacing the stock **About**
 tile. It exists because the stock browser lists an album artist's *tracks*
 rather than their *albums* — pick Berliner Philharmoniker and you get hundreds
 of individual pieces instead of the sixteen albums they belong to.
@@ -80,15 +80,14 @@ Build, then copy onto the device:
 ```
 app/build.sh
 adb push app/libmusic_hook.so /usr/data/libpodcast_hook.so
-adb push icon/stream_media.png /usr/data/music_res/stream_media.png
-adb push icon/stream_media_s.png /usr/data/music_res/stream_media_s.png
+adb push icon/about.png /usr/data/music_res/about.png
+adb push icon/about_s.png /usr/data/music_res/about_s.png
 ```
 
 The firmware preloads exactly one library, and that slot is
-`/usr/data/libpodcast_hook.so`. If you also run the Podcasts app, put its
-library at `/usr/data/libpodcast_hook.so.real` and this app will load it on
-startup — the two hooks patch different launcher tiles into different code
-caves and coexist. Missing is not an error.
+`/usr/data/libpodcast_hook.so` (a legacy name that predates this app
+absorbing Podcasts — the device only looks at the path, so it's left as-is
+rather than renamed for cosmetics).
 
 Always check the object loads before rebooting; a link error otherwise costs a
 boot cycle:

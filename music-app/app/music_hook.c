@@ -1,15 +1,20 @@
-/* music_hook.c — a music and radio app on the R1's Stream media launcher tile.
+/* music_hook.c — a music and radio app on the R1's About launcher tile.
  *
- * Same in-process approach as the Podcasts app: LD_PRELOAD into hiby_player,
- * re-point a launcher tile's callback at us, and take the framebuffer and input
- * for as long as the app is open. The two hooks coexist — they claim different
- * tiles and different code caves.
+ * LD_PRELOAD into hiby_player, re-point a launcher tile's callback at us, and
+ * take the framebuffer and input for as long as the app is open.
  *
- *   tile     stream_media, record 0x008925E8, callback slot 0x00892630
- *   cave     0x00760800, a zeroed run in .rodata well clear of the Podcasts
- *            app's 0x0075E400
+ *   tile     about, callback slots 0x00892150 and 0x00892570 (the tile shows
+ *            up twice in hiby_player's own data, both patched so it's caught
+ *            wherever the launcher reads it from)
+ *   cave     0x00760800, a zeroed run in .rodata
  *
- * Both addresses were read straight out of hiby_player rather than found by
+ * This app used to live on the Stream media tile, chain-loading a separate
+ * standalone Podcasts app onto the About tile from its own constructor.
+ * Podcasts is built into this app directly now (see podcast.c), so that
+ * second app was retired and this hook moved onto the About tile in its
+ * place -- Stream media is untouched and back to its stock behaviour.
+ *
+ * Addresses were read straight out of hiby_player rather than found by
  * scanning a live device: tile records hold their name as an inline string at
  * +0x00 and the callback at +0x48, so a new firmware can be re-derived in
  * seconds. See the tile-table notes in the repo.
@@ -22,7 +27,6 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <dlfcn.h>
 #include <sys/mount.h>
 #include <math.h>
 #include <time.h>
@@ -124,12 +128,12 @@ static int usb_bypass_bt_was_on;
 #define LIST_TAP_SETTLE_TICKS 3
 
 /* ---- tile hook ----------------------------------------------------------- */
-#define TILE_CB       0x00892630u   /* stream_media record + 0x48 */
-#define TILE_CB_ORIG  0x0053C300u   /* what it holds on a stock 2.0.26 */
+#define ABOUT_CB_1    0x00892150u
+#define ABOUT_CB_2    0x00892570u   /* the live About tile callback */
+#define ABOUT_CB_ORIG 0x0053BC20u   /* what it holds on a stock 2.0.25/2.0.26 */
 #define CAVE_ADDR     0x00760800u
-#define PODCAST_HOOK_PATH "/usr/data/libpodcast_hook.so.real"
 #define CAVE_PAGE     (CAVE_ADDR & ~0xFFFu)
-#define DATA_PAGE     (TILE_CB & ~0xFFFu)
+#define DATA_PAGE     0x00892000u
 #define PAGE_SPAN     0x2000u
 
 /* Was /tmp, which a reboot wipes — and a lockup is always followed by a
@@ -500,11 +504,22 @@ static void draw_line(uint16_t *fb, int x0, int y0, int x1, int y1, uint16_t c) 
     }
 }
 
-static void draw_toggle_switch(uint16_t *fb, int y, int on) {
-    int w = 68, h = 32, x = FB_W - 24 - w;
-    fill_pill(fb, x, y + 16, w, h, on ? COL_ACCENT : COL_LINE);
-    fill_circle(fb, on ? x + w - h / 2 : x + h / 2, y + 16 + h / 2, h / 2 - 3,
+/* Centers the switch on an explicit block height rather than always ROW_H --
+ * some rows (Settings' Power button lock / Bypass DSP on USB) draw a
+ * two-line description below the title, and the divider bounding "this
+ * setting" spans that whole block, not just the top 72px title slice. The
+ * old fixed y+16 also put the pill's midpoint at y+32 against a plain row's
+ * actual center at y+36, a 4px-high misalignment even ignoring the
+ * description issue (BG63). */
+static void draw_toggle_switch_h(uint16_t *fb, int y, int on, int block_h) {
+    int w = 68, h = 32, x = FB_W - 24 - w, top = y + block_h / 2 - h / 2;
+    fill_pill(fb, x, top, w, h, on ? COL_ACCENT : COL_LINE);
+    fill_circle(fb, on ? x + w - h / 2 : x + h / 2, top + h / 2, h / 2 - 3,
                 on ? COL_BG : COL_DIM);
+}
+
+static void draw_toggle_switch(uint16_t *fb, int y, int on) {
+    draw_toggle_switch_h(fb, y, on, ROW_H);
 }
 
 /* dir = +1 points right, -1 points left. */
@@ -1726,6 +1741,15 @@ static void draw_right(uint16_t *fb, int y, const char *s) {
     int w = text_width(s, TEXT_PX_SMALL);
     int right = FB_W - 24 - (index_visible() ? INDEX_W : 0);
     draw_text(fb, right - w, y, s, COL_DIM, TEXT_PX_SMALL, FB_W);
+}
+
+/* Same as draw_right(), but lets the caller pick a colour instead of the
+ * fixed COL_DIM -- used for values that should read as accented/interactive
+ * rather than plain informational text (BG63). */
+static void draw_right_col(uint16_t *fb, int y, const char *s, uint16_t col) {
+    int w = text_width(s, TEXT_PX_SMALL);
+    int right = FB_W - 24 - (index_visible() ? INDEX_W : 0);
+    draw_text(fb, right - w, y, s, col, TEXT_PX_SMALL, FB_W);
 }
 
 static void draw_right_clip(uint16_t *fb, int y, const char *s, int clip_top, int clip_bot) {
@@ -3160,38 +3184,51 @@ static void draw_screen(uint16_t *fb) {
          * description from "Idle sleep" below it. Drawn at the top of the
          * row that follows instead, so it always closes off the block above
          * it, whatever that block was. */
+        /* Each setting's right-side control (toggle or value) is centered on
+         * the FULL divider-bound block for that setting, not just the 72px
+         * title slice -- rows with a two-line description below the title
+         * (lock, usbbypass, autooff) have a visual "area" spanning both, and
+         * a control centered on only the title slice reads as sitting too
+         * high against that whole card (BG63). */
         int ry = set_row_lock_y();
+        int lock_h = set_row_usbbypass_y() - ry;
         draw_text(fb, 24, ry + 20, "Power button lock", COL_TEXT, TEXT_PX_BODY, FB_W - 140);
-        draw_toggle_switch(fb, ry, button_lock_enabled);
+        draw_toggle_switch_h(fb, ry, button_lock_enabled, lock_h);
 
         int dy = set_lock_desc_y();
         draw_text(fb, 24, dy, "Double-press power to lock the screen and", COL_DIM, TEXT_PX_SMALL, FB_W - 48);
         draw_text(fb, 24, dy + 26, "disable buttons. Double-press again to undo.", COL_DIM, TEXT_PX_SMALL, FB_W - 48);
 
         ry = set_row_usbbypass_y();
+        int usbbypass_h = set_row_autooff_y() - ry;
         fill_rect(fb, 0, ry - 1, FB_W, 1, COL_LINE);
         draw_text(fb, 24, ry + 20, "Bypass DSP on USB", COL_TEXT, TEXT_PX_BODY, FB_W - 140);
-        draw_toggle_switch(fb, ry, usb_bypass_enabled);
+        draw_toggle_switch_h(fb, ry, usb_bypass_enabled, usbbypass_h);
 
         int uy = set_usbbypass_desc_y();
         draw_text(fb, 24, uy, "Disables PEQ, MSEB and Bluetooth while", COL_DIM, TEXT_PX_SMALL, FB_W - 48);
         draw_text(fb, 24, uy + 26, "output is USB. Restored when USB stops.", COL_DIM, TEXT_PX_SMALL, FB_W - 48);
 
         ry = set_row_autooff_y();
+        int autooff_h = set_row_theme_y() - ry;
         fill_rect(fb, 0, ry - 1, FB_W, 1, COL_LINE);
         draw_text(fb, 24, ry + 20, "Auto shutdown", COL_TEXT, TEXT_PX_BODY, FB_W - 200);
         if (auto_off_minutes() == 0) snprintf(buf, sizeof(buf), "Never");
         else                         snprintf(buf, sizeof(buf), "%d min", auto_off_minutes());
-        draw_right(fb, ry + 20, buf);
+        draw_right_col(fb, ry + autooff_h / 2 - TEXT_PX_SMALL / 2, buf, COL_ACCENT);
 
         int ay = set_autooff_desc_y();
         draw_text(fb, 24, ay, "Powers the device off when locked with", COL_DIM, TEXT_PX_SMALL, FB_W - 48);
         draw_text(fb, 24, ay + 26, "nothing playing. Tap to change.", COL_DIM, TEXT_PX_SMALL, FB_W - 48);
 
         ry = set_row_theme_y();
+        int theme_h = set_row_about_y() - ry;
         fill_rect(fb, 0, ry - 1, FB_W, 1, COL_LINE);
         draw_text(fb, 24, ry + 20, "Accent colour", COL_TEXT, TEXT_PX_BODY, FB_W - 200);
-        draw_right(fb, ry + 20, ACCENT_PRESETS[g_accent_idx].name);
+        /* The value itself renders in the accent colour it names, rather
+         * than a separate swatch blob next to plain text (BG63 follow-up). */
+        draw_right_col(fb, ry + theme_h / 2 - TEXT_PX_SMALL / 2,
+                        ACCENT_PRESETS[g_accent_idx].name, ACCENT_PRESETS[g_accent_idx].color);
 
         ry = set_row_about_y();
         fill_rect(fb, 0, ry - 1, FB_W, 1, COL_LINE);
@@ -5996,18 +6033,19 @@ int music_entry(void *a0, void *a1) {
 }
 
 /* ---- tile name and icon -------------------------------------------------- */
-/* The tile this app takes over is still labelled "Stream media" with a cloud
+/* The tile this app takes over is still labelled "About" with an info-circle
  * icon. The rootfs is read-only squashfs, so a bind mount is the only way to
  * change either short of reflashing, and it has to happen in this constructor
  * rather than from a boot script: the player reads its string table during
  * startup and a backgrounded script loses that race.
  *
- * The label is in sys_set.ini, not settings.ini or launcher.ini — which is
- * lucky, because the Podcasts app shadows settings.ini and two hooks binding
- * over the same file would leave one of the two names lost.
+ * Launcher tile labels live in settings.ini (music / net_set / sys_set /
+ * about), not launcher.ini — that one drives a different menu, which is why
+ * editing its <abo_dev> had no effect (found while this hook still lived on
+ * the Stream media tile, whose own label is in sys_set.ini instead).
  */
 #define RES_DIR    "/usr/data/music_res"
-#define LABEL_INI  "/tmp/.music_sys_set.ini"
+#define LABEL_INI  "/tmp/.music_settings.ini"
 #define TILE_LABEL "Library"
 
 /* The ini is UTF-16LE, so tags have to be matched widened. */
@@ -6026,7 +6064,7 @@ static const uint8_t *memfind(const uint8_t *hay, size_t hn,
 }
 
 static const char *make_label_ini(void) {
-    static const char SRC[] = "/usr/resource/str/english/sys_set.ini";
+    static const char SRC[] = "/usr/resource/str/english/settings.ini";
     int fd = open(SRC, O_RDONLY);
     if (fd < 0) return NULL;
 
@@ -6038,8 +6076,8 @@ static const char *make_label_ini(void) {
     if (len <= 0 || (size_t)len == sizeof(buf)) return NULL;
 
     uint8_t otag[48], ctag[48], label[64];
-    size_t on = widen("<stream_media>", otag);
-    size_t cn = widen("</stream_media>", ctag);
+    size_t on = widen("<about>", otag);
+    size_t cn = widen("</about>", ctag);
     size_t ln = widen(TILE_LABEL, label);
 
     const uint8_t *a = memfind(buf, (size_t)len, otag, on);
@@ -6062,10 +6100,10 @@ static const char *make_label_ini(void) {
 
 static void shadow_resources(void) {
     static const char *pairs[][2] = {
-        { RES_DIR "/stream_media.png",   "/usr/resource/litegui/theme1/launcher/stream_media.png" },
-        { RES_DIR "/stream_media_s.png", "/usr/resource/litegui/theme1/launcher/stream_media_s.png" },
-        { RES_DIR "/stream_media.png",   "/usr/resource/litegui/theme2/launcher/stream_media.png" },
-        { RES_DIR "/stream_media_s.png", "/usr/resource/litegui/theme2/launcher/stream_media_s.png" },
+        { RES_DIR "/about.png",   "/usr/resource/litegui/theme1/launcher/about.png" },
+        { RES_DIR "/about_s.png", "/usr/resource/litegui/theme1/launcher/about_s.png" },
+        { RES_DIR "/about.png",   "/usr/resource/litegui/theme2/launcher/about.png" },
+        { RES_DIR "/about_s.png", "/usr/resource/litegui/theme2/launcher/about_s.png" },
     };
     for (unsigned i = 0; i < sizeof(pairs) / sizeof(pairs[0]); i++) {
         if (access(pairs[i][0], R_OK) != 0) continue;   /* no icon shipped: keep the stock one */
@@ -6076,8 +6114,8 @@ static void shadow_resources(void) {
     const char *ini = make_label_ini();
     if (!ini)
         mlog("[music] label rewrite failed; tile keeps its stock name\n");
-    else if (mount(ini, "/usr/resource/str/english/sys_set.ini", NULL, MS_BIND, NULL) != 0)
-        mlog("[music] bind sys_set.ini failed: %s\n", strerror(errno));
+    else if (mount(ini, "/usr/resource/str/english/settings.ini", NULL, MS_BIND, NULL) != 0)
+        mlog("[music] bind settings.ini failed: %s\n", strerror(errno));
 }
 
 /* ---- install ------------------------------------------------------------- */
@@ -6130,17 +6168,26 @@ static void music_init(void) {
     syscall(__NR_cacheflush, (void *)CAVE_ADDR, 16, BCACHE_FLAG);
     mprotect((void *)CAVE_PAGE, PAGE_SPAN, PROT_READ | PROT_EXEC);
 
-    volatile uint32_t *cb = (volatile uint32_t *)TILE_CB;
-    if (*cb != TILE_CB_ORIG) {
-        mlog("[music] unexpected tile callback 0x%08X, leaving it alone\n", *cb);
+    /* The tile shows up at two callback addresses in hiby_player's data;
+     * both get patched so it's caught wherever the launcher happens to read
+     * it from that run (see podcast_hook.c's own history of this same
+     * tile, which this hook inherited). Only the second is checked against
+     * its known stock value before writing -- if that one has already
+     * drifted from what this build expects, the first is left alone too
+     * rather than guessing. */
+    volatile uint32_t *cb1 = (volatile uint32_t *)ABOUT_CB_1;
+    volatile uint32_t *cb2 = (volatile uint32_t *)ABOUT_CB_2;
+    if (*cb2 != ABOUT_CB_ORIG) {
+        mlog("[music] unexpected About callback 0x%08X, leaving it alone\n", *cb2);
         return;
     }
     if (mprotect((void *)DATA_PAGE, PAGE_SPAN, PROT_READ | PROT_WRITE) < 0) {
         mlog("[music] data mprotect failed\n");
         return;
     }
-    orig_cb = *cb;
-    *cb = CAVE_ADDR;
+    orig_cb = *cb2;
+    *cb2 = CAVE_ADDR;
+    if (*cb1 == ABOUT_CB_ORIG) *cb1 = CAVE_ADDR;
     __asm__ __volatile__("sync" ::: "memory");
     /* If the player died while the screen was locked, the backlight was left
      * at 0 and nothing ever put it back: the device looks dead, and the only
@@ -6162,16 +6209,5 @@ static void music_init(void) {
     write_int_file(LED_RED, 0);
 
     shadow_resources();
-    mlog("[music] Stream media tile armed -> 0x%08X\n", CAVE_ADDR);
-
-    /* The firmware preloads exactly one library, and this app took the slot —
-     * which silently removed the Podcasts app from the device. Rather than
-     * reflash to add a second preload, load it from here: the two hooks patch
-     * different tiles (About vs Stream media) into different code caves, and
-     * both are built with hidden visibility so their internals cannot collide.
-     * RTLD_LOCAL keeps it that way.
-     *
-     * Missing is not an error — plenty of installs will have only this app. */
-    void *pod = dlopen(PODCAST_HOOK_PATH, RTLD_NOW | RTLD_LOCAL);
-    mlog("[music] podcast hook: %s\n", pod ? "loaded" : dlerror());
+    mlog("[music] About tile armed -> 0x%08X\n", CAVE_ADDR);
 }
