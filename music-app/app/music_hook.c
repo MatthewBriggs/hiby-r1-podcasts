@@ -68,16 +68,25 @@
 #define FB_H 800
 
 #define RGB(r, g, b) ((uint16_t)((((r) & 0xF8) << 8) | (((g) & 0xFC) << 3) | ((b) >> 3)))
-#define COL_BG      RGB(16, 16, 20)
-#define COL_HEADER  RGB(26, 26, 33)
-#define COL_TEXT    RGB(240, 240, 245)
-#define COL_DIM     RGB(125, 125, 136)
+/* R41: variables behind these names, not literals -- same reasoning as
+ * COL_ACCENT below, so a light theme can repoint every draw call without
+ * touching any of them. apply_theme() is the only place that assigns these. */
+static uint16_t g_col_bg     = RGB(16, 16, 20);
+static uint16_t g_col_header = RGB(26, 26, 33);
+static uint16_t g_col_text   = RGB(240, 240, 245);
+static uint16_t g_col_dim    = RGB(125, 125, 136);
+static uint16_t g_col_row    = RGB(26, 26, 33);
+static uint16_t g_col_line   = RGB(38, 38, 46);
+#define COL_BG      g_col_bg
+#define COL_HEADER  g_col_header
+#define COL_TEXT    g_col_text
+#define COL_DIM     g_col_dim
+#define COL_ROW     g_col_row
+#define COL_LINE    g_col_line
 /* A variable behind this name, not a literal -- R20 wants the accent
  * colour user-selectable, and every draw call already says COL_ACCENT. */
 static uint16_t g_accent = RGB(240, 138, 42);
 #define COL_ACCENT  g_accent
-#define COL_ROW     RGB(26, 26, 33)
-#define COL_LINE    RGB(38, 38, 46)
 
 /* R20: a small preset palette rather than a full colour picker -- matching
  * the hardware's own colour variants (or close to them) is the actual ask,
@@ -93,6 +102,31 @@ static const struct { const char *name; uint16_t color; } ACCENT_PRESETS[] = {
 };
 #define ACCENT_N ((int)(sizeof(ACCENT_PRESETS) / sizeof(ACCENT_PRESETS[0])))
 static int g_accent_idx;
+/* R41: light theme is an exact per-channel invert of the dark palette above
+ * (light = 255 - dark, per channel), which is what guarantees every
+ * contrast relationship dark mode already relies on -- text-vs-background,
+ * dim-vs-background, line-vs-background -- survives the swap unchanged
+ * rather than needing to be independently re-balanced. Accent presets are
+ * untouched either way, per R41's own "maintaining accent colour
+ * functionality" -- they're saturated enough to read on both. */
+static int light_theme;
+static void apply_theme(void) {
+    if (light_theme) {
+        g_col_bg     = RGB(239, 239, 235);
+        g_col_header = RGB(229, 229, 222);
+        g_col_text   = RGB(15, 15, 10);
+        g_col_dim    = RGB(130, 130, 119);
+        g_col_row    = RGB(229, 229, 222);
+        g_col_line   = RGB(217, 217, 209);
+    } else {
+        g_col_bg     = RGB(16, 16, 20);
+        g_col_header = RGB(26, 26, 33);
+        g_col_text   = RGB(240, 240, 245);
+        g_col_dim    = RGB(125, 125, 136);
+        g_col_row    = RGB(26, 26, 33);
+        g_col_line   = RGB(38, 38, 46);
+    }
+}
 static int button_lock_enabled;   /* off by default: a new gesture, opt in */
 /* "Disable PEQ, MSEB and Bluetooth when playing over USB" -- off by default,
  * same reasoning as button_lock_enabled: a new behaviour, opt in. usb_bypass_
@@ -948,7 +982,11 @@ static int set_usbbypass_desc_y(void) { return set_row_usbbypass_y() + ROW_H; }
  * shipped answer to the same problem. */
 static int set_row_autooff_y(void)  { return set_usbbypass_desc_y() + 64; }
 static int set_autooff_desc_y(void) { return set_row_autooff_y() + ROW_H; }
-static int set_row_theme_y(void) { return set_autooff_desc_y() + 64; }
+/* R41: no description under this one -- "Light theme" needs no explaining
+ * the way the toggles above did, so it's a plain ROW_H row like Accent
+ * colour and About below it, not another +64 two-line block. */
+static int set_row_lighttheme_y(void) { return set_autooff_desc_y() + 64; }
+static int set_row_theme_y(void) { return set_row_lighttheme_y() + ROW_H; }
 /* R26: About, one row below Accent colour -- which now needs its own
  * trailing divider back (it used to be the last row and closed the list
  * itself), and this row takes over closing the list instead. */
@@ -3210,7 +3248,7 @@ static void draw_screen(uint16_t *fb) {
         draw_text(fb, 24, uy + 26, "output is USB. Restored when USB stops.", COL_DIM, TEXT_PX_SMALL, FB_W - 48);
 
         ry = set_row_autooff_y();
-        int autooff_h = set_row_theme_y() - ry;
+        int autooff_h = set_row_lighttheme_y() - ry;
         fill_rect(fb, 0, ry - 1, FB_W, 1, COL_LINE);
         draw_text(fb, 24, ry + 20, "Auto shutdown", COL_TEXT, TEXT_PX_BODY, FB_W - 200);
         if (auto_off_minutes() == 0) snprintf(buf, sizeof(buf), "Never");
@@ -3220,6 +3258,11 @@ static void draw_screen(uint16_t *fb) {
         int ay = set_autooff_desc_y();
         draw_text(fb, 24, ay, "Powers the device off when locked with", COL_DIM, TEXT_PX_SMALL, FB_W - 48);
         draw_text(fb, 24, ay + 26, "nothing playing. Tap to change.", COL_DIM, TEXT_PX_SMALL, FB_W - 48);
+
+        ry = set_row_lighttheme_y();
+        fill_rect(fb, 0, ry - 1, FB_W, 1, COL_LINE);
+        draw_text(fb, 24, ry + 20, "Light theme", COL_TEXT, TEXT_PX_BODY, FB_W - 140);
+        draw_toggle_switch_h(fb, ry, light_theme, ROW_H);
 
         ry = set_row_theme_y();
         int theme_h = set_row_about_y() - ry;
@@ -4053,6 +4096,9 @@ static void load_conf(void) {
         } else if (sscanf(line, "usb_bypass_enabled = %d", &v) == 1 ||
                    sscanf(line, "usb_bypass_enabled=%d", &v) == 1) {
             usb_bypass_enabled = v != 0;
+        } else if (sscanf(line, "light_theme = %d", &v) == 1 ||
+                   sscanf(line, "light_theme=%d", &v) == 1) {
+            light_theme = v != 0;
         } else if (sscanf(line, "deep_sleep = %d", &v) == 1 ||
                    sscanf(line, "deep_sleep=%d", &v) == 1) {
             /* Deliberately conf-only and off by default, with no Settings row
@@ -4094,6 +4140,7 @@ static void load_conf(void) {
     mseb_load(mseb_gain, &mseb_on);
     eq_set_mseb(mseb_on, mseb_gain);
     recent_heard_load();   /* R30 -- its own file, not a music.conf key either */
+    apply_theme();         /* R41: light_theme just loaded above, if present */
 }
 
 /* Does this line set `key`? Length taken from the key itself rather than
@@ -4120,6 +4167,7 @@ static void save_conf(void) {
             if (!conf_line_is(lines[n], "accent_index") &&
                 !conf_line_is(lines[n], "button_lock_enabled") &&
                 !conf_line_is(lines[n], "usb_bypass_enabled") &&
+                !conf_line_is(lines[n], "light_theme") &&
                 !conf_line_is(lines[n], "deep_sleep") &&
                 !conf_line_is(lines[n], "sleep_minutes") &&
                 !conf_line_is(lines[n], "auto_off_minutes") &&
@@ -4135,6 +4183,7 @@ static void save_conf(void) {
     fprintf(f, "accent_index = %d\n", g_accent_idx);
     fprintf(f, "button_lock_enabled = %d\n", button_lock_enabled);
     fprintf(f, "usb_bypass_enabled = %d\n", usb_bypass_enabled);
+    fprintf(f, "light_theme = %d\n", light_theme);
     fprintf(f, "sleep_minutes = %d\n", sleep_minutes());
     fprintf(f, "deep_sleep = %d\n", deep_sleep_enabled);
     fprintf(f, "auto_off_minutes = %d\n", auto_off_minutes());
@@ -5167,6 +5216,7 @@ int music_entry(void *a0, void *a1) {
                 int ry_lock = set_row_lock_y(), ry_theme = set_row_theme_y();
                 int ry_usbbypass = set_row_usbbypass_y();
                 int ry_autooff = set_row_autooff_y(), ry_about = set_row_about_y();
+                int ry_lighttheme = set_row_lighttheme_y();
                 int ry_reindex = set_row_reindex_y();
                 if (y >= ry_lock && y < ry_lock + ROW_H) {
                     button_lock_enabled = !button_lock_enabled;
@@ -5179,6 +5229,10 @@ int music_entry(void *a0, void *a1) {
                      * and a whole screen for them would be more chrome than
                      * the choice is worth. */
                     auto_off_idx = (auto_off_idx + 1) % AUTO_OFF_CHOICE_N;
+                    save_conf();
+                } else if (y >= ry_lighttheme && y < ry_lighttheme + ROW_H) {
+                    light_theme = !light_theme;
+                    apply_theme();
                     save_conf();
                 } else if (y >= ry_theme && y < ry_theme + ROW_H) {
                     screen = SC_SETTINGS_THEME; reset_scroll();
