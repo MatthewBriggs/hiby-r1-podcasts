@@ -388,7 +388,7 @@ def main():
                 # New, not changed, on a vanilla base -- a mod base already
                 # carries this file, so there it would show up as "changed"
                 # (or not at all, if identical) instead.
-                expected_added = {"etc/init.d/S90adb"}
+                expected_added = {"etc/init.d/S90adb", "usr/resource/kernel_build_id"}
                 if (set(changed) <= expected and set(added) <= expected_added
                         and not removed):
                     print(f"    only expected files changed ({len(changed)}), "
