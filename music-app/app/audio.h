@@ -28,6 +28,13 @@ int  audio_volume(void);
 void audio_volume_step(int delta);   /* routes to the BT mixer or software */
 void audio_volume_set(int pct);      /* absolute, for the slider */
 int  audio_using_bt(void);
+int  audio_using_usb(void);
+/* Settings' "disable PEQ, MSEB and Bluetooth when playing over USB" -- skips
+ * eq_process_*() outright while on, rather than touching eq_enabled()/the
+ * saved profile, so it's a pure runtime override that undoes itself the
+ * instant USB output stops, whatever the user's actual EQ settings are. */
+void audio_set_usb_bypass(int on);
+int  audio_usb_bypass(void);
 /* Background-thread only (bt_poll) -- both do blocking D-Bus round-trips via
  * amixer. audio_bt_volume_pending() is the cheap check between polls;
  * audio_bt_volume_service() applies a pending write (from a key or the

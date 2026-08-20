@@ -54,6 +54,7 @@
 #include "art.h"
 #include "lastfm.h"
 #include "spotify.h"
+#include "index.h"
 #include "status.h"
 #include "radio.h"
 #include "playlist.h"
@@ -89,6 +90,17 @@ static const struct { const char *name; uint16_t color; } ACCENT_PRESETS[] = {
 #define ACCENT_N ((int)(sizeof(ACCENT_PRESETS) / sizeof(ACCENT_PRESETS[0])))
 static int g_accent_idx;
 static int button_lock_enabled;   /* off by default: a new gesture, opt in */
+/* "Disable PEQ, MSEB and Bluetooth when playing over USB" -- off by default,
+ * same reasoning as button_lock_enabled: a new behaviour, opt in. usb_bypass_
+ * active tracks whether the override is *currently* engaged (distinct from
+ * the setting itself: engaged only while output is actually USB), and
+ * usb_bypass_bt_was_on remembers what Bluetooth was before this turned it
+ * off, so leaving USB puts it back exactly as deep_suspend() already does
+ * for its own Bluetooth teardown -- never silently changing a setting the
+ * user chose themselves. */
+static int usb_bypass_enabled;
+static int usb_bypass_active;
+static int usb_bypass_bt_was_on;
 
 #define TEXT_PX_TITLE 34
 #define TEXT_PX_BODY  30
@@ -104,6 +116,12 @@ static int button_lock_enabled;   /* off by default: a new gesture, opt in */
 #define STATUS_H  32
 #define CONTENT_Y (STATUS_H + HEADER_H)
 #define ROW_H     72
+/* How many consecutive ticks since inertia was last active a scrollable
+ * list needs before a tap is trusted as a real row selection rather than
+ * the tail end of a fling. ~100ms at the ~30/s tick rate this loop runs
+ * at. See list_settled_ticks's own comment for why this is keyed on
+ * inertia_active alone, not list_dragging. */
+#define LIST_TAP_SETTLE_TICKS 3
 
 /* ---- tile hook ----------------------------------------------------------- */
 #define TILE_CB       0x00892630u   /* stream_media record + 0x48 */
@@ -903,6 +921,8 @@ static int auto_off_minutes(void) { return AUTO_OFF_CHOICES[auto_off_idx]; }
  * number sized for a different layout. */
 static int set_row_lock_y(void)  { return CONTENT_Y; }
 static int set_lock_desc_y(void) { return set_row_lock_y() + ROW_H; }
+static int set_row_usbbypass_y(void)  { return set_lock_desc_y() + 64; }
+static int set_usbbypass_desc_y(void) { return set_row_usbbypass_y() + ROW_H; }
 /* "Idle sleep" used to sit here. Its row is gone from Settings: it drove
  * deep_suspend(), and that whole line of work is paused until there is source
  * for open_hiby_player to compare against -- an unattended overnight run with
@@ -911,13 +931,15 @@ static int set_lock_desc_y(void) { return set_row_lock_y() + ROW_H; }
  * deep_sleep defaulting to 0 nothing reaches the suspend path, and there is no
  * longer a way to switch it on by accident from the UI. Auto shutdown is the
  * shipped answer to the same problem. */
-static int set_row_autooff_y(void)  { return set_lock_desc_y() + 64; }
+static int set_row_autooff_y(void)  { return set_usbbypass_desc_y() + 64; }
 static int set_autooff_desc_y(void) { return set_row_autooff_y() + ROW_H; }
 static int set_row_theme_y(void) { return set_autooff_desc_y() + 64; }
 /* R26: About, one row below Accent colour -- which now needs its own
  * trailing divider back (it used to be the last row and closed the list
  * itself), and this row takes over closing the list instead. */
 static int set_row_about_y(void) { return set_row_theme_y() + ROW_H; }
+/* Same idea again: Rebuild index takes over closing the list from About. */
+static int set_row_reindex_y(void) { return set_row_about_y() + ROW_H; }
 
 /* Bump this with every release -- it had been stuck at "0.1" since the very
  * first one, through 0.14, because nothing ever reminded anyone to touch it.
@@ -925,9 +947,34 @@ static int set_row_about_y(void) { return set_row_theme_y() + ROW_H; }
  * pushed by hand, not by CI against a tagged commit), so this stays a
  * literal that a human edits; the discipline is remembering to, not the
  * mechanism. */
-#define LIBRARY_VERSION "0.17"
+#define LIBRARY_VERSION "0.29"
+
+/* A custom-built kernel keeps uname()'s own release string exactly
+ * "4.4.94+" on purpose -- that string is also the vermagic every one of the
+ * 28 kernel modules is checked against on load, 9 of them closed-source
+ * blobs this project can never recompile, so it can never change without
+ * breaking module loading outright. /usr/resource/kernel_build_id is a
+ * separate marker this project's own firmware patcher stamps (same
+ * pattern as CONFIG_JSON's stamped version string, read a few lines down
+ * from here) -- "4.4.94_r1", "_r2", ... -- read here in preference to the
+ * real uname() when present, so About can show which of this project's
+ * own kernel builds is actually running without touching the one string
+ * that has to stay stock. */
+#define KERNEL_BUILD_ID_PATH "/usr/resource/kernel_build_id"
 
 static void about_kernel(char *out, size_t n) {
+    FILE *f = fopen(KERNEL_BUILD_ID_PATH, "r");
+    if (f) {
+        if (fgets(out, (int)n, f)) {
+            size_t len = strlen(out);
+            while (len > 0 && (out[len - 1] == '\n' || out[len - 1] == '\r'))
+                out[--len] = '\0';
+            fclose(f);
+            if (out[0]) return;
+        } else {
+            fclose(f);
+        }
+    }
     struct utsname u;
     if (uname(&u) == 0) snprintf(out, n, "%s", u.release);
     else snprintf(out, n, "unknown");
@@ -1111,6 +1158,17 @@ static int   list_last_y;
 static unsigned list_last_tick;
 static float  list_velocity;            /* px per tick, signed */
 static int    inertia_active;
+/* Ticks since inertia was last active -- resets only on inertia_active
+ * itself, deliberately not on list_dragging too: list_dragging goes true
+ * on *any* touch-down on a scrollable screen, ordinary stationary taps
+ * included, so resetting on it as well (tried once) made an ordinary
+ * album-row tap read as "still settling" and get swallowed on every
+ * single tap, not just the scroll-then-tap case this exists for. Gates a
+ * tap-driven selection below on having cleared a short threshold, since
+ * inertia_active alone flips false the instant |list_velocity| decays
+ * under its 0.6 px/tick arming threshold -- which can be the very same
+ * tick a tap lands in, while the list is still visibly settling. */
+static unsigned list_settled_ticks;
 
 static int index_lock_end = -1; /* absolute row index the last index jump can't show past, -1 = none */
 
@@ -3110,6 +3168,15 @@ static void draw_screen(uint16_t *fb) {
         draw_text(fb, 24, dy, "Double-press power to lock the screen and", COL_DIM, TEXT_PX_SMALL, FB_W - 48);
         draw_text(fb, 24, dy + 26, "disable buttons. Double-press again to undo.", COL_DIM, TEXT_PX_SMALL, FB_W - 48);
 
+        ry = set_row_usbbypass_y();
+        fill_rect(fb, 0, ry - 1, FB_W, 1, COL_LINE);
+        draw_text(fb, 24, ry + 20, "Bypass DSP on USB", COL_TEXT, TEXT_PX_BODY, FB_W - 140);
+        draw_toggle_switch(fb, ry, usb_bypass_enabled);
+
+        int uy = set_usbbypass_desc_y();
+        draw_text(fb, 24, uy, "Disables PEQ, MSEB and Bluetooth while", COL_DIM, TEXT_PX_SMALL, FB_W - 48);
+        draw_text(fb, 24, uy + 26, "output is USB. Restored when USB stops.", COL_DIM, TEXT_PX_SMALL, FB_W - 48);
+
         ry = set_row_autooff_y();
         fill_rect(fb, 0, ry - 1, FB_W, 1, COL_LINE);
         draw_text(fb, 24, ry + 20, "Auto shutdown", COL_TEXT, TEXT_PX_BODY, FB_W - 200);
@@ -3126,11 +3193,27 @@ static void draw_screen(uint16_t *fb) {
         draw_text(fb, 24, ry + 20, "Accent colour", COL_TEXT, TEXT_PX_BODY, FB_W - 200);
         draw_right(fb, ry + 20, ACCENT_PRESETS[g_accent_idx].name);
 
-        /* R26: takes over closing the list -- Accent colour no longer does,
-         * now that it has a row below it. */
         ry = set_row_about_y();
         fill_rect(fb, 0, ry - 1, FB_W, 1, COL_LINE);
         draw_text(fb, 24, ry + 20, "About", COL_TEXT, TEXT_PX_BODY, FB_W - 200);
+
+        /* Takes over closing the list from About. Status text doubles as
+         * the row's subtitle and its own progress readout -- no separate
+         * screen for something this small. */
+        ry = set_row_reindex_y();
+        fill_rect(fb, 0, ry - 1, FB_W, 1, COL_LINE);
+        draw_text(fb, 24, ry + 20, "Rebuild library index", COL_TEXT, TEXT_PX_BODY, FB_W - 200);
+        {
+            int scanned = 0, written = 0;
+            int started = index_scan_progress(&scanned, &written);
+            if (index_scan_running())
+                snprintf(buf, sizeof(buf), "Scanning… %d", scanned);
+            else if (started)
+                snprintf(buf, sizeof(buf), "%d tracks indexed", scanned);
+            else
+                snprintf(buf, sizeof(buf), "Not started");
+            draw_right(fb, ry + 20, buf);
+        }
         fill_rect(fb, 0, ry + ROW_H - 1, FB_W, 1, COL_LINE);
 
         if (mini_visible()) draw_mini(fb);
@@ -3225,6 +3308,15 @@ static void draw_screen(uint16_t *fb) {
  * be distinguished from a tap or every scroll also opens whatever was under the
  * finger. */
 #define DRAG_MIN 18
+/* A fixed 18px threshold, checked continuously from the moment of touch-down,
+ * misclassifies both directions: a fast, decisive tap with a little finger
+ * tremor easily exceeds 18px and reads as a scroll, while a slow, deliberate
+ * small drag can stay under it and reads as a tap. A real scroll and a real
+ * tap differ in more than distance -- a scroll is sustained motion, a tap is
+ * quick -- so touches still within this short a window of going down get a
+ * more generous distance allowance before being called "moved" at all. */
+#define FAST_TAP_MS   150
+#define FAST_DRAG_MIN 30
 
 /* 1 = tap, 2 = vertical drag (*oy carries the distance), 3 = swipe in from the
  * left edge (back), 4 = press and hold. The edge test is on where the finger went down,
@@ -3245,6 +3337,18 @@ static int edge_active, edge_travel, edge_y;
 static int touch_down, touch_x, touch_y, touch_moved, hold_fired;
 static struct timespec touch_at;
 
+/* Elapsed ms since touch-down (touch_at), then DRAG_MIN or the more
+ * generous FAST_DRAG_MIN depending on whether that's still within the fast-
+ * tap window. Shared by both axes below so a diagonal touch is judged by
+ * one consistent age, not whichever axis's event happened to arrive first. */
+static int drag_threshold(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    long ms = (now.tv_sec - touch_at.tv_sec) * 1000L +
+              (now.tv_nsec - touch_at.tv_nsec) / 1000000L;
+    return ms < FAST_TAP_MS ? FAST_DRAG_MIN : DRAG_MIN;
+}
+
 static int read_gesture(int fd, int *ox, int *oy) {
     struct input_event ev;
     static int x, y, down_x = -1, down_y = -1, moved, have_down;
@@ -3257,13 +3361,13 @@ static int read_gesture(int fd, int *ox, int *oy) {
              * scroll: a slow swipe in from the edge has no vertical travel at
              * all, so tracking only Y made it look like a stationary finger
              * and it opened the hold menu instead of going back. */
-            if (have_down && down_x >= 0 && abs(x - down_x) > DRAG_MIN)
+            if (have_down && down_x >= 0 && abs(x - down_x) > drag_threshold())
                 touch_moved = 1;
         }
         else if (ev.type == EV_ABS && ev.code == ABS_MT_POSITION_Y) {
             y = ev.value;
             live_y = y;
-            if (have_down && down_y >= 0 && abs(y - down_y) > DRAG_MIN) {
+            if (have_down && down_y >= 0 && abs(y - down_y) > drag_threshold()) {
                 moved = 1;
                 touch_moved = 1;
             }
@@ -3909,6 +4013,9 @@ static void load_conf(void) {
         } else if (sscanf(line, "button_lock_enabled = %d", &v) == 1 ||
                    sscanf(line, "button_lock_enabled=%d", &v) == 1) {
             button_lock_enabled = v != 0;
+        } else if (sscanf(line, "usb_bypass_enabled = %d", &v) == 1 ||
+                   sscanf(line, "usb_bypass_enabled=%d", &v) == 1) {
+            usb_bypass_enabled = v != 0;
         } else if (sscanf(line, "deep_sleep = %d", &v) == 1 ||
                    sscanf(line, "deep_sleep=%d", &v) == 1) {
             /* Deliberately conf-only and off by default, with no Settings row
@@ -3975,6 +4082,7 @@ static void save_conf(void) {
         while (n < 64 && fgets(lines[n], sizeof(lines[0]), f)) {
             if (!conf_line_is(lines[n], "accent_index") &&
                 !conf_line_is(lines[n], "button_lock_enabled") &&
+                !conf_line_is(lines[n], "usb_bypass_enabled") &&
                 !conf_line_is(lines[n], "deep_sleep") &&
                 !conf_line_is(lines[n], "sleep_minutes") &&
                 !conf_line_is(lines[n], "auto_off_minutes") &&
@@ -3989,6 +4097,7 @@ static void save_conf(void) {
     for (int i = 0; i < n; i++) fputs(lines[i], f);
     fprintf(f, "accent_index = %d\n", g_accent_idx);
     fprintf(f, "button_lock_enabled = %d\n", button_lock_enabled);
+    fprintf(f, "usb_bypass_enabled = %d\n", usb_bypass_enabled);
     fprintf(f, "sleep_minutes = %d\n", sleep_minutes());
     fprintf(f, "deep_sleep = %d\n", deep_sleep_enabled);
     fprintf(f, "auto_off_minutes = %d\n", auto_off_minutes());
@@ -4520,6 +4629,30 @@ int music_entry(void *a0, void *a1) {
         if (locked) g = 0;             /* drained above, acted on here: never */
         else if (g) idle = 0;
 
+        /* Settings' "disable PEQ, MSEB and Bluetooth when playing over USB":
+         * a pure runtime override, engaged and released purely by whether
+         * output is actually USB right now -- never touches eq_enabled(),
+         * mseb_on or their saved profile, so whatever the user's own EQ/MSEB
+         * settings are, they come back exactly as chosen the moment USB
+         * output stops. Same "note it, then put it back" idiom
+         * deep_suspend() already uses for its own Bluetooth teardown. */
+        {
+            int want_bypass = usb_bypass_enabled && audio_using_usb();
+            if (want_bypass && !usb_bypass_active) {
+                usb_bypass_bt_was_on = st_bt_on();
+                if (usb_bypass_bt_was_on) { st_bt_set(0); qs_bt = 0; }
+                audio_set_usb_bypass(1);
+                usb_bypass_active = 1;
+                mlog("[music] usb bypass: engaged (peq/mseb off%s)\n",
+                     usb_bypass_bt_was_on ? ", bluetooth off" : "");
+            } else if (!want_bypass && usb_bypass_active) {
+                audio_set_usb_bypass(0);
+                if (usb_bypass_bt_was_on) { st_bt_set(1); qs_bt = 1; }
+                usb_bypass_active = 0;
+                mlog("[music] usb bypass: released\n");
+            }
+        }
+
         /* BG38 (part 2): drain bt_poll's fuzzy-matched profile, if it found
          * one since the last time round. The switch itself has to happen
          * here, not on that thread -- see the comment on bt_match_profile(). */
@@ -4754,6 +4887,19 @@ int music_entry(void *a0, void *a1) {
                 sheet_open = 0;
             }
             dirty = 1; idle = 0;
+        } else if (g == 1 && list_settled_ticks < LIST_TAP_SETTLE_TICKS) {
+            /* A tap that lands while the list is still coasting from a
+             * fling, or in the brief window right after, stops the scroll
+             * and does nothing else -- selecting whatever row happened to
+             * be under the finger was wrong far more often than right.
+             * list_settled_ticks (see its own comment) is keyed on
+             * inertia_active alone, not list_dragging -- an earlier attempt
+             * that also reset on list_dragging broke every ordinary tap,
+             * since list_dragging goes true on any touch-down at all, tap
+             * or drag alike. */
+            inertia_active = 0;
+            list_velocity = 0;
+            dirty = 1;
         } else if (g == 1) {
             sheet_note[0] = '\0';
             if (screen == SC_PLAYING && audiobook_mode && y >= STATUS_H) {
@@ -4982,9 +5128,14 @@ int music_entry(void *a0, void *a1) {
                 }
             } else if (screen == SC_SETTINGS) {
                 int ry_lock = set_row_lock_y(), ry_theme = set_row_theme_y();
+                int ry_usbbypass = set_row_usbbypass_y();
                 int ry_autooff = set_row_autooff_y(), ry_about = set_row_about_y();
+                int ry_reindex = set_row_reindex_y();
                 if (y >= ry_lock && y < ry_lock + ROW_H) {
                     button_lock_enabled = !button_lock_enabled;
+                    save_conf();
+                } else if (y >= ry_usbbypass && y < ry_usbbypass + ROW_H) {
+                    usb_bypass_enabled = !usb_bypass_enabled;
                     save_conf();
                 } else if (y >= ry_autooff && y < ry_autooff + ROW_H) {
                     /* Cycles rather than opening a picker: six short values,
@@ -4996,6 +5147,9 @@ int music_entry(void *a0, void *a1) {
                     screen = SC_SETTINGS_THEME; reset_scroll();
                 } else if (y >= ry_about && y < ry_about + ROW_H) {
                     screen = SC_SETTINGS_ABOUT; reset_scroll();
+                } else if (y >= ry_reindex && y < ry_reindex + ROW_H) {
+                    index_rescan_now();
+                    dirty = 1;
                 }
             } else if (screen == SC_SETTINGS_THEME) {
                 int idx = (y - CONTENT_Y) / ROW_H;
@@ -5182,9 +5336,17 @@ int music_entry(void *a0, void *a1) {
                     screen = SC_TRACKS; reset_scroll();
                     ab_list = 0;
                     pod_list = 0;
-                    track_n = lib_tracks_for_album(cur_artist, cur_album,
-                                                   tracks, (int)(sizeof(tracks)/sizeof(tracks[0])));
-                    mlog("[music] %s -> %d tracks\n", cur_album, track_n);
+                    {
+                        struct timespec t0, t1;
+                        clock_gettime(CLOCK_MONOTONIC, &t0);
+                        track_n = lib_tracks_for_album(cur_artist, cur_album,
+                                                       tracks, (int)(sizeof(tracks)/sizeof(tracks[0])),
+                                                       row->count);
+                        clock_gettime(CLOCK_MONOTONIC, &t1);
+                        long ms = (t1.tv_sec - t0.tv_sec) * 1000L +
+                                  (t1.tv_nsec - t0.tv_nsec) / 1000000L;
+                        mlog("[music] %s -> %d tracks (%ld ms)\n", cur_album, track_n, ms);
+                    }
                 } else if (screen == SC_AUDIOBOOKS && scroll + idx < ab_book_n) {
                     ab_book_t *b = &ab_books[scroll + idx];
                     if (audiobook_mode && !strcmp(b->dir, ab_book.dir)) {
@@ -5510,6 +5672,14 @@ int music_entry(void *a0, void *a1) {
             if (list_velocity < 0.6f && list_velocity > -0.6f) inertia_active = 0;
             idle = 0;
         }
+        /* Deliberately keyed on inertia_active alone -- see its own comment
+         * on why list_dragging must not also reset this. Capped rather
+         * than left to grow unbounded: only ever compared against a small
+         * threshold below, and an unsigned counter running for the hours a
+         * session can last would eventually wrap (harmlessly, but there's
+         * no reason to lean on that instead of just capping it). */
+        if (inertia_active) list_settled_ticks = 0;
+        else if (list_settled_ticks < 1000) list_settled_ticks++;
 
         /* Show-notes scrolling: no inertia, no row snapping -- it's free text
          * in a fixed box, not a list, so the plain drag-follows-the-finger
@@ -5938,6 +6108,12 @@ __attribute__((constructor))
 static void music_init(void) {
     if (!is_hiby_player()) return;
     mlog("[music] init pid=%d entry=%p\n", (int)getpid(), &music_entry);
+
+    /* Manual only, on request -- an earlier auto-start here (regardless of
+     * the tile hijack below succeeding) made the whole HiBy launcher UI
+     * sluggish at boot, competing with everything else initialising at the
+     * same time. index_rescan_now() (Settings' "Rebuild library index" row)
+     * is the only way this thread starts now. */
 
     volatile uint32_t *cave = (volatile uint32_t *)CAVE_ADDR;
     if (cave[0] != 0 || cave[1] != 0) { mlog("[music] cave occupied\n"); return; }

@@ -695,6 +695,25 @@ def main():
                     help="one character appended to the version shown in "
                          "System -> About; the field is cut to 7 chars and "
                          "'2.0.26' already uses 6 (default: a)")
+    ap.add_argument("--kernel", metavar="XIMAGE",
+                    help="replace the kernel image (uImage/xImage, u-boot "
+                         "legacy header + payload) with this file. Swapped "
+                         "in before rootfs patching, so a custom kernel and "
+                         "the usual rootfs patches can be applied in one "
+                         "pass. The stock (OTA_V0) manifest always rebuilds "
+                         "fresh from each image's live data, so no extra "
+                         "size/md5 bookkeeping is needed there; the mod "
+                         "format's manifest is a text template that has to "
+                         "be patched in place, same as the rootfs entry "
+                         "already is below.")
+    ap.add_argument("--kernel-build-id", metavar="ID",
+                    help="stamp usr/resource/kernel_build_id with this "
+                         "string (e.g. '4.4.94_r1') -- read by the app's "
+                         "About screen in preference to uname(), since a "
+                         "custom kernel's real uname()/vermagic has to stay "
+                         "exactly stock for the closed-source modules to "
+                         "keep loading. Meaningless without --kernel, but "
+                         "not required by it.")
     args = ap.parse_args()
 
     try:
@@ -736,6 +755,22 @@ def main():
     rootfs = next((i for i in images if i["type"] == "rootfs"), None)
     if rootfs is None:
         die("no rootfs image in this .upt")
+
+    if args.kernel:
+        kernel = next((i for i in images if i["type"] == "kernel"), None)
+        if kernel is None:
+            die("no kernel image in this .upt -- --kernel has nothing to replace")
+        if not os.path.exists(args.kernel):
+            die(f"{args.kernel} not found")
+        with open(args.kernel, "rb") as fh:
+            new_kernel = fh.read()
+        if new_kernel[:4] != b"\x27\x05\x19\x56":   # u-boot legacy image magic
+            die(f"{args.kernel} does not start with the u-boot legacy image "
+                f"magic (0x27051956) -- this doesn't look like a real xImage/"
+                f"uImage. Refusing to write something the device's bootloader "
+                f"would reject.")
+        print(f"replacing kernel: {len(kernel['data'])} -> {len(new_kernel)} bytes")
+        kernel["data"] = new_kernel
 
     with tempfile.TemporaryDirectory(prefix="r1patch-") as tmp:
         sqfs = os.path.join(tmp, "rootfs.squashfs")
@@ -854,6 +889,13 @@ def main():
                     fh.write(vnew)
                 print(f"stamped {VERSION_FILE} with podcast_rom={args.rom_version}")
 
+        if args.kernel_build_id:
+            kbtarget = os.path.join(root, "usr/resource/kernel_build_id")
+            with open(kbtarget, "w") as fh:
+                fh.write(args.kernel_build_id + "\n")
+            print(f"stamped usr/resource/kernel_build_id -> "
+                  f"'{args.kernel_build_id}'")
+
         print("repacking rootfs...")
         newsq = os.path.join(tmp, "rootfs.new.squashfs")
         subprocess.run(["mksquashfs", root, newsq, "-comp", "lzo", "-b", "131072",
@@ -866,13 +908,18 @@ def main():
     if fmt == "mod":
         # The rootfs almost always changes size, so the manifest text has to
         # follow it -- write_upt() takes the manifest as text and patches it
-        # in place, matching how it was read.
+        # in place, matching how it was read. A replaced kernel (--kernel)
+        # needs exactly the same treatment, for the same reason.
+        changed = {"rootfs": rootfs}
+        if args.kernel:
+            changed["kernel"] = kernel
         for img_type, name, size, md5 in entries:
-            if img_type == "rootfs":
+            img = changed.get(img_type)
+            if img is not None:
                 manifest = manifest.replace(f"img_size={size}",
-                                            f"img_size={len(rootfs['data'])}")
+                                            f"img_size={len(img['data'])}")
                 manifest = manifest.replace(f"img_md5={md5}",
-                                            f"img_md5={hashlib.md5(rootfs['data']).hexdigest()}")
+                                            f"img_md5={hashlib.md5(img['data']).hexdigest()}")
         last = write_upt(args.output, images, manifest, meta, version_blob, last)
         print(f"\nwrote {args.output} ({os.path.getsize(args.output)} bytes, "
               f"last entry F{last:07d}.TXT)")

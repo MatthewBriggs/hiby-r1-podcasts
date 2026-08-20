@@ -8,12 +8,19 @@
  * Three formats, all read from the head of the file:
  *
  *   FLAC  metadata block type 4, VORBIS_COMMENT, "TRACKNUMBER=7" (or "7/12")
- *   MP4   a 'trkn' atom inside ilst, the number in a 16-bit field
- *   MP3   an ID3v2 TRCK frame, text, likewise possibly "7/12"
+ *   MP4   a 'trkn'/'disk' atom inside ilst, the number in a 16-bit field
+ *   MP3   an ID3v2 TRCK/TPOS frame, text, likewise possibly "7/12"
  *
  * Only the first few hundred KB are ever touched; none of these formats put
  * their tags at the end in practice, and reading a whole 13 MB FLAC to find a
  * two-digit number would cost more than the ordering is worth.
+ *
+ * tag_read() reads track, disc and (FLAC only) title in one file open and one
+ * pass over the tag data, rather than three separate opens each re-scanning
+ * the same block for a different key — found live scanning a 183-track box
+ * set, where the per-open cost is what made opening the album slow. The
+ * single-field tag_track_number()/tag_disc_number()/tag_title() wrappers
+ * below stay for callers that only want one field.
  */
 
 #include <stdio.h>
@@ -53,58 +60,62 @@ static uint32_t rd32le(const unsigned char *p) {
            ((uint32_t)p[1] << 8) | p[0];
 }
 
-static int flac_field(FILE *f, const char *key) {
+/* One pass over the VORBIS_COMMENT block, checking every entry against all
+ * three keys instead of one -- the whole reason to combine these calls. */
+static void flac_all(FILE *f, int *track, int *disc, char *title, unsigned title_n) {
     unsigned char h[4];
-    if (fread(h, 1, 4, f) != 4 || memcmp(h, "fLaC", 4)) return -1;
+    if (fread(h, 1, 4, f) != 4 || memcmp(h, "fLaC", 4)) return;
     for (int guard = 0; guard < 64; guard++) {
         unsigned char b[4];
-        if (fread(b, 1, 4, f) != 4) return -1;
+        if (fread(b, 1, 4, f) != 4) return;
         int last = b[0] & 0x80, type = b[0] & 0x7F;
         uint32_t len = ((uint32_t)b[1] << 16) | ((uint32_t)b[2] << 8) | b[3];
         if (type == 4) {                       /* VORBIS_COMMENT */
-            if (len > 1 << 20) return -1;
+            if (len > 1 << 20) return;
             unsigned char *v = malloc(len);
-            if (!v) return -1;
-            if (fread(v, 1, len, f) != len) { free(v); return -1; }
+            if (!v) return;
+            if (fread(v, 1, len, f) != len) { free(v); return; }
             /* vendor string, then a count, then "KEY=value" entries */
-            uint32_t off = 0;
-            if (len < 4) { free(v); return -1; }
-            uint32_t vlen = rd32le(v);
-            off = 4 + vlen;
-            if (off + 4 > len) { free(v); return -1; }
+            if (len < 4) { free(v); return; }
+            uint32_t off = 4 + rd32le(v);
+            if (off + 4 > len) { free(v); return; }
             uint32_t n = rd32le(v + off);
             off += 4;
-            int found = -1;
             for (uint32_t i = 0; i < n && off + 4 <= len; i++) {
                 uint32_t clen = rd32le(v + off);
                 off += 4;
                 if (off + clen > len) break;
-                size_t klen = strlen(key);
-                if (clen > klen && !strncasecmp((char *)v + off, key, klen))
-                    found = parse_num((char *)v + off + klen, (int)clen - (int)klen);
+                const char *entry = (char *)v + off;
+                if (track && *track < 0 && clen > 12 && !strncasecmp(entry, "TRACKNUMBER=", 12))
+                    *track = parse_num(entry + 12, (int)clen - 12);
+                else if (disc && *disc < 0 && clen > 11 && !strncasecmp(entry, "DISCNUMBER=", 11))
+                    *disc = parse_num(entry + 11, (int)clen - 11);
+                else if (title && title[0] == '\0' && clen > 6 && !strncasecmp(entry, "TITLE=", 6)) {
+                    unsigned take = (unsigned)clen - 6;
+                    if (take >= title_n) take = title_n - 1;
+                    memcpy(title, entry + 6, take);
+                    title[take] = '\0';
+                }
                 off += clen;
-                if (found > 0) break;
             }
             free(v);
-            return found;
+            return;
         }
-        if (last) return -1;
-        if (fseek(f, (long)len, SEEK_CUR)) return -1;
+        if (last) return;
+        if (fseek(f, (long)len, SEEK_CUR)) return;
     }
-    return -1;
 }
 
-/* Scan the head of the file for the atom rather than descending the box tree:
- * one four-character name is not worth a parser, and the same shortcut is
- * already used for cover art. */
-static int mp4_field(FILE *f, const char *atom) {
-    /* Half the size the cover-art scan uses: this runs once per track when an
-     * album is opened, not once per album, so the read cost is multiplied. */
+/* Scan the head of the file for both atoms in one buffered read, rather than
+ * reading the same 256 KB twice for 'trkn' then 'disk'. */
+static void mp4_all(FILE *f, int *track, int *disc) {
     static unsigned char buf[256 * 1024];
     size_t n = fread(buf, 1, sizeof(buf), f);
-    if (n < 32) return -1;
+    if (n < 32) return;
     for (size_t i = 0; i + 32 < n; i++) {
-        if (memcmp(buf + i, atom, 4)) continue;
+        const char *atom = track && *track < 0 && !memcmp(buf + i, "trkn", 4) ? "trkn"
+                          : disc  && *disc  < 0 && !memcmp(buf + i, "disk", 4) ? "disk" : NULL;
+        if (!atom) continue;
         const unsigned char *d = buf + i + 4;
         if (memcmp(d + 4, "data", 4)) continue;
         uint32_t dsize = rd32be(d);
@@ -112,9 +123,8 @@ static int mp4_field(FILE *f, const char *atom) {
         /* 16 bytes of data-box header, then 2 reserved, then the number. */
         const unsigned char *p = d + 16;
         int v = (p[2] << 8) | p[3];
-        return v > 0 ? v : -1;
+        if (v > 0) { if (atom[0] == 't') *track = v; else *disc = v; }
     }
-    return -1;
 }
 
 static uint32_t syncsafe(const unsigned char *p) {
@@ -122,119 +132,69 @@ static uint32_t syncsafe(const unsigned char *p) {
            ((uint32_t)(p[2] & 0x7F) << 7) | (p[3] & 0x7F);
 }
 
-static int id3_field(FILE *f, const char *frame) {
+/* One frame walk, checking each frame against both TRCK and TPOS. */
+static void id3_all(FILE *f, int *track, int *disc) {
     unsigned char h[10];
-    if (fread(h, 1, 10, f) != 10 || memcmp(h, "ID3", 3)) return -1;
+    if (fread(h, 1, 10, f) != 10 || memcmp(h, "ID3", 3)) return;
     int ver = h[3];
     uint32_t tag_size = syncsafe(h + 6), pos = 0;
     while (pos + 10 < tag_size) {
         unsigned char fh[10];
-        if (fread(fh, 1, 10, f) != 10) return -1;
-        if (fh[0] == 0) return -1;                    /* padding */
+        if (fread(fh, 1, 10, f) != 10) return;
+        if (fh[0] == 0) return;                    /* padding */
         uint32_t fsize = (ver >= 4) ? syncsafe(fh + 4) : rd32be(fh + 4);
-        if (fsize == 0 || fsize > (1 << 16)) return -1;
-        if (!memcmp(fh, frame, 4)) {
+        if (fsize == 0 || fsize > (1 << 16)) return;
+        int *out = track && *track < 0 && !memcmp(fh, "TRCK", 4) ? track
+                 : disc  && *disc  < 0 && !memcmp(fh, "TPOS", 4) ? disc : NULL;
+        if (out) {
             char v[64];
             uint32_t want = fsize < sizeof(v) ? fsize : sizeof(v) - 1;
-            if (fread(v, 1, want, f) != want) return -1;
+            if (fread(v, 1, want, f) != want) return;
             v[want] = '\0';
-            /* First byte is the text encoding. */
-            return parse_num(v + 1, (int)want - 1);
+            *out = parse_num(v + 1, (int)want - 1);   /* first byte is text encoding */
+        } else if (fseek(f, (long)fsize, SEEK_CUR)) {
+            return;
         }
-        if (fseek(f, (long)fsize, SEEK_CUR)) return -1;
         pos += 10 + fsize;
     }
-    return -1;
 }
 
-/* Same three containers, the other field: DISCNUMBER, disk, TPOS. Without it a
- * multi-disc set interleaves — every disc's track 1, then every track 2. */
-static int flac_field(FILE *f, const char *key);
-static int mp4_field(FILE *f, const char *atom);
-static int id3_field(FILE *f, const char *frame);
+/* Track, disc and (FLAC only -- see the header comment on flac_text's old
+ * callers) title, in one open. Any output pointer may be NULL to skip it;
+ * track/disc are left at -1 and title untouched when not found or not
+ * applicable to the container. title may be NULL/title_n 0 to skip it
+ * outright. */
+void tag_read(const char *path, int *track, int *disc, char *title, unsigned title_n) {
+    if (track) *track = -1;
+    if (disc)  *disc  = -1;
+    if (title && title_n) title[0] = '\0';
+    FILE *f = fopen(path, "rb");
+    if (!f) return;
+    unsigned char m[12];
+    if (fread(m, 1, sizeof(m), f) != sizeof(m)) { fclose(f); return; }
+    rewind(f);
+    if (!memcmp(m, "fLaC", 4))
+        flac_all(f, track, disc, (title && title_n) ? title : NULL, title_n);
+    else if (!memcmp(m + 4, "ftyp", 4))
+        mp4_all(f, track, disc);
+    else if (!memcmp(m, "ID3", 3))
+        id3_all(f, track, disc);
+    fclose(f);
+}
 
-/* Only FLAC and ID3 carry a title cheaply enough to be worth reading here; an
- * MP4 keeps it deep in the box tree and those files are all indexed anyway. */
-static int flac_text(FILE *f, const char *key, char *out, unsigned n) {
-    unsigned char h[4];
-    if (fread(h, 1, 4, f) != 4 || memcmp(h, "fLaC", 4)) return -1;
-    for (int guard = 0; guard < 64; guard++) {
-        unsigned char b[4];
-        if (fread(b, 1, 4, f) != 4) return -1;
-        int last = b[0] & 0x80, type = b[0] & 0x7F;
-        uint32_t len = ((uint32_t)b[1] << 16) | ((uint32_t)b[2] << 8) | b[3];
-        if (type == 4) {
-            if (len > (1u << 20)) return -1;
-            unsigned char *v = malloc(len);
-            if (!v) return -1;
-            if (fread(v, 1, len, f) != len) { free(v); return -1; }
-            uint32_t off = 4 + rd32le(v), cnt, i;
-            if (off + 4 > len) { free(v); return -1; }
-            cnt = rd32le(v + off); off += 4;
-            int rc = -1;
-            size_t klen = strlen(key);
-            for (i = 0; i < cnt && off + 4 <= len; i++) {
-                uint32_t clen = rd32le(v + off); off += 4;
-                if (off + clen > len) break;
-                if (clen > klen && !strncasecmp((char *)v + off, key, klen)) {
-                    unsigned take = clen - (unsigned)klen;
-                    if (take >= n) take = n - 1;
-                    memcpy(out, v + off + klen, take);
-                    out[take] = '\0';
-                    rc = 0;
-                    break;
-                }
-                off += clen;
-            }
-            free(v);
-            return rc;
-        }
-        if (last) return -1;
-        if (fseek(f, (long)len, SEEK_CUR)) return -1;
-    }
-    return -1;
+int tag_track_number(const char *path) {
+    int v; tag_read(path, &v, NULL, NULL, 0); return v;
+}
+
+int tag_disc_number(const char *path) {
+    int v; tag_read(path, NULL, &v, NULL, 0); return v;
 }
 
 int tag_title(const char *path, char *out, unsigned n) {
     if (!out || n < 2) return -1;
     out[0] = '\0';
-    FILE *f = fopen(path, "rb");
-    if (!f) return -1;
-    unsigned char m[12];
-    int rc = -1;
-    if (fread(m, 1, sizeof(m), f) == sizeof(m)) {
-        rewind(f);
-        if (!memcmp(m, "fLaC", 4)) rc = flac_text(f, "TITLE=", out, n);
-    }
-    fclose(f);
-    return rc;
-}
-
-int tag_disc_number(const char *path) {
-    FILE *f = fopen(path, "rb");
-    if (!f) return -1;
-    unsigned char m[12];
-    if (fread(m, 1, sizeof(m), f) != sizeof(m)) { fclose(f); return -1; }
-    rewind(f);
-    int v = -1;
-    if (!memcmp(m, "fLaC", 4))          v = flac_field(f, "DISCNUMBER=");
-    else if (!memcmp(m + 4, "ftyp", 4)) v = mp4_field(f, "disk");
-    else if (!memcmp(m, "ID3", 3))      v = id3_field(f, "TPOS");
-    fclose(f);
-    return v;
-}
-
-int tag_track_number(const char *path) {
-    FILE *f = fopen(path, "rb");
-    if (!f) return -1;
-    unsigned char m[12];
-    if (fread(m, 1, sizeof(m), f) != sizeof(m)) { fclose(f); return -1; }
-    rewind(f);
-
-    int v = -1;
-    if (!memcmp(m, "fLaC", 4))            v = flac_field(f, "TRACKNUMBER=");
-    else if (!memcmp(m + 4, "ftyp", 4))   v = mp4_field(f, "trkn");
-    else if (!memcmp(m, "ID3", 3))        v = id3_field(f, "TRCK");
-    fclose(f);
-    return v;
+    /* Only FLAC ever gets a title from tag_read() (see flac_all) -- MP4/MP3
+     * never populate it, matching this function's pre-existing behaviour. */
+    tag_read(path, NULL, NULL, out, n);
+    return out[0] ? 0 : -1;
 }

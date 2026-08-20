@@ -31,8 +31,15 @@ typedef struct {
 int  lib_open(void);
 void lib_close(void);
 
+/* `expected`: the album row's own track count, from the same Albums list
+ * the caller just tapped (lib_row_t.count) -- lets the folder-recovery
+ * sweep below be skipped once the SQL result already accounts for every
+ * track the index itself claims this album has, rather than always paying
+ * for an opendir()+stat()-per-file walk regardless of whether anything is
+ * actually missing. Pass 0 if unknown, which keeps the old always-sweep
+ * behaviour. */
 int  lib_tracks_for_album(const char *artist, const char *album,
-                          lib_track_t *out, int max);
+                          lib_track_t *out, int max, int expected);
 /* Grouped browsing. `column` is one of "album_artist", "artist", "genre" —
  * checked against a whitelist, since a column name cannot be bound as a
  * parameter and has to be pasted into the SQL. */
@@ -79,5 +86,11 @@ int lib_prefixes(const char *column, const char *value, int albums,
                  char *out, int max);
 
 const char *lib_format_name(int code);
+
+/* The stock index stores paths in the player's own volume notation
+ * ("a:\Artist\Album\file.flac") -- turns that into a real filesystem path
+ * under the SD card root. Exported for index.c's scanner, which enumerates
+ * the same stock database from its own connection. */
+void real_path(char *dst, size_t n, const char *stored);
 
 #endif

@@ -764,6 +764,12 @@ static int usb_card(void) {
 }
 
 static int  g_out_kind;              /* 0 wired, 1 usb, 2 bluetooth */
+/* Settings' "disable PEQ, MSEB and Bluetooth when playing over USB" -- the
+ * Bluetooth-radio half of that is music_hook.c's job (it owns st_bt_set()
+ * and the quick-settings toggle already), this flag is only the DSP half. */
+static int  g_usb_bypass;
+void audio_set_usb_bypass(int on) { g_usb_bypass = on; }
+int  audio_usb_bypass(void)       { return g_usb_bypass; }
 static int  g_out_card = -1;
 static unsigned g_out_rate;          /* what pcm_open() actually negotiated */
 
@@ -807,7 +813,8 @@ const char *audio_output(void) { return out_label(); }
 const char *audio_codec(void)  { return g_codec; }
 int audio_is_exact(void) { return g_exact; }
 int audio_output_lost(void) { return g_out_lost; }
-int audio_using_bt(void) { return g_out_kind == 2; }
+int audio_using_bt(void)  { return g_out_kind == 2; }
+int audio_using_usb(void) { return g_out_kind == 1; }
 
 /* Bluetooth has a real mixer, unlike the wired path where the CS43131's volume
  * registers are not wired up and samples have to be scaled in software. The
@@ -1642,8 +1649,10 @@ static void *worker(void *arg) {
         /* Before any volume scaling, shift or dither below, on whichever
          * buffer actually holds this chunk's decode -- the same raw samples
          * regardless of which output path they take afterward. A no-op
-         * (single flag check) when the EQ is off. */
-        if (got > 0) {
+         * (single flag check) when the EQ is off, and likewise skipped
+         * outright on USB when the bypass setting is on and this chunk is
+         * actually going out over USB -- see g_usb_bypass's own comment. */
+        if (got > 0 && !(g_usb_bypass && g_out_kind == 1)) {
             if (src_wide) eq_process_s32(buf32, (int)got, ch);
             else          eq_process_s16(buf, (int)got, ch);
         }

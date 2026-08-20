@@ -31,6 +31,7 @@
 #include "library.h"
 #include "tags.h"
 #include "audio.h"
+#include "index.h"
 
 #define DB_PATH "/usr/data/usrlocal_media.db"
 
@@ -148,6 +149,22 @@ static int allowed_column(const char *c) {
 /* ---- grouped lists (album artists, artists, genres) ---------------------- */
 int lib_group(const char *column, lib_row_t *out, int max, int offset) {
     if (!g_db || !allowed_column(column)) return 0;
+
+    /* Same cache/fallback pattern as lib_albums() -- see its own comment.
+     * 0 means "never scanned yet", not "empty list", and falls through to
+     * the live query below unchanged. */
+    {
+        int n = index_group(column, out, max, offset);
+        if (n > 0) {
+            for (int i = 0; i < n; i++) {
+                int blank = is_blank(out[i].name);
+                if (blank) snprintf(out[i].name, sizeof(out[i].name), "Unknown");
+                snprintf(out[i].owner, sizeof(out[i].owner), blank ? LIB_UNKNOWN_MARK : "");
+            }
+            return n;
+        }
+    }
+
     /* The album count is what makes these lists worth reading, and for the
      * album-artist list it is the whole point of the app: the stock browser
      * shows an album artist's tracks rather than their albums. */
@@ -177,6 +194,12 @@ int lib_group(const char *column, lib_row_t *out, int max, int offset) {
 
 int lib_group_count(const char *column) {
     if (!g_db || !allowed_column(column)) return 0;
+
+    {
+        int n = index_group_count(column);
+        if (n > 0) return n;
+    }
+
     char sql[192];
     snprintf(sql, sizeof(sql),
              "select count(distinct %s) from MEDIA_TABLE where " PODCAST_EXCL_FMT,
@@ -197,6 +220,25 @@ int lib_albums(const char *column, const char *value,
                lib_row_t *out, int max, int offset) {
     if (!g_db) return 0;
     int filtered = allowed_column(column) && value;
+
+    /* Unfiltered (whole-library) browsing is the common case -- the Albums
+     * menu entry, not a facet drill-down -- and the one index.c's scan
+     * pass keeps a cache for. GROUP BY/ORDER BY over MEDIA_TABLE with no
+     * index on `album` meant re-sorting the whole table on every single
+     * visit; a facet-filtered view is a smaller slice and reruns live
+     * unchanged. 0 rows back from the cache means "never scanned yet", not
+     * "empty library" -- falls through to the live query below exactly as
+     * before. */
+    if (!filtered) {
+        int n = index_albums(out, max, offset);
+        if (n > 0) {
+            for (int i = 0; i < n; i++)
+                if (is_blank(out[i].name))
+                    snprintf(out[i].name, sizeof(out[i].name), "Unknown album");
+            return n;
+        }
+    }
+
     char frag[128]; int need_bind;
     filter_clause(column, value, filtered, frag, sizeof(frag), &need_bind);
     char sql[320];
@@ -230,6 +272,13 @@ int lib_albums(const char *column, const char *value,
 int lib_albums_count(const char *column, const char *value) {
     if (!g_db) return 0;
     int filtered = allowed_column(column) && value;
+
+    /* Same cache lib_albums() itself uses; see its own comment. */
+    if (!filtered) {
+        int n = index_albums_count();
+        if (n > 0) return n;
+    }
+
     char frag[128]; int need_bind;
     filter_clause(column, value, filtered, frag, sizeof(frag), &need_bind);
     char sql[256];
@@ -342,7 +391,7 @@ int lib_albums_recent_heard(long long (*heard_ts)(const char *album),
  * open until that is turned back into a real path; a: is the card. */
 #define SD_ROOT "/data/mnt/sd_0/"
 
-static void real_path(char *dst, size_t n, const char *stored) {
+void real_path(char *dst, size_t n, const char *stored) {
     const char *p = stored;
     if (((p[0] | 32) >= 'a' && (p[0] | 32) <= 'z') && p[1] == ':' &&
         (p[2] == '\\' || p[2] == '/'))
@@ -469,17 +518,17 @@ static int sweep_album_folder(lib_track_t *out, int n, int max,
         lib_track_t *t = &out[n];
         memset(t, 0, sizeof(*t));
         snprintf(t->path, sizeof(t->path), "%s", full);
+        /* One open for track+disc+title instead of three separate ones. */
+        tag_read(full, &t->track, &t->disc, t->name, sizeof(t->name));
         /* Prefer what the file calls itself; these names are long and the
          * filename carries the whole album title as a prefix. */
-        if (tag_title(full, t->name, sizeof(t->name)) != 0 || !t->name[0])
+        if (!t->name[0])
             name_from_file(e->d_name, t->name, sizeof(t->name));
         /* artist_fallback, not out[0].artist: out[0] is never written when n
          * starts at 0 (BG11 — every indexed row for this album was stale),
          * so reading it here would be uninitialized caller memory. */
         snprintf(t->artist, sizeof(t->artist), "%s", artist_fallback);
-        t->track = tag_track_number(full);
         if (t->track <= 0) t->track = track_no_from_path(full);
-        t->disc = tag_disc_number(full);
         if (t->disc <= 0) t->disc = disc_no_from_path(full);
         n++;
     }
@@ -505,13 +554,47 @@ static int sweep_album_folder(lib_track_t *out, int n, int max,
  * use_artist=1 tries the disambiguating filter first — needed when two
  * different artists share an album name and album_artist is populated.
  * use_artist=0 is the retry once that comes back with literally nothing to
- * work with, dropping the filter and matching by album alone. */
+ * work with, dropping the filter and matching by album alone.
+ *
+ * The artist match itself is deliberately two-directional, not a plain
+ * "column starts with the tapped artist" LIKE: found live on a Schoenberg
+ * box set where 34 of 37 tracks carry album_artist "Berliner Philharmoniker,
+ * Kirill Petrenko" and the 3 Violin Concerto tracks add the soloist,
+ * "...Kirill Petrenko, Patricia Kopatchinskaja". lib_albums()'s max(album_
+ * artist) picks the longer string (lexicographically greater), so the row
+ * tapped from Albums always carries the soloist's name -- and the old
+ * one-directional "album_artist like 'tapped-value%'" then matched only
+ * the 3 rows that actually start with that longer string, silently
+ * dropping the other 34. The second clause below catches the reverse
+ * case -- the tapped value starting with the row's own (shorter)
+ * album_artist -- without weakening the filter for two genuinely
+ * different artists sharing an album title (their names don't prefix one
+ * another, so neither clause matches across them).
+ *
+ * substr(album_artist, 1, length(album_artist)-1), not album_artist itself,
+ * on the right side of that second clause: this file's own header comment
+ * on the stock DB's traps says every string carries a NUL *inside* the
+ * value, not just as a terminator -- confirmed live, hex-dumped directly
+ * off the Schoenberg rows: the 40-byte "short" album_artist is 39 real
+ * bytes plus a trailing 0x00 (the 65-byte "long" one is 64 real bytes
+ * plus the same). Appending '%' straight onto the raw column therefore
+ * appended it *after* that embedded NUL, so the pattern demanded the
+ * literal byte sequence "...Petrenko\0%" -- which the actual searched
+ * value (a plain C string with no embedded NUL of its own) can never
+ * contain, so the clause matched nothing at all despite being logically
+ * correct. Dropping the last byte before appending '%' fixes it; verified
+ * directly against a pulled copy of the real device database, 3 rows to
+ * 37. (char(0)/rtrim(x, char(0)) were tried first and don't work here --
+ * this build's char(0) reports length() 0, not 1, so neither rtrim() nor
+ * replace() ever had a real NUL byte to strip.) */
 static int tracks_query(const char *artist, const char *album, int use_artist,
                         lib_track_t *out, int max, char *seed_path, size_t seed_len) {
     const char *sql = use_artist
         ? "select name, path, format, bit, sample_rate, bit_rate, end_time, artist "
           "from MEDIA_TABLE where album like ? escape '\\' "
-          "and album_artist like ? escape '\\' and " PODCAST_EXCL_SQL " limit ?"
+          "and (album_artist like ? escape '\\' "
+          "or ? like (substr(album_artist, 1, length(album_artist) - 1) || '%')) "
+          "and " PODCAST_EXCL_SQL " limit ?"
         : "select name, path, format, bit, sample_rate, bit_rate, end_time, artist "
           "from MEDIA_TABLE where album like ? escape '\\' "
           "and " PODCAST_EXCL_SQL " limit ?";
@@ -524,6 +607,7 @@ static int tracks_query(const char *artist, const char *album, int use_artist,
     if (use_artist) {
         snprintf(pb, sizeof(pb), "%s%%", artist);
         sqlite3_bind_text(st, a++, pb, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, a++, artist, -1, SQLITE_TRANSIENT);
     }
     sqlite3_bind_int(st, a++, max);
     int n = 0;
@@ -551,23 +635,36 @@ static int tracks_query(const char *artist, const char *album, int use_artist,
          * track, which is nearly everything, is left at -1 indefinitely.
          * See audio_probe_dur_ms()'s own comment for why this is safe to
          * call here, including while something else is playing. */
+        /* Rows can outlive their files — renaming anything leaves the index
+         * pointing at a name that is gone, and a track that cannot be opened
+         * is worse than one that is absent. The folder sweep below picks the
+         * real file up under its new name. One stat() here does double duty:
+         * this existence check, and (below) the mtime our own track_index
+         * cache is keyed against, rather than stat()ing the same path twice. */
+        struct stat fst;
+        if (stat(t->path, &fst) != 0) continue;
+
+        /* Our own background scanner (index.c) already read this file's tags
+         * once; a hit here skips tag_read() and audio_probe_dur_ms() below
+         * entirely -- the whole reason an album with hundreds of tracks
+         * doesn't have to pay hundreds of file opens on every single open. */
+        int idx_track, idx_disc, idx_dur;
+        int cached = index_lookup(t->path, fst.st_mtime, &idx_track, &idx_disc, &idx_dur);
+        if (cached && idx_dur > 0) t->dur_ms = idx_dur;
+
         if (t->dur_ms <= 0) t->dur_ms = audio_probe_dur_ms(t->path, t->bitrate);
         copy_text(t->artist, sizeof(t->artist), sqlite3_column_text(st, 7));
         /* Ask the file first. The filename is a guess that happens to be right
          * about half the time here, and a wrong guess does not leave a track
          * unnumbered — it puts the album in the wrong order. */
-        t->track = tag_track_number(t->path);
-        if (t->track <= 0) t->track = track_no_from_path(t->path);
-        t->disc = tag_disc_number(t->path);
-        if (t->disc <= 0) t->disc = disc_no_from_path(t->path);
-        /* Rows can outlive their files — renaming anything leaves the index
-         * pointing at a name that is gone, and a track that cannot be opened
-         * is worse than one that is absent. The folder sweep below picks the
-         * real file up under its new name. */
-        {
-            struct stat fst;
-            if (stat(t->path, &fst) != 0) continue;
+        if (cached) {
+            t->track = idx_track;
+            t->disc = idx_disc;
+        } else {
+            tag_read(t->path, &t->track, &t->disc, NULL, 0);
         }
+        if (t->track <= 0) t->track = track_no_from_path(t->path);
+        if (t->disc <= 0) t->disc = disc_no_from_path(t->path);
         n++;
     }
     sqlite3_finalize(st);
@@ -575,7 +672,7 @@ static int tracks_query(const char *artist, const char *album, int use_artist,
 }
 
 int lib_tracks_for_album(const char *artist, const char *album,
-                         lib_track_t *out, int max) {
+                         lib_track_t *out, int max, int expected) {
     if (!g_db) return 0;
     char seed_path[LIB_PATH_LEN];
     int n = tracks_query(artist, album, 1, out, max, seed_path, sizeof(seed_path));
@@ -599,8 +696,20 @@ int lib_tracks_for_album(const char *artist, const char *album,
      * one, and an album quietly short of a track is worse than a slow open.
      * Sweep the folder the album came from and take anything it did not know
      * about. Runs even at n==0: the index can show a track count in the
-     * album list yet have every one of those rows' paths gone stale. */
-    if (n < max && seed_path[0]) n = sweep_album_folder(out, n, max, seed_path, artist);
+     * album list yet have every one of those rows' paths gone stale.
+     *
+     * `expected` (the Albums list's own count for this row) was briefly used
+     * to skip this sweep once n reached it -- wrong, and reverted: found live
+     * on "Arnold Schoenberg", 37 tracks on disk, 3 in the database. The
+     * Albums list's count comes from the *same* incomplete SQL side as
+     * tracks_query() above, so n reaching `expected` only proves the two
+     * agree with each other, never that the filesystem doesn't have more --
+     * which is exactly the case this sweep exists to catch. `expected` is
+     * kept as a parameter (some future, actually-independent count might
+     * use it safely) but no longer read here. */
+    (void)expected;
+    if (n < max && seed_path[0])
+        n = sweep_album_folder(out, n, max, seed_path, artist);
 
     /* The index carries the same file twice for some albums, which showed as a
      * doubled movement. Drop repeats whatever their source. */
@@ -752,11 +861,20 @@ int lib_track_by_path(const char *real, lib_track_t *out) {
         out->rate    = sqlite3_column_int(st, 4);
         out->bitrate = sqlite3_column_int(st, 5);
         out->dur_ms  = sqlite3_column_int(st, 6);
-        if (out->dur_ms <= 0) out->dur_ms = audio_probe_dur_ms(out->path, out->bitrate);
         copy_text(out->artist, sizeof(out->artist), sqlite3_column_text(st, 7));
-        out->track = tag_track_number(out->path);
+        struct stat fst;
+        int idx_track, idx_disc, idx_dur;
+        int cached = stat(out->path, &fst) == 0 &&
+                     index_lookup(out->path, fst.st_mtime, &idx_track, &idx_disc, &idx_dur);
+        if (out->dur_ms <= 0 && cached && idx_dur > 0) out->dur_ms = idx_dur;
+        if (out->dur_ms <= 0) out->dur_ms = audio_probe_dur_ms(out->path, out->bitrate);
+        if (cached) {
+            out->track = idx_track;
+            out->disc = idx_disc;
+        } else {
+            tag_read(out->path, &out->track, &out->disc, NULL, 0);
+        }
         if (out->track <= 0) out->track = track_no_from_path(out->path);
-        out->disc = tag_disc_number(out->path);
         if (out->disc <= 0) out->disc = disc_no_from_path(out->path);
         rc = 0;
     }
