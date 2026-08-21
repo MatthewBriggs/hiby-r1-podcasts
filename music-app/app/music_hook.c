@@ -102,31 +102,150 @@ static const struct { const char *name; uint16_t color; } ACCENT_PRESETS[] = {
 };
 #define ACCENT_N ((int)(sizeof(ACCENT_PRESETS) / sizeof(ACCENT_PRESETS[0])))
 static int g_accent_idx;
-/* R41: light theme is an exact per-channel invert of the dark palette above
- * (light = 255 - dark, per channel), which is what guarantees every
+/* R41/R43: light theme is an exact per-channel invert of the dark palette
+ * above (light = 255 - dark, per channel), which is what guarantees every
  * contrast relationship dark mode already relies on -- text-vs-background,
  * dim-vs-background, line-vs-background -- survives the swap unchanged
- * rather than needing to be independently re-balanced. Accent presets are
- * untouched either way, per R41's own "maintaining accent colour
- * functionality" -- they're saturated enough to read on both. */
-static int light_theme;
+ * rather than needing to be independently re-balanced. Grey isn't an invert
+ * of anything -- R43 asked for a genuine middle ground, not dark-lite or
+ * light-lite, so its six values are their own deliberate design: a mid-grey
+ * field (not near-black, not near-white) with light text, sized to read
+ * comfortably in daylight without light theme's starkness or dark theme's
+ * depth. Accent presets are untouched across all three, per R41's own
+ * "maintaining accent colour functionality" -- they're saturated enough to
+ * read against any of them. */
+#define THEME_DARK  0
+#define THEME_LIGHT 1
+#define THEME_GREY  2
+#define THEME_AUTO  3
+#define THEME_MODE_N 4
+static const char *THEME_MODE_NAMES[THEME_MODE_N] = { "Dark", "Light", "Grey", "Auto" };
+static int theme_mode;
+/* R45: defined below tz_offset_minutes(), which it needs -- forward
+ * declared here so apply_theme() can call it regardless of definition
+ * order. */
+static int is_daytime(void);
 static void apply_theme(void) {
-    if (light_theme) {
+    /* R45: Auto isn't its own palette -- it picks Light or Dark by time of
+     * day and applies that one, same as if the user had picked it directly.
+     * theme_mode itself still reads "Auto" everywhere it's displayed or
+     * saved; only the six colour variables below are ever affected. */
+    int effective = theme_mode;
+    if (effective == THEME_AUTO) effective = is_daytime() ? THEME_LIGHT : THEME_DARK;
+    switch (effective) {
+    case THEME_LIGHT:
         g_col_bg     = RGB(239, 239, 235);
         g_col_header = RGB(229, 229, 222);
         g_col_text   = RGB(15, 15, 10);
         g_col_dim    = RGB(130, 130, 119);
         g_col_row    = RGB(229, 229, 222);
         g_col_line   = RGB(217, 217, 209);
-    } else {
+        break;
+    case THEME_GREY:
+        g_col_bg     = RGB(60, 60, 66);
+        g_col_header = RGB(72, 72, 79);
+        g_col_text   = RGB(235, 235, 238);
+        g_col_dim    = RGB(170, 170, 178);
+        g_col_row    = RGB(72, 72, 79);
+        g_col_line   = RGB(85, 85, 92);
+        break;
+    default:
         g_col_bg     = RGB(16, 16, 20);
         g_col_header = RGB(26, 26, 33);
         g_col_text   = RGB(240, 240, 245);
         g_col_dim    = RGB(125, 125, 136);
         g_col_row    = RGB(26, 26, 33);
         g_col_line   = RGB(38, 38, 46);
+        break;
     }
 }
+
+/* R44: a fixed UTC-offset list rather than full IANA tzdata -- this device
+ * has no zoneinfo database to speak of, and R45's only actual use for this
+ * (a sunrise/sunset estimate) needs nothing more precise than "roughly which
+ * meridian." DST is deliberately not modelled: it depends on region and date
+ * in a way a single offset can't express, and getting it wrong twice a year
+ * would be worse than a sunrise/sunset guess that's steadily an hour off in
+ * summer. Ordered west to east so the picker reads as a line around the
+ * globe, not an alphabetised list. */
+static const struct { const char *name; int offset_min; } TZ_PRESETS[] = {
+    { "UTC-12:00",              -720 },
+    { "UTC-11:00",              -660 },
+    { "UTC-10:00 (Hawaii)",     -600 },
+    { "UTC-9:00 (Alaska)",      -540 },
+    { "UTC-8:00 (Pacific)",     -480 },
+    { "UTC-7:00 (Mountain)",    -420 },
+    { "UTC-6:00 (Central)",     -360 },
+    { "UTC-5:00 (Eastern)",     -300 },
+    { "UTC-4:00 (Atlantic)",    -240 },
+    { "UTC-3:00 (Argentina)",   -180 },
+    { "UTC-2:00",               -120 },
+    { "UTC-1:00 (Azores)",       -60 },
+    { "UTC+0:00 (London)",         0 },
+    { "UTC+1:00 (Central Europe)", 60 },
+    { "UTC+2:00 (Eastern Europe)", 120 },
+    { "UTC+3:00 (Moscow)",       180 },
+    { "UTC+3:30 (Iran)",         210 },
+    { "UTC+4:00 (Dubai)",        240 },
+    { "UTC+4:30 (Kabul)",        270 },
+    { "UTC+5:00 (Pakistan)",     300 },
+    { "UTC+5:30 (India)",        330 },
+    { "UTC+5:45 (Nepal)",        345 },
+    { "UTC+6:00 (Bangladesh)",   360 },
+    { "UTC+6:30 (Myanmar)",      390 },
+    { "UTC+7:00 (Bangkok)",      420 },
+    { "UTC+8:00 (China/Singapore)", 480 },
+    { "UTC+9:00 (Japan/Korea)",  540 },
+    { "UTC+9:30 (Adelaide)",     570 },
+    { "UTC+10:00 (Sydney)",      600 },
+    { "UTC+11:00",               660 },
+    { "UTC+12:00 (NZ)",          720 },
+    { "UTC+13:00",               780 },
+    { "UTC+14:00",               840 },
+};
+#define TZ_N ((int)(sizeof(TZ_PRESETS) / sizeof(TZ_PRESETS[0])))
+static int tz_idx = 12;   /* UTC+0:00, a neutral default rather than guessing */
+/* Getter for other subsystems (R45's sunrise/sunset calc) to query the
+ * current offset without reaching into tz_idx/TZ_PRESETS directly. */
+static int tz_offset_minutes(void) { return TZ_PRESETS[tz_idx].offset_min; }
+
+/* R45: Auto mode's day/night test. Real sunrise/sunset needs latitude, which
+ * this device has no way to collect on its own -- R44 only gathers a UTC
+ * offset, not a full geographic fix. Rather than pretend to a precision this
+ * app can't have, this assumes a fixed mid-latitude (40 deg N, roughly New
+ * York/Madrid/Beijing) and combines it with the real day-of-year and the
+ * timezone offset to get a genuine seasonal swing in day length -- accurate
+ * for anyone actually near that latitude, and still the right *shape* of
+ * behaviour (later dawn and earlier dusk in winter, the reverse in summer)
+ * everywhere else, rather than a fixed clock-hour cutoff that would not
+ * account for seasons at all. Cooper's equation for solar declination, the
+ * standard approximate form (accurate to about 1 degree, which is closer
+ * than the assumed latitude itself is to anyone's actual position). */
+static int is_daytime(void) {
+    time_t now = time(NULL);
+    struct tm u;
+    gmtime_r(&now, &u);
+    int day_of_year = u.tm_yday + 1;             /* 1..366 */
+    double local_hour = u.tm_hour + u.tm_min / 60.0 + u.tm_sec / 3600.0
+                       + tz_offset_minutes() / 60.0;
+    /* Wrap into [0,24) -- the offset above can push it either side of the
+     * UTC day, and only the time-of-day matters here, not which calendar
+     * day it lands on. */
+    local_hour = fmod(local_hour, 24.0);
+    if (local_hour < 0) local_hour += 24.0;
+
+    const double rad = M_PI / 180.0;
+    const double assumed_lat = 40.0;
+    double decl = 23.45 * sin(rad * (360.0 / 365.0) * (284 + day_of_year));
+    double cos_omega = -tan(assumed_lat * rad) * tan(decl * rad);
+    if (cos_omega > 1.0) return 0;    /* sun never rises at this latitude today */
+    if (cos_omega < -1.0) return 1;   /* sun never sets at this latitude today */
+    double omega = acos(cos_omega) / rad;    /* degrees */
+    double sunrise = 12.0 - omega / 15.0;
+    double sunset  = 12.0 + omega / 15.0;
+    return local_hour >= sunrise && local_hour < sunset;
+}
+
 static int button_lock_enabled;   /* off by default: a new gesture, opt in */
 /* "Disable PEQ, MSEB and Bluetooth when playing over USB" -- off by default,
  * same reasoning as button_lock_enabled: a new behaviour, opt in. usb_bypass_
@@ -443,6 +562,106 @@ static void art_request(const char *track, const char *artist, const char *album
         art_thread_valid = 1;
 }
 
+/* BG70: a completely separate bitmap from art_bits above, not a save/
+ * restore around the same one. The album-detail screen's cover used to
+ * call art_request() (the playing track's own loader) to show whatever
+ * album was being *browsed* -- but art_bits is also what the mini-player
+ * and Now Playing read, so the moment you opened a different album than
+ * whatever was actually playing, the mini-player's thumbnail flipped to
+ * the browsed album too, for the entire time that screen stayed open, not
+ * just after leaving it. A go_back()-time restore only patched the "after"
+ * half; the two states need to never share a buffer in the first place. */
+static pthread_mutex_t view_art_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint16_t *view_art_bits;
+static char      view_art_want[512];
+static char      view_art_want_artist[LIB_NAME_LEN];
+static char      view_art_want_album[LIB_NAME_LEN];
+static pthread_t view_art_thread;
+static int       view_art_thread_valid;
+static int       view_art_seq_v;
+
+static int view_art_seq(void) {
+    pthread_mutex_lock(&view_art_lock);
+    int v = view_art_seq_v;
+    pthread_mutex_unlock(&view_art_lock);
+    return v;
+}
+
+static void *view_art_worker(void *arg) {
+    (void)arg;
+    char track[512], artist[LIB_NAME_LEN], album[LIB_NAME_LEN];
+    pthread_mutex_lock(&view_art_lock);
+    snprintf(track, sizeof(track), "%s", view_art_want);
+    snprintf(artist, sizeof(artist), "%s", view_art_want_artist);
+    snprintf(album, sizeof(album), "%s", view_art_want_album);
+    pthread_mutex_unlock(&view_art_lock);
+
+    char jpg[512], key[512];
+    uint16_t *bits = NULL;
+    for (int n = 0; !bits; n++) {
+        int rc = art_candidate(track, n, jpg, sizeof(jpg), key, sizeof(key));
+        if (rc == -1) break;
+        if (rc == ART_SKIP) continue;
+        bits = cover_load(jpg, key, ART_PX);
+    }
+    /* Same Last.fm-then-Spotify network fallback art_worker() uses, kept
+     * in sync deliberately -- an album can be viewed without ever being
+     * played, and it deserves the same chance at a fetched cover. */
+    if (!bits && artist[0] && album[0] && st_net_up() &&
+        (lastfm_has_key() || spotify_has_key())) {
+        char dir[512], dest[560], nomatch[580];
+        album_dir(track, dir, sizeof(dir));
+        snprintf(dest, sizeof(dest), "%s/cover.jpg", dir);
+        snprintf(nomatch, sizeof(nomatch), "%s/.cover_no_match", dir);
+        struct stat nm_st;
+        if (stat(nomatch, &nm_st) != 0) {
+            int ok = lastfm_has_key() && lastfm_fetch_cover(artist, album, dest) == 0;
+            if (!ok && spotify_has_key() && spotify_fetch_cover(artist, album, dest) == 0)
+                ok = 1;
+            if (ok) {
+                bits = cover_load(dest, dir, ART_PX);
+            } else {
+                FILE *f = fopen(nomatch, "w");
+                if (f) fclose(f);
+            }
+        }
+    }
+
+    pthread_mutex_lock(&view_art_lock);
+    if (strcmp(track, view_art_want) != 0) { free(bits); }
+    else { free(view_art_bits); view_art_bits = bits; view_art_seq_v++; }
+    pthread_mutex_unlock(&view_art_lock);
+    return NULL;
+}
+
+static void view_art_request(const char *track, const char *artist, const char *album) {
+    if (view_art_thread_valid) { pthread_join(view_art_thread, NULL); view_art_thread_valid = 0; }
+    pthread_mutex_lock(&view_art_lock);
+    free(view_art_bits);
+    view_art_bits = NULL;
+    view_art_seq_v++;
+    snprintf(view_art_want, sizeof(view_art_want), "%s", track);
+    snprintf(view_art_want_artist, sizeof(view_art_want_artist), "%s", artist ? artist : "");
+    snprintf(view_art_want_album, sizeof(view_art_want_album), "%s", album ? album : "");
+    pthread_mutex_unlock(&view_art_lock);
+    if (pthread_create(&view_art_thread, NULL, view_art_worker, NULL) == 0)
+        view_art_thread_valid = 1;
+}
+
+static void view_blit_art_clip(uint16_t *fb, int x, int y, int clip_top, int clip_bot) {
+    pthread_mutex_lock(&view_art_lock);
+    if (view_art_bits) {
+        for (int r = 0; r < ART_PX; r++) {
+            int py = y + r;
+            if (py < clip_top || py >= clip_bot || py < 0 || py >= FB_H) continue;
+            memcpy(fb + (size_t)py * FB_W + x,
+                   view_art_bits + (size_t)r * ART_PX,
+                   (size_t)ART_PX * sizeof(uint16_t));
+        }
+    }
+    pthread_mutex_unlock(&view_art_lock);
+}
+
 static void blit_art(uint16_t *fb, int x, int y) {
     pthread_mutex_lock(&art_lock);
     if (art_bits) {
@@ -450,6 +669,27 @@ static void blit_art(uint16_t *fb, int x, int y) {
             memcpy(fb + (size_t)(y + r) * FB_W + x,
                    art_bits + (size_t)r * ART_PX,
                    (size_t)ART_PX * sizeof(uint16_t));
+    }
+    pthread_mutex_unlock(&art_lock);
+}
+
+/* R46: blit_art() writes ART_PX rows unconditionally with no bounds check --
+ * fine every other place it's called, since the cover never moves there, but
+ * the album-detail screen scrolls its cover along with everything else, so y
+ * can land anywhere from well above 0 to well below FB_H. Skips whichever
+ * rows fall outside [clip_top, clip_bot) (and the framebuffer itself, for
+ * anything calling this with unchecked bounds) instead of writing past the
+ * buffer. */
+static void blit_art_clip(uint16_t *fb, int x, int y, int clip_top, int clip_bot) {
+    pthread_mutex_lock(&art_lock);
+    if (art_bits) {
+        for (int r = 0; r < ART_PX; r++) {
+            int py = y + r;
+            if (py < clip_top || py >= clip_bot || py < 0 || py >= FB_H) continue;
+            memcpy(fb + (size_t)py * FB_W + x,
+                   art_bits + (size_t)r * ART_PX,
+                   (size_t)ART_PX * sizeof(uint16_t));
+        }
     }
     pthread_mutex_unlock(&art_lock);
 }
@@ -679,6 +919,43 @@ static void fill_rect_clip(uint16_t *fb, int x, int y, int w, int h, uint16_t c,
     fill_rect(fb, x, y, w, h, c);
 }
 
+/* BG69: fill_circle()/fill_pill() only ever clipped against the screen
+ * edges, not an arbitrary clip_top -- fine everywhere they'd been used
+ * until Settings started scrolling, where a toggle mid-row can have its
+ * top half still above CONTENT_Y while its centre (where these primitives
+ * actually draw from) is well below it. Skipping the whole draw call
+ * whenever the row was *at all* out of bounds was the first attempt at
+ * this; it missed exactly this straddling case, since the toggle's own
+ * drawn pixels don't start at the row's nominal top -- they're centred
+ * within it. Row-height gating can't get that right without duplicating
+ * this same per-scanline math, so the primitives clip properly instead. */
+static void fill_circle_clip(uint16_t *fb, int cx, int cy, int r, uint16_t c,
+                             int clip_top, int clip_bot) {
+    for (int dy = -r; dy <= r; dy++) {
+        int yy = cy + dy;
+        if (yy < clip_top || yy >= clip_bot || yy < 0 || yy >= FB_H) continue;
+        int dx = (int)(sqrt((double)(r * r - dy * dy)) + 0.5);
+        fill_rect(fb, cx - dx, yy, dx * 2, 1, c);
+    }
+}
+
+static void fill_pill_clip(uint16_t *fb, int x, int y, int w, int h, uint16_t c,
+                          int clip_top, int clip_bot) {
+    int r = h / 2;
+    if (w <= h) { fill_circle_clip(fb, x + w / 2, y + r, r, c, clip_top, clip_bot); return; }
+    fill_rect_clip(fb, x + r, y, w - 2 * r, h, c, clip_top, clip_bot);
+    fill_circle_clip(fb, x + r, y + r, r, c, clip_top, clip_bot);
+    fill_circle_clip(fb, x + w - r, y + r, r, c, clip_top, clip_bot);
+}
+
+static void draw_toggle_switch_h_clip(uint16_t *fb, int y, int on, int block_h,
+                                      int clip_top, int clip_bot) {
+    int w = 68, h = 32, x = FB_W - 24 - w, top = y + block_h / 2 - h / 2;
+    fill_pill_clip(fb, x, top, w, h, on ? COL_ACCENT : COL_LINE, clip_top, clip_bot);
+    fill_circle_clip(fb, on ? x + w - h / 2 : x + h / 2, top + h / 2, h / 2 - 3,
+                     on ? COL_BG : COL_DIM, clip_top, clip_bot);
+}
+
 /* ---- screens ------------------------------------------------------------- */
 /* Rows are fetched a screenful at a time rather than held in one array: the
  * library is 4722 tracks and this device has 56 MB. Only what is on screen,
@@ -688,7 +965,8 @@ static void fill_rect_clip(uint16_t *fb, int x, int y, int w, int h, uint16_t c,
 typedef enum { SC_MENU = 0, SC_MUSIC_MENU, SC_ARTISTS, SC_ALBUMS, SC_TRACKS, SC_PLAYING,
                SC_RADIO, SC_PLAYLISTS, SC_AUDIOBOOKS, SC_PODCASTS, SC_POD_SYNC,
                SC_EQ, SC_EQ_BANDS, SC_EQ_BAND, SC_MSEB,
-               SC_SETTINGS, SC_SETTINGS_THEME, SC_SETTINGS_ABOUT } screen_t;
+               SC_SETTINGS, SC_SETTINGS_THEME, SC_SETTINGS_ABOUT,
+               SC_SETTINGS_TIMEZONE, SC_SETTINGS_THEMEMODE, SC_QUEUE } screen_t;
 
 /* L2: the top-level menu ("Main Menu", EXIT on the right) stays small on
  * purpose rather than listing every library-browsing facet alongside
@@ -755,7 +1033,7 @@ static int live_x, live_y;          /* where the finger is now, while it is down
 /* Quick settings, pulled down from the status strip. Brightness, Wi-Fi and
  * Bluetooth are wanted often enough that leaving the app to reach them is the
  * annoyance; everything else stays in the firmware's own settings. */
-#define QS_H       490          /* was 418; +QS_ROW_H for the MSEB row */
+#define QS_H       490
 #define QS_ROW_H   72
 /* Row label column. Was a bare 68 until the Wi-Fi/Bluetooth/EQ row icons grew
  * larger -- Wi-Fi's natural width at its new height puts its right edge
@@ -812,6 +1090,17 @@ static int index_shown = -1;        /* letter slot last jumped to */
  * (see draw_scroll_title), so the layout below them is fixed again and the
  * hit tests can be read straight off these constants. */
 static int title_y(void) { return ART_PX + 20; }
+
+/* R46: the album-detail screen's own header block -- cover, title, artist,
+ * then the tracks/format/duration line, all scrolling together with the
+ * track list beneath them rather than sitting fixed above it. Same spacing
+ * Now Playing already uses for its own title/artist block (title_y()+44,
+ * +82), so the two screens read consistently even though this one scrolls
+ * and Now Playing doesn't. */
+static int tracks_hdr_title_y(void)  { return ART_PX + 20; }
+static int tracks_hdr_artist_y(void) { return tracks_hdr_title_y() + 44; }
+static int tracks_hdr_info_y(void)   { return tracks_hdr_artist_y() + 38; }
+static int tracks_hdr_h(void)        { return tracks_hdr_info_y() + 40; }
 
 /* Growing the art to edge-to-edge (ART_PX == FB_W, up from 384) ate more
  * vertical space than removing the status strip freed -- 96px added against
@@ -986,13 +1275,23 @@ static int set_autooff_desc_y(void) { return set_row_autooff_y() + ROW_H; }
  * the way the toggles above did, so it's a plain ROW_H row like Accent
  * colour and About below it, not another +64 two-line block. */
 static int set_row_lighttheme_y(void) { return set_autooff_desc_y() + 64; }
-static int set_row_theme_y(void) { return set_row_lighttheme_y() + ROW_H; }
+/* R44: plain ROW_H row too -- the offset reads for itself once picked, same
+ * as Theme above it. */
+static int set_row_timezone_y(void) { return set_row_lighttheme_y() + ROW_H; }
+static int set_row_theme_y(void) { return set_row_timezone_y() + ROW_H; }
 /* R26: About, one row below Accent colour -- which now needs its own
  * trailing divider back (it used to be the last row and closed the list
  * itself), and this row takes over closing the list instead. */
 static int set_row_about_y(void) { return set_row_theme_y() + ROW_H; }
 /* Same idea again: Rebuild index takes over closing the list from About. */
 static int set_row_reindex_y(void) { return set_row_about_y() + ROW_H; }
+/* R44: total content height, for the Settings screen's own scroll clamp --
+ * ceil() so a last row that doesn't fill a whole ROW_H still gets fully
+ * scrollable rather than clipped short. */
+static int settings_content_rows(void) {
+    int content_px = set_row_reindex_y() + ROW_H - CONTENT_Y;
+    return (content_px + ROW_H - 1) / ROW_H;
+}
 
 /* Bump this with every release -- it had been stuck at "0.1" since the very
  * first one, through 0.14, because nothing ever reminded anyone to touch it.
@@ -1432,7 +1731,11 @@ static char index_letter(int i) { return i == 0 ? '#' : (char)('A' + i - 1); }
  * the rows it covers or the last one is unreachable. */
 static int mini_visible(void);
 static int vis_rows(void) {
-    int h = FB_H - CONTENT_Y - (mini_visible() ? MINI_H : 40);
+    /* R46: the album-detail screen has no status bar or title bar to leave
+     * room for -- its content starts at y=0, not CONTENT_Y, same as Now
+     * Playing's own art already does. */
+    int top = (screen == SC_TRACKS && !ab_list && !pod_list) ? 0 : CONTENT_Y;
+    int h = FB_H - top - (mini_visible() ? MINI_H : 40);
     return h / ROW_H;
 }
 
@@ -1749,10 +2052,49 @@ static lib_row_t *row_at(int absolute) {
  * raised on the tick a row actually crosses. That is the whole fix for the
  * smoothness this was chasing — not a cheaper redraw, just far fewer of
  * them: one per 72px of travel instead of one on nearly every tick. */
+/* R46 follow-up: exact max scroll offset for the album-detail screen, shared
+ * by scroll_to_px() and the inertia tick's spring-back -- both need the same
+ * number and neither should compute it slightly differently. */
+static int tracks_max_px(void) {
+    int content_px = tracks_hdr_h() + track_n * ROW_H;
+    int visible_px = FB_H - (mini_visible() ? MINI_H : 40);
+    int max_px = content_px - visible_px;
+    return max_px < 0 ? 0 : max_px;
+}
+
 static int scroll_to_px(int total_px) {
+    if (screen == SC_TRACKS && !ab_list && !pod_list) {
+        /* R46 follow-up: exact pixel bounds, not the ceil()'d row-count
+         * `limit` every other screen below uses -- rounding a fractional
+         * last row up to a whole ROW_H let scroll go a full row past the
+         * real end of content, which is exactly the "large gap after the
+         * last track" reported live. Rubber-banded rather than hard-
+         * clamped too: dragging past either end is allowed, damped to a
+         * third of the actual finger travel, so it gives rather than
+         * stopping dead -- the spring-back on release lives in the
+         * inertia tick below, which also drives this screen since it's
+         * marked "continuous" there. */
+        int max_px = tracks_max_px();
+        if (total_px < 0) total_px = total_px / 3;
+        else if (total_px > max_px) total_px = max_px + (total_px - max_px) / 3;
+        /* Floor division, not C's truncate-toward-zero -- total_px can be
+         * negative during overscroll above the top, and scroll_px must stay
+         * in [0, ROW_H) regardless, the same invariant every use of
+         * `scroll*ROW_H + scroll_px` elsewhere already assumes. */
+        int new_scroll = (total_px >= 0) ? total_px / ROW_H
+                                          : -((-total_px + ROW_H - 1) / ROW_H);
+        int new_px = total_px - new_scroll * ROW_H;
+        int changed = new_scroll != scroll;
+        scroll = new_scroll;
+        scroll_px = new_px;
+        return changed;
+    }
     int limit = (screen == SC_TRACKS) ? track_n :
+                (screen == SC_QUEUE)  ? queue_n :
                 (screen == SC_RADIO)  ? station_n :
-                (screen == SC_PLAYLISTS) ? playlist_n : total;
+                (screen == SC_PLAYLISTS) ? playlist_n :
+                (screen == SC_SETTINGS) ? settings_content_rows() :
+                (screen == SC_SETTINGS_TIMEZONE) ? TZ_N : total;
     int max_top = limit - vis_rows();
     if (max_top < 0) max_top = 0;
     int max_px = max_top * ROW_H;
@@ -1794,6 +2136,15 @@ static void draw_right_clip(uint16_t *fb, int y, const char *s, int clip_top, in
     int w = text_width(s, TEXT_PX_SMALL);
     int right = FB_W - 24 - (index_visible() ? INDEX_W : 0);
     draw_text_clip(fb, right - w, y, s, COL_DIM, TEXT_PX_SMALL, FB_W, clip_top, clip_bot);
+}
+
+/* R44: draw_right_col(), clipped -- Settings scrolling needs this the same
+ * way the library lists already needed draw_right_clip() above. */
+static void draw_right_col_clip(uint16_t *fb, int y, const char *s, uint16_t col,
+                                 int clip_top, int clip_bot) {
+    int w = text_width(s, TEXT_PX_SMALL);
+    int right = FB_W - 24 - (index_visible() ? INDEX_W : 0);
+    draw_text_clip(fb, right - w, y, s, col, TEXT_PX_SMALL, FB_W, clip_top, clip_bot);
 }
 
 /* Every route into playback goes through here: tapping a track, and the two
@@ -1845,10 +2196,112 @@ static void play_station(int i) {
     mlog("[music] station %s\n", stations[i].name);
 }
 
+/* R47: shuffle/repeat, music only -- audiobooks and podcasts have their own
+ * next/prev logic already (chapter rollover, the fixed +/-30s skip), and
+ * shuffling a book or looping one podcast episode forever isn't what either
+ * mode's own transport is for. */
+#define REPEAT_OFF 0
+#define REPEAT_ALL 1
+#define REPEAT_ONE 2
+static int shuffle_enabled;
+static int repeat_mode;
+static int shuffle_order[QUEUE_MAX];
+static int shuffle_n;    /* == queue_n as of the last regenerate() */
+
+/* Fisher-Yates over [0, queue_n), then cur_track's entry is swapped to the
+ * front: toggling shuffle on mid-album must not itself jump to a different
+ * track, only randomize what comes after the one already playing. Called
+ * lazily (shuffle_n != queue_n) rather than at every queue change, so a
+ * shuffle that's off costs nothing. */
+static void shuffle_regenerate(void) {
+    shuffle_n = queue_n;
+    for (int i = 0; i < shuffle_n; i++) shuffle_order[i] = i;
+    for (int i = shuffle_n - 1; i > 0; i--) {
+        int j = rand() % (i + 1);
+        int t = shuffle_order[i]; shuffle_order[i] = shuffle_order[j]; shuffle_order[j] = t;
+    }
+    for (int i = 0; i < shuffle_n; i++) {
+        if (shuffle_order[i] == cur_track) {
+            int t = shuffle_order[0]; shuffle_order[0] = shuffle_order[i]; shuffle_order[i] = t;
+            break;
+        }
+    }
+}
+
+static int shuffle_find_pos(int idx) {
+    for (int i = 0; i < shuffle_n; i++) if (shuffle_order[i] == idx) return i;
+    return -1;
+}
+
+/* -1 means "nothing plays next" -- callers already treat that as a no-op,
+ * since play_index() itself guards i<0. */
+static int next_track_index(void) {
+    if (queue_n == 0) return -1;
+    /* Shuffle/repeat only ever change this for plain music. Audiobooks,
+     * podcasts and radio fall straight through to the plain sequential step
+     * below, unchanged from before this existed -- returning -1 here for
+     * them would have broken the Now Playing/mini-player transport zones,
+     * which reuse this same helper for all four modes (the hardware keys
+     * have their own explicit audiobook/podcast branches instead, but these
+     * two on-screen zones never did, relying on the mirrored queue[]
+     * ab_play_chapter's own comment describes). */
+    if (!audiobook_mode && !podcast_mode && !radio_mode) {
+        if (repeat_mode == REPEAT_ONE) return cur_track;
+        if (shuffle_enabled) {
+            if (shuffle_n != queue_n) shuffle_regenerate();
+            int pos = shuffle_find_pos(cur_track);
+            if (pos < 0) return -1;
+            int nxt = pos + 1;
+            if (nxt >= shuffle_n) return (repeat_mode == REPEAT_ALL) ? shuffle_order[0] : -1;
+            return shuffle_order[nxt];
+        }
+        if (repeat_mode == REPEAT_ALL) {
+            int nxt = cur_track + 1;
+            return (nxt >= queue_n) ? 0 : nxt;
+        }
+    }
+    int nxt = cur_track + 1;
+    return (nxt < queue_n) ? nxt : -1;
+}
+
+static int prev_track_index(void) {
+    if (queue_n == 0) return -1;
+    if (!audiobook_mode && !podcast_mode && !radio_mode && shuffle_enabled) {
+        if (shuffle_n != queue_n) shuffle_regenerate();
+        int pos = shuffle_find_pos(cur_track);
+        if (pos < 0) return -1;
+        int prv = pos - 1;
+        if (prv < 0) return (repeat_mode == REPEAT_ALL) ? shuffle_order[shuffle_n - 1] : -1;
+        return shuffle_order[prv];
+    }
+    int prv = cur_track - 1;
+    if (prv < 0) {
+        if (!audiobook_mode && !podcast_mode && !radio_mode && repeat_mode == REPEAT_ALL)
+            return queue_n - 1;
+        return -1;
+    }
+    return prv;
+}
+
+/* BG71: the queue view's row order -- shuffle_order[] when shuffle's on
+ * (already a permutation of [0,queue_n) with cur_track anchored at
+ * position 0, exactly what "actual play order" means), plain array order
+ * otherwise. Lazily regenerated the same way next_track_index() already
+ * does, so opening the queue view right after toggling shuffle still
+ * reflects it correctly. */
+static int queue_display_index(int display_i) {
+    if (shuffle_enabled) {
+        if (shuffle_n != queue_n) shuffle_regenerate();
+        if (display_i >= 0 && display_i < shuffle_n) return shuffle_order[display_i];
+        return -1;
+    }
+    return display_i;
+}
+
 /* Hand the worker the track after this one so it can roll straight into it. */
 static void queue_follower(void) {
-    int nxt = cur_track + 1;
-    audio_set_next((!radio_mode && nxt < queue_n) ? queue[nxt].path : NULL);
+    int nxt = next_track_index();
+    audio_set_next((!radio_mode && nxt >= 0) ? queue[nxt].path : NULL);
 }
 
 static void play_index(int i) {
@@ -2191,7 +2644,21 @@ static void draw_mini(uint16_t *fb) {
          * for the rare track with no artist tag of its own at all. */
         const char *sub = audiobook_mode ? q_album
                          : (t->artist[0] ? t->artist : q_artist);
-        draw_text(fb, text_x, by + 42, sub, COL_DIM, TEXT_PX_SMALL, text_edge);
+        /* R47: a short suffix rather than a second line or icon -- this bar
+         * has no room to spare (see text_edge above), and the artist name
+         * is what a glance actually wants; shuffle/repeat only need to be
+         * noticeable, not detailed, here. */
+        if (!audiobook_mode && (shuffle_enabled || repeat_mode != REPEAT_OFF)) {
+            char subbuf[96];
+            const char *tag = repeat_mode == REPEAT_ONE ? " \xc2\xb7 R1"
+                             : repeat_mode == REPEAT_ALL ? " \xc2\xb7 R"
+                             : "";
+            snprintf(subbuf, sizeof(subbuf), "%s%s%s", sub,
+                     shuffle_enabled ? " \xc2\xb7 S" : "", tag);
+            draw_text(fb, text_x, by + 42, subbuf, COL_DIM, TEXT_PX_SMALL, text_edge);
+        } else {
+            draw_text(fb, text_x, by + 42, sub, COL_DIM, TEXT_PX_SMALL, text_edge);
+        }
     }
 
     int cy = by + MINI_H / 2;
@@ -2350,7 +2817,11 @@ static void draw_screen(uint16_t *fb) {
      * gone (it was never anything more than a placeholder there), and the
      * Bluetooth codec/headset-battery readout that used to share that line
      * moved into the quick-settings Bluetooth row instead. */
-    if (screen != SC_PLAYING) {
+    /* R46: the album-detail screen drops its status bar/title bar the same
+     * way Now Playing already does, for the same reason -- the cover runs
+     * edge-to-edge from y=0, and there's no room left for either. Back is
+     * the swipe gesture everywhere else already relies on. */
+    if (screen != SC_PLAYING && !(screen == SC_TRACKS && !ab_list && !pod_list)) {
         fill_rect(fb, 0, 0, FB_W, CONTENT_Y, COL_HEADER);
     }
 
@@ -2384,12 +2855,19 @@ static void draw_screen(uint16_t *fb) {
     else if (screen == SC_SETTINGS)       { title = "Settings"; right = "BACK"; }
     else if (screen == SC_SETTINGS_THEME) { title = "Accent colour"; right = "BACK"; }
     else if (screen == SC_SETTINGS_ABOUT) { title = "About"; right = "BACK"; }
+    else if (screen == SC_SETTINGS_TIMEZONE) { title = "Timezone"; right = "BACK"; }
+    else if (screen == SC_SETTINGS_THEMEMODE) { title = "Theme"; right = "BACK"; }
+    else if (screen == SC_QUEUE) { title = "Queue"; right = "BACK"; }
     else if (screen == SC_MUSIC_MENU)     { title = "Music"; right = "BACK"; }
 
     /* The player has no title bar. Drawn unconditionally, it sat behind the
      * artwork with the ends of "Music" and "EXIT" poking out either side of
      * the cover. */
-    if (screen != SC_PLAYING) {
+    /* R46: the album-detail screen drops its status bar/title bar the same
+     * way Now Playing already does, for the same reason -- the cover runs
+     * edge-to-edge from y=0, and there's no room left for either. Back is
+     * the swipe gesture everywhere else already relies on. */
+    if (screen != SC_PLAYING && !(screen == SC_TRACKS && !ab_list && !pod_list)) {
         int rw = text_width(right, TEXT_PX_SMALL);
         draw_text(fb, 18, STATUS_H + 14, title, COL_TEXT, TEXT_PX_TITLE, FB_W - rw - 40);
         draw_text(fb, FB_W - 24 - rw, STATUS_H + 20, right, COL_DIM, TEXT_PX_SMALL, FB_W);
@@ -2501,6 +2979,36 @@ static void draw_screen(uint16_t *fb) {
             draw_text(fb, 24, FB_H - 34, "Wi-Fi is off", RGB(230, 80, 70), TEXT_PX_SMALL, FB_W - 40);
         else if (radio_msg[0])
             draw_text(fb, 24, FB_H - 34, radio_msg, RGB(230, 80, 70), TEXT_PX_SMALL, FB_W - 40);
+        if (mini_visible()) draw_mini(fb);
+        return;
+    }
+
+    if (screen == SC_QUEUE) {
+        /* BG71: the actual upcoming play order -- queue_display_index()
+         * walks shuffle_order[] when shuffle's on rather than plain array
+         * order, so this genuinely reflects what happens next rather than
+         * just the album's own track order. */
+        for (int i = 0; i < vis_rows(); i++) {
+            int display_i = scroll + i;
+            if (display_i >= queue_n) break;
+            int idx = queue_display_index(display_i);
+            if (idx < 0) break;
+            lib_track_t *t = &queue[idx];
+            int playing = audio_is_active() && idx == cur_track;
+            if (playing) {
+                fill_rect_clip(fb, 0, y, FB_W, ROW_H, COL_ROW, CONTENT_Y, clip_bot);
+                fill_rect_clip(fb, 0, y, 4, ROW_H, COL_ACCENT, CONTENT_Y, clip_bot);
+            }
+            draw_text_clip(fb, 24, y + 20, t->name, playing ? COL_ACCENT : COL_TEXT,
+                          TEXT_PX_BODY, FB_W - 110, CONTENT_Y, clip_bot);
+            if (t->dur_ms > 0) {
+                char b[16];
+                fmt_dur(b, sizeof(b), t->dur_ms);
+                draw_right_clip(fb, y + 22, b, CONTENT_Y, clip_bot);
+            }
+            fill_rect_clip(fb, 0, y + ROW_H - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
+            y += ROW_H;
+        }
         if (mini_visible()) draw_mini(fb);
         return;
     }
@@ -2801,12 +3309,34 @@ static void draw_screen(uint16_t *fb) {
                 draw_text(fb, icx - 3, icy - TEXT_PX_BODY / 2 + 2, "i", COL_TEXT, TEXT_PX_BODY, FB_W);
             }
         } else {
-            /* previous: triangle against a bar */
-            fill_triangle(fb, mid - 128, cyy, 34, -1, COL_TEXT);
-            fill_rect(fb, mid - 128 - 15 - 5, cyy - 17, 5, 34, COL_TEXT);
+            /* previous: triangle against a bar. Offset 96, not the old 128 --
+             * matches the audiobook player's own skip-arc spacing exactly
+             * (see its "off = 96" comment), pulled in per explicit request so
+             * this row reads as one cluster rather than two icons stranded
+             * out at the edges. R47's mode button below took the room this
+             * freed on the left. */
+            fill_triangle(fb, mid - 96, cyy, 34, -1, COL_TEXT);
+            fill_rect(fb, mid - 96 - 15 - 5, cyy - 17, 5, 34, COL_TEXT);
             /* next: mirrored */
-            fill_triangle(fb, mid + 128, cyy, 34, +1, COL_TEXT);
-            fill_rect(fb, mid + 128 + 15, cyy - 17, 5, 34, COL_TEXT);
+            fill_triangle(fb, mid + 96, cyy, 34, +1, COL_TEXT);
+            fill_rect(fb, mid + 96 + 15, cyy - 17, 5, 34, COL_TEXT);
+
+            /* R47: Normal -> Shuffle -> Repeat -> Normal, one button. Same
+             * slot the audiobook player uses for its own extra control past
+             * the skip rings (its speed ring sits at mid-96-70) -- placing
+             * this anywhere else was what read as "not in line with" that
+             * screen. Ring is COL_DIM always, same weight as the artist
+             * line -- a first attempt made it COL_TEXT/COL_ACCENT, too bold
+             * for a secondary control; only the letter inside brightens to
+             * COL_ACCENT when a mode is actually engaged. */
+            int pmx = mid - 96 - 82, pmy = cyy;
+            int pm_on = shuffle_enabled || repeat_mode != REPEAT_OFF;
+            fill_circle(fb, pmx, pmy, 26, COL_DIM);
+            fill_circle(fb, pmx, pmy, 25, COL_BG);
+            const char *pmlabel = shuffle_enabled ? "S" : repeat_mode != REPEAT_OFF ? "R" : "-";
+            int lw = text_width(pmlabel, TEXT_PX_BODY);
+            draw_text(fb, pmx - lw / 2, pmy - TEXT_PX_BODY / 2 + 2, pmlabel,
+                      pm_on ? COL_ACCENT : COL_DIM, TEXT_PX_BODY, FB_W);
         }
 
         fill_circle(fb, mid, cyy, 42, COL_ACCENT);
@@ -2882,8 +3412,115 @@ static void draw_screen(uint16_t *fb) {
                      track_format_name(t), t->bits, t->rate / 1000.0,
                      t->bitrate / 1000);
         }
+        /* R47: the mode button on the transport row is the state indicator
+         * now -- a first attempt also prefixed this line with "Shuffle"/
+         * "Repeat", which read as redundant/cluttered next to it and was
+         * removed per live feedback. */
         draw_text(fb, 24, FB_H - 34, buf, COL_ACCENT, TEXT_PX_SMALL,
                   FB_W - 62 - ow - riw - 36);
+        return;
+    }
+
+    if (screen == SC_TRACKS && !ab_list && !pod_list) {
+        /* R46: album detail as one continuous scroll -- cover, title, artist
+         * and the tracks/format/duration line all move together with the
+         * track list beneath them, rather than a fixed header sitting above
+         * a separately-scrolling list. off is a plain pixel offset (same
+         * technique Settings already uses for its own not-a-clean-multiple-
+         * of-ROW_H content) rather than scroll indexing directly into
+         * tracks[], since the header's own height isn't a ROW_H multiple. */
+        int off = scroll * ROW_H + scroll_px;
+        int header_h = tracks_hdr_h();
+
+        int cover_y = 0 - off;
+        fill_rect_clip(fb, 0, cover_y, ART_PX, ART_PX, COL_ROW, 0, clip_bot);
+        view_blit_art_clip(fb, 0, cover_y, 0, clip_bot);
+
+        draw_text_clip(fb, 24, tracks_hdr_title_y() - off, cur_album,
+                       COL_TEXT, TEXT_PX_TITLE, FB_W - 24, 0, clip_bot);
+        /* Blank rather than a guessed label when an album has no unified
+         * album_artist tag -- same "blank rather than a wrong guess"
+         * reasoning the disc-number column above already follows. */
+        if (cur_artist[0])
+            draw_text_clip(fb, 24, tracks_hdr_artist_y() - off, cur_artist,
+                           COL_DIM, TEXT_PX_BODY, FB_W - 24, 0, clip_bot);
+
+        {
+            int iy = tracks_hdr_info_y() - off;
+            char cbuf[24], fbuf[64], dbuf[16];
+            snprintf(cbuf, sizeof(cbuf), "%d track%s", track_n, track_n == 1 ? "" : "s");
+            lib_track_t *t0 = track_n > 0 ? &tracks[0] : NULL;
+            fbuf[0] = '\0';
+            if (t0)
+                snprintf(fbuf, sizeof(fbuf), "%s  %d/%g kHz",
+                         track_format_name(t0), t0->bits, t0->rate / 1000.0);
+            int64_t total_ms = 0;
+            for (int i = 0; i < track_n; i++) total_ms += tracks[i].dur_ms;
+            fmt_dur(dbuf, sizeof(dbuf), total_ms);
+
+            int ix = 24;
+            draw_text_clip(fb, ix, iy, cbuf, COL_DIM, TEXT_PX_SMALL, FB_W, 0, clip_bot);
+            ix += text_width(cbuf, TEXT_PX_SMALL);
+            if (fbuf[0]) {
+                draw_text_clip(fb, ix, iy, "  \xc2\xb7  ", COL_DIM, TEXT_PX_SMALL, FB_W, 0, clip_bot);
+                ix += text_width("  \xc2\xb7  ", TEXT_PX_SMALL);
+                draw_text_clip(fb, ix, iy, fbuf, COL_ACCENT, TEXT_PX_SMALL, FB_W, 0, clip_bot);
+                ix += text_width(fbuf, TEXT_PX_SMALL);
+            }
+            draw_text_clip(fb, ix, iy, "  \xc2\xb7  ", COL_DIM, TEXT_PX_SMALL, FB_W, 0, clip_bot);
+            ix += text_width("  \xc2\xb7  ", TEXT_PX_SMALL);
+            draw_text_clip(fb, ix, iy, dbuf, COL_DIM, TEXT_PX_SMALL, FB_W, 0, clip_bot);
+        }
+        fill_rect_clip(fb, 0, header_h - off - 1, FB_W, 1, COL_LINE, 0, clip_bot);
+
+        /* Multi-disc marking, same rule as the ab_list/pod_list path below
+         * (those never carry real disc numbers, so it's always off there --
+         * this is the branch it actually matters for). */
+        int multi_disc = 0;
+        if (track_n > 1) {
+            int first_disc = tracks[0].disc > 0 ? tracks[0].disc : 1;
+            for (int i = 1; i < track_n; i++) {
+                int d = tracks[i].disc > 0 ? tracks[i].disc : 1;
+                if (d != first_disc) { multi_disc = 1; break; }
+            }
+        }
+
+        int first_idx = (off - header_h) / ROW_H;
+        if (first_idx < 0) first_idx = 0;
+        for (int idx = first_idx; idx < track_n; idx++) {
+            int ry = header_h + idx * ROW_H - off;
+            if (ry > clip_bot) break;
+            lib_track_t *t = &tracks[idx];
+            int playing = audio_is_active() && idx == cur_track &&
+                         !strcmp(cur_album, q_album) && !strcmp(cur_artist, q_artist);
+            if (playing) {
+                fill_rect_clip(fb, 0, ry, FB_W, ROW_H, COL_ROW, 0, clip_bot);
+                fill_rect_clip(fb, 0, ry, 4, ROW_H, COL_ACCENT, 0, clip_bot);
+            }
+            int disc = t->disc > 0 ? t->disc : 1;
+            int disc_start = multi_disc &&
+                (idx == 0 || (tracks[idx - 1].disc > 0 ? tracks[idx - 1].disc : 1) != disc);
+            int track_x = multi_disc ? 44 : 20;
+            if (disc_start) {
+                char discbuf[8];
+                snprintf(discbuf, sizeof(discbuf), "%d", disc);
+                draw_text_clip(fb, 20, ry + 22, discbuf, COL_ACCENT, TEXT_PX_SMALL, 40, 0, clip_bot);
+            }
+            if (t->track > 0) snprintf(buf, sizeof(buf), "%d", t->track);
+            else              buf[0] = '\0';
+            draw_text_clip(fb, track_x, ry + 22, buf, COL_DIM, TEXT_PX_SMALL,
+                          track_x + 36, 0, clip_bot);
+            draw_text_clip(fb, 68, ry + 20, t->name, playing ? COL_ACCENT : COL_TEXT,
+                          TEXT_PX_BODY, FB_W - 110, 0, clip_bot);
+            if (t->dur_ms > 0) {
+                fmt_dur(buf, sizeof(buf), t->dur_ms);
+                draw_right_clip(fb, ry + 22, buf, 0, clip_bot);
+            }
+            fill_rect_clip(fb, 0, ry + ROW_H - 1, FB_W, 1, COL_LINE, 0, clip_bot);
+        }
+        if (sheet_note[0] && !mini_visible())
+            draw_text(fb, 24, FB_H - 34, sheet_note, COL_ACCENT, TEXT_PX_SMALL, FB_W - 48);
+        if (mini_visible()) draw_mini(fb);
         return;
     }
 
@@ -3228,61 +3865,88 @@ static void draw_screen(uint16_t *fb) {
          * (lock, usbbypass, autooff) have a visual "area" spanning both, and
          * a control centered on only the title slice reads as sitting too
          * high against that whole card (BG63). */
-        int ry = set_row_lock_y();
-        int lock_h = set_row_usbbypass_y() - ry;
-        draw_text(fb, 24, ry + 20, "Power button lock", COL_TEXT, TEXT_PX_BODY, FB_W - 140);
-        draw_toggle_switch_h(fb, ry, button_lock_enabled, lock_h);
+        /* R44: Settings outgrew one screen the moment Timezone joined Theme
+         * below Auto shutdown, hence the scroll offset applied to every row
+         * from here on. Unlike the library lists, whose rows only ever sit
+         * below CONTENT_Y in the first place, Settings' own rows start right
+         * at the top -- scrolling can carry one up into the header/status
+         * strip, and plain draw_text/fill_rect only clip against the screen
+         * edges (y<0, y>=FB_H), not against CONTENT_Y. Live-tested this
+         * missing the first time: row text visibly wrote over the header
+         * while scrolling up. Every call below is the _clip variant with
+         * clip_top=CONTENT_Y for that reason -- including the toggle
+         * switches (BG69): a row-height gate that skips the whole draw call
+         * once fully out of bounds isn't enough on its own, since the
+         * toggle's own pixels are centred within the row rather than
+         * starting at its nominal top, and can still straddle the header
+         * line even while that gate says "still in bounds". */
+        int off = scroll * ROW_H + scroll_px;
+        int clip_bot = FB_H;
+        int ry = set_row_lock_y() - off;
+        int lock_h = set_row_usbbypass_y() - set_row_lock_y();
+        draw_text_clip(fb, 24, ry + 20, "Power button lock", COL_TEXT, TEXT_PX_BODY, FB_W - 140, CONTENT_Y, clip_bot);
+        draw_toggle_switch_h_clip(fb, ry, button_lock_enabled, lock_h, CONTENT_Y, clip_bot);
 
-        int dy = set_lock_desc_y();
-        draw_text(fb, 24, dy, "Double-press power to lock the screen and", COL_DIM, TEXT_PX_SMALL, FB_W - 48);
-        draw_text(fb, 24, dy + 26, "disable buttons. Double-press again to undo.", COL_DIM, TEXT_PX_SMALL, FB_W - 48);
+        int dy = set_lock_desc_y() - off;
+        draw_text_clip(fb, 24, dy, "Double-press power to lock the screen and", COL_DIM, TEXT_PX_SMALL, FB_W - 48, CONTENT_Y, clip_bot);
+        draw_text_clip(fb, 24, dy + 26, "disable buttons. Double-press again to undo.", COL_DIM, TEXT_PX_SMALL, FB_W - 48, CONTENT_Y, clip_bot);
 
-        ry = set_row_usbbypass_y();
-        int usbbypass_h = set_row_autooff_y() - ry;
-        fill_rect(fb, 0, ry - 1, FB_W, 1, COL_LINE);
-        draw_text(fb, 24, ry + 20, "Bypass DSP on USB", COL_TEXT, TEXT_PX_BODY, FB_W - 140);
-        draw_toggle_switch_h(fb, ry, usb_bypass_enabled, usbbypass_h);
+        ry = set_row_usbbypass_y() - off;
+        int usbbypass_h = set_row_autooff_y() - set_row_usbbypass_y();
+        fill_rect_clip(fb, 0, ry - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
+        draw_text_clip(fb, 24, ry + 20, "Bypass DSP on USB", COL_TEXT, TEXT_PX_BODY, FB_W - 140, CONTENT_Y, clip_bot);
+        draw_toggle_switch_h_clip(fb, ry, usb_bypass_enabled, usbbypass_h, CONTENT_Y, clip_bot);
 
-        int uy = set_usbbypass_desc_y();
-        draw_text(fb, 24, uy, "Disables PEQ, MSEB and Bluetooth while", COL_DIM, TEXT_PX_SMALL, FB_W - 48);
-        draw_text(fb, 24, uy + 26, "output is USB. Restored when USB stops.", COL_DIM, TEXT_PX_SMALL, FB_W - 48);
+        int uy = set_usbbypass_desc_y() - off;
+        draw_text_clip(fb, 24, uy, "Disables PEQ, MSEB and Bluetooth while", COL_DIM, TEXT_PX_SMALL, FB_W - 48, CONTENT_Y, clip_bot);
+        draw_text_clip(fb, 24, uy + 26, "output is USB. Restored when USB stops.", COL_DIM, TEXT_PX_SMALL, FB_W - 48, CONTENT_Y, clip_bot);
 
-        ry = set_row_autooff_y();
-        int autooff_h = set_row_lighttheme_y() - ry;
-        fill_rect(fb, 0, ry - 1, FB_W, 1, COL_LINE);
-        draw_text(fb, 24, ry + 20, "Auto shutdown", COL_TEXT, TEXT_PX_BODY, FB_W - 200);
+        ry = set_row_autooff_y() - off;
+        int autooff_h = set_row_lighttheme_y() - set_row_autooff_y();
+        fill_rect_clip(fb, 0, ry - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
+        draw_text_clip(fb, 24, ry + 20, "Auto shutdown", COL_TEXT, TEXT_PX_BODY, FB_W - 200, CONTENT_Y, clip_bot);
         if (auto_off_minutes() == 0) snprintf(buf, sizeof(buf), "Never");
         else                         snprintf(buf, sizeof(buf), "%d min", auto_off_minutes());
-        draw_right_col(fb, ry + autooff_h / 2 - TEXT_PX_SMALL / 2, buf, COL_ACCENT);
+        draw_right_col_clip(fb, ry + autooff_h / 2 - TEXT_PX_SMALL / 2, buf, COL_ACCENT, CONTENT_Y, clip_bot);
 
-        int ay = set_autooff_desc_y();
-        draw_text(fb, 24, ay, "Powers the device off when locked with", COL_DIM, TEXT_PX_SMALL, FB_W - 48);
-        draw_text(fb, 24, ay + 26, "nothing playing. Tap to change.", COL_DIM, TEXT_PX_SMALL, FB_W - 48);
+        int ay = set_autooff_desc_y() - off;
+        draw_text_clip(fb, 24, ay, "Powers the device off when locked with", COL_DIM, TEXT_PX_SMALL, FB_W - 48, CONTENT_Y, clip_bot);
+        draw_text_clip(fb, 24, ay + 26, "nothing playing. Tap to change.", COL_DIM, TEXT_PX_SMALL, FB_W - 48, CONTENT_Y, clip_bot);
 
-        ry = set_row_lighttheme_y();
-        fill_rect(fb, 0, ry - 1, FB_W, 1, COL_LINE);
-        draw_text(fb, 24, ry + 20, "Light theme", COL_TEXT, TEXT_PX_BODY, FB_W - 140);
-        draw_toggle_switch_h(fb, ry, light_theme, ROW_H);
+        ry = set_row_lighttheme_y() - off;
+        fill_rect_clip(fb, 0, ry - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
+        draw_text_clip(fb, 24, ry + 20, "Theme", COL_TEXT, TEXT_PX_BODY, FB_W - 200, CONTENT_Y, clip_bot);
+        /* R45: opens a picker like Accent colour/Timezone below, rather than
+         * R43's plain cycle-tap -- four values (Dark/Light/Grey/Auto) reads
+         * better as a named list than a tap-to-advance control. */
+        draw_right_col_clip(fb, ry + ROW_H / 2 - TEXT_PX_SMALL / 2,
+                            THEME_MODE_NAMES[theme_mode], COL_ACCENT, CONTENT_Y, clip_bot);
 
-        ry = set_row_theme_y();
-        int theme_h = set_row_about_y() - ry;
-        fill_rect(fb, 0, ry - 1, FB_W, 1, COL_LINE);
-        draw_text(fb, 24, ry + 20, "Accent colour", COL_TEXT, TEXT_PX_BODY, FB_W - 200);
+        ry = set_row_timezone_y() - off;
+        fill_rect_clip(fb, 0, ry - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
+        draw_text_clip(fb, 24, ry + 20, "Timezone", COL_TEXT, TEXT_PX_BODY, FB_W - 200, CONTENT_Y, clip_bot);
+        draw_right_col_clip(fb, ry + ROW_H / 2 - TEXT_PX_SMALL / 2,
+                            TZ_PRESETS[tz_idx].name, COL_ACCENT, CONTENT_Y, clip_bot);
+
+        ry = set_row_theme_y() - off;
+        int theme_h = set_row_about_y() - set_row_theme_y();
+        fill_rect_clip(fb, 0, ry - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
+        draw_text_clip(fb, 24, ry + 20, "Accent colour", COL_TEXT, TEXT_PX_BODY, FB_W - 200, CONTENT_Y, clip_bot);
         /* The value itself renders in the accent colour it names, rather
          * than a separate swatch blob next to plain text (BG63 follow-up). */
-        draw_right_col(fb, ry + theme_h / 2 - TEXT_PX_SMALL / 2,
-                        ACCENT_PRESETS[g_accent_idx].name, ACCENT_PRESETS[g_accent_idx].color);
+        draw_right_col_clip(fb, ry + theme_h / 2 - TEXT_PX_SMALL / 2,
+                            ACCENT_PRESETS[g_accent_idx].name, ACCENT_PRESETS[g_accent_idx].color, CONTENT_Y, clip_bot);
 
-        ry = set_row_about_y();
-        fill_rect(fb, 0, ry - 1, FB_W, 1, COL_LINE);
-        draw_text(fb, 24, ry + 20, "About", COL_TEXT, TEXT_PX_BODY, FB_W - 200);
+        ry = set_row_about_y() - off;
+        fill_rect_clip(fb, 0, ry - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
+        draw_text_clip(fb, 24, ry + 20, "About", COL_TEXT, TEXT_PX_BODY, FB_W - 200, CONTENT_Y, clip_bot);
 
         /* Takes over closing the list from About. Status text doubles as
          * the row's subtitle and its own progress readout -- no separate
          * screen for something this small. */
-        ry = set_row_reindex_y();
-        fill_rect(fb, 0, ry - 1, FB_W, 1, COL_LINE);
-        draw_text(fb, 24, ry + 20, "Rebuild library index", COL_TEXT, TEXT_PX_BODY, FB_W - 200);
+        ry = set_row_reindex_y() - off;
+        fill_rect_clip(fb, 0, ry - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
+        draw_text_clip(fb, 24, ry + 20, "Rebuild library index", COL_TEXT, TEXT_PX_BODY, FB_W - 200, CONTENT_Y, clip_bot);
         {
             int scanned = 0, written = 0;
             int started = index_scan_progress(&scanned, &written);
@@ -3292,9 +3956,9 @@ static void draw_screen(uint16_t *fb) {
                 snprintf(buf, sizeof(buf), "%d tracks indexed", scanned);
             else
                 snprintf(buf, sizeof(buf), "Not started");
-            draw_right(fb, ry + 20, buf);
+            draw_right_clip(fb, ry + 20, buf, CONTENT_Y, clip_bot);
         }
-        fill_rect(fb, 0, ry + ROW_H - 1, FB_W, 1, COL_LINE);
+        fill_rect_clip(fb, 0, ry + ROW_H - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
 
         if (mini_visible()) draw_mini(fb);
         return;
@@ -3350,6 +4014,43 @@ static void draw_screen(uint16_t *fb) {
             if (i == g_accent_idx) {
                 /* A tick from two line segments, matching the app's other
                  * line-primitive glyphs rather than a font checkmark. */
+                int cx = FB_W - 44, cy = ry + ROW_H / 2;
+                draw_line(fb, cx - 10, cy, cx - 3, cy + 7, COL_ACCENT);
+                draw_line(fb, cx - 3, cy + 7, cx + 10, cy - 8, COL_ACCENT);
+            }
+            fill_rect(fb, 0, ry + ROW_H - 1, FB_W, 1, COL_LINE);
+        }
+        if (mini_visible()) draw_mini(fb);
+        return;
+    }
+
+    if (screen == SC_SETTINGS_TIMEZONE) {
+        /* R44: 33 entries, unlike Accent colour's 7 -- scrolls the same way
+         * Settings itself now does, rather than the fixed one-screen list
+         * above, and needs the same clip_top=CONTENT_Y treatment for the
+         * same reason (see Settings' own comment on this). */
+        int off = scroll * ROW_H + scroll_px;
+        for (int i = 0; i < TZ_N; i++) {
+            int ry = CONTENT_Y + i * ROW_H - off;
+            draw_text_clip(fb, 24, ry + 20, TZ_PRESETS[i].name, COL_TEXT, TEXT_PX_BODY, FB_W - 100, CONTENT_Y, FB_H);
+            if (i == tz_idx && ry + ROW_H > CONTENT_Y) {
+                int cx = FB_W - 44, cy = ry + ROW_H / 2;
+                draw_line(fb, cx - 10, cy, cx - 3, cy + 7, COL_ACCENT);
+                draw_line(fb, cx - 3, cy + 7, cx + 10, cy - 8, COL_ACCENT);
+            }
+            fill_rect_clip(fb, 0, ry + ROW_H - 1, FB_W, 1, COL_LINE, CONTENT_Y, FB_H);
+        }
+        if (mini_visible()) draw_mini(fb);
+        return;
+    }
+
+    if (screen == SC_SETTINGS_THEMEMODE) {
+        /* R45: four entries, fits in one screen like Accent colour -- no
+         * scroll needed. */
+        for (int i = 0; i < THEME_MODE_N; i++) {
+            int ry = CONTENT_Y + i * ROW_H;
+            draw_text(fb, 24, ry + 20, THEME_MODE_NAMES[i], COL_TEXT, TEXT_PX_BODY, FB_W - 100);
+            if (i == theme_mode) {
                 int cx = FB_W - 44, cy = ry + ROW_H / 2;
                 draw_line(fb, cx - 10, cy, cx - 3, cy + 7, COL_ACCENT);
                 draw_line(fb, cx - 3, cy + 7, cx + 10, cy - 8, COL_ACCENT);
@@ -3570,6 +4271,30 @@ static int go_back(void) {
             pod_notes_showing = 0;
             screen = SC_TRACKS;
             reset_scroll();
+            /* R46 follow-up: Now Playing already showed this cover -- back
+             * out of it landing on the *same* cover again just to re-scroll
+             * past it read as pointless. Jumps straight past it to where the
+             * title sits, ART_PX being exactly the scroll distance that
+             * takes -- scroll_to_px() (called after reset_scroll(), which
+             * would otherwise have zeroed it right back to the top) clamps
+             * against a short album's real content, so this can't overshoot
+             * one with only a few tracks. */
+            if (!ab_list && !pod_list) {
+                scroll_to_px(ART_PX);
+                /* BG71 sub-bug: swiping back from Now Playing lands here
+                 * (the same rich album-detail page the queue button used
+                 * to, before it got its own SC_QUEUE) -- reported live as
+                 * showing whatever album was last *browsed*, not the one
+                 * actually playing, because nothing here ever refreshed
+                 * view_art_bits. It's a separate buffer from the playing
+                 * track's own art specifically so the two can't leak into
+                 * each other (BG70) -- but that also means arriving here
+                 * has to explicitly ask for the right cover, the same way
+                 * tapping an album row in Albums already does, rather than
+                 * inheriting whatever the last view happened to leave. */
+                if (track_n > 0)
+                    view_art_request(tracks[0].path, cur_artist, cur_album);
+            }
             break;
         case SC_RADIO:
         case SC_AUDIOBOOKS:
@@ -3589,6 +4314,9 @@ static int go_back(void) {
         case SC_EQ_BANDS:
             screen = SC_EQ; reset_scroll();
             break;
+        case SC_QUEUE:
+            screen = SC_PLAYING; reset_scroll();
+            break;
         case SC_POD_SYNC:
             /* Refreshed the same way opening Podcasts does -- a sync that's
              * still running when the reader backs out of watching it may
@@ -3601,6 +4329,8 @@ static int go_back(void) {
             break;
         case SC_SETTINGS_THEME:
         case SC_SETTINGS_ABOUT:
+        case SC_SETTINGS_TIMEZONE:
+        case SC_SETTINGS_THEMEMODE:
             screen = SC_SETTINGS; reset_scroll();
             break;
         case SC_EQ_BAND:
@@ -4096,9 +4826,27 @@ static void load_conf(void) {
         } else if (sscanf(line, "usb_bypass_enabled = %d", &v) == 1 ||
                    sscanf(line, "usb_bypass_enabled=%d", &v) == 1) {
             usb_bypass_enabled = v != 0;
+        } else if (sscanf(line, "theme_mode = %d", &v) == 1 ||
+                   sscanf(line, "theme_mode=%d", &v) == 1) {
+            if (v >= 0 && v < THEME_MODE_N) theme_mode = v;
+        } else if (sscanf(line, "tz_index = %d", &v) == 1 ||
+                   sscanf(line, "tz_index=%d", &v) == 1) {
+            if (v >= 0 && v < TZ_N) tz_idx = v;
+        } else if (sscanf(line, "shuffle_enabled = %d", &v) == 1 ||
+                   sscanf(line, "shuffle_enabled=%d", &v) == 1) {
+            shuffle_enabled = v != 0;
+        } else if (sscanf(line, "repeat_mode = %d", &v) == 1 ||
+                   sscanf(line, "repeat_mode=%d", &v) == 1) {
+            if (v >= REPEAT_OFF && v <= REPEAT_ONE) repeat_mode = v;
         } else if (sscanf(line, "light_theme = %d", &v) == 1 ||
                    sscanf(line, "light_theme=%d", &v) == 1) {
-            light_theme = v != 0;
+            /* R43: superseded by theme_mode, which a save always writes
+             * instead from here on -- read only for a config saved by the
+             * R41 build, before Grey existed. Harmless if theme_mode above
+             * already set this from a newer file: whichever line appears
+             * second in an old file wins, and a config this old was written
+             * by code that only ever wrote one of the two keys, never both. */
+            theme_mode = (v != 0) ? THEME_LIGHT : THEME_DARK;
         } else if (sscanf(line, "deep_sleep = %d", &v) == 1 ||
                    sscanf(line, "deep_sleep=%d", &v) == 1) {
             /* Deliberately conf-only and off by default, with no Settings row
@@ -4140,7 +4888,7 @@ static void load_conf(void) {
     mseb_load(mseb_gain, &mseb_on);
     eq_set_mseb(mseb_on, mseb_gain);
     recent_heard_load();   /* R30 -- its own file, not a music.conf key either */
-    apply_theme();         /* R41: light_theme just loaded above, if present */
+    apply_theme();         /* R41/R43: theme_mode just loaded above, if present */
 }
 
 /* Does this line set `key`? Length taken from the key itself rather than
@@ -4168,6 +4916,10 @@ static void save_conf(void) {
                 !conf_line_is(lines[n], "button_lock_enabled") &&
                 !conf_line_is(lines[n], "usb_bypass_enabled") &&
                 !conf_line_is(lines[n], "light_theme") &&
+                !conf_line_is(lines[n], "theme_mode") &&
+                !conf_line_is(lines[n], "tz_index") &&
+                !conf_line_is(lines[n], "shuffle_enabled") &&
+                !conf_line_is(lines[n], "repeat_mode") &&
                 !conf_line_is(lines[n], "deep_sleep") &&
                 !conf_line_is(lines[n], "sleep_minutes") &&
                 !conf_line_is(lines[n], "auto_off_minutes") &&
@@ -4183,7 +4935,10 @@ static void save_conf(void) {
     fprintf(f, "accent_index = %d\n", g_accent_idx);
     fprintf(f, "button_lock_enabled = %d\n", button_lock_enabled);
     fprintf(f, "usb_bypass_enabled = %d\n", usb_bypass_enabled);
-    fprintf(f, "light_theme = %d\n", light_theme);
+    fprintf(f, "theme_mode = %d\n", theme_mode);
+    fprintf(f, "tz_index = %d\n", tz_idx);
+    fprintf(f, "shuffle_enabled = %d\n", shuffle_enabled);
+    fprintf(f, "repeat_mode = %d\n", repeat_mode);
     fprintf(f, "sleep_minutes = %d\n", sleep_minutes());
     fprintf(f, "deep_sleep = %d\n", deep_sleep_enabled);
     fprintf(f, "auto_off_minutes = %d\n", auto_off_minutes());
@@ -4504,14 +5259,14 @@ static int handle_keys(int fd, key_src_t src) {
                 case KEY_PLAYPAUSE_:            /* the skip-forward button */
                     if (audiobook_mode) ab_play_chapter(cur_track + 1);
                     else if (podcast_mode) audio_seek_ms(audio_pos_ms() + 30000);
-                    else                play_index(cur_track + 1);
+                    else                play_index(next_track_index());
                     acted = 1; break;
                 case KEY_NEXTSONG_:             /* the skip-back button */
                 case KEY_PREVSONG_:
                     if (audiobook_mode) ab_play_chapter(cur_track - 1);
                     else if (podcast_mode) audio_seek_ms(audio_pos_ms() - 30000);
                     else if (audio_pos_ms() > 3000) audio_seek_ms(0);
-                    else play_index(cur_track - 1);
+                    else play_index(prev_track_index());
                     acted = 1;
                     break;
                 default: break;
@@ -4537,7 +5292,7 @@ static int handle_keys(int fd, key_src_t src) {
             case KEY_NEXTSONG_:
                 if (audiobook_mode) ab_play_chapter(cur_track + 1);
                 else if (podcast_mode) audio_seek_ms(audio_pos_ms() + 30000);
-                else                play_index(cur_track + 1);
+                else                play_index(next_track_index());
                 acted = 1;
                 break;
             case KEY_PREVSONG_:
@@ -4557,7 +5312,7 @@ static int handle_keys(int fd, key_src_t src) {
                 } else if (audio_pos_ms() > 3000) {
                     audio_seek_ms(0);
                 } else {
-                    play_index(cur_track - 1);
+                    play_index(prev_track_index());
                 }
                 acted = 1;
                 break;
@@ -4704,7 +5459,7 @@ int music_entry(void *a0, void *a1) {
      * A frame is produced only when something actually changed: a gesture, the
      * clock ticking over a second, or artwork arriving. */
     int page = 0, frames = 0, running = 1, dirty = 1;
-    int last_sec = -1, art_seen = 0, status_tick = 0, idle = 0, rescan_tick = 0;
+    int last_sec = -1, art_seen = 0, view_art_seen = 0, status_tick = 0, idle = 0, rescan_tick = 0;
     int sleep_idle = 0, auto_off_idle = 0;
     int ab_pos_tick = 0;
     int blank_tick = 0, last_lit_bright = 0;    /* BG6 watchdog, see below */
@@ -4785,8 +5540,14 @@ int music_entry(void *a0, void *a1) {
                 }
                 audio_set_next(ab_next_file(cur_track));
             } else if (adv > 0) {
-                for (int i = 0; i < adv && cur_track + 1 < queue_n; i++) {
-                    cur_track++;
+                /* R47: steps through next_track_index() rather than a bare
+                 * cur_track++, so cur_track ends up wherever queue_follower()
+                 * actually told the worker to roll into -- shuffle order or
+                 * a repeat-all wrap, not just "the next slot." */
+                for (int i = 0; i < adv; i++) {
+                    int nxt = next_track_index();
+                    if (nxt < 0) break;
+                    cur_track = nxt;
                     art_request(queue[cur_track].path,
                                 queue[cur_track].artist[0] ? queue[cur_track].artist : q_artist,
                                 q_album);
@@ -4817,12 +5578,13 @@ int music_entry(void *a0, void *a1) {
                     mlog("[music] fell back to restart at chapter %d\n", j + 1);
                     ab_play_chapter(j);
                 }
-            } else if (!radio_mode && cur_track + 1 < queue_n) {
+            } else if (!radio_mode && next_track_index() >= 0) {
                 /* Reaching here means the worker could not roll on by itself,
                  * which costs a restart and therefore a gap. Logged, because
                  * a gap is otherwise only findable by ear. */
-                mlog("[music] fell back to restart at track %d\n", cur_track + 1);
-                play_index(cur_track + 1);
+                int nxt = next_track_index();
+                mlog("[music] fell back to restart at track %d\n", nxt + 1);
+                play_index(nxt);
             } else if (podcast_mode && cur_track >= 0 && cur_track < queue_n) {
                 /* An episode is never queued alongside a next one (see
                  * podcast_mode's comment), so reaching the end just stops --
@@ -5040,7 +5802,18 @@ int music_entry(void *a0, void *a1) {
                 if (y > cyy - 48 && y < cyy + 48) audio_toggle();
             } else if (screen == SC_PLAYING && y >= STATUS_H) {
                 /* The queue control sits in the corner the header used to own. */
-                if (y > FB_H - 56 && x > FB_W - 76) { go_back(); }
+                if (y > FB_H - 56 && x > FB_W - 76) {
+                    /* BG71: plain music gets its own queue view now -- the
+                     * old go_back()-into-SC_TRACKS reuse showed the *album*
+                     * (now a rich cover/bio page, R46) rather than the
+                     * actual upcoming play order, which silently diverges
+                     * from it the moment shuffle is on. podcast_mode's
+                     * queue is genuinely just its feed's episode list
+                     * (see podcast_mode's own comment on this), which the
+                     * unchanged go_back() path still shows correctly. */
+                    if (podcast_mode) go_back();
+                    else { screen = SC_QUEUE; reset_scroll(); }
+                }
                 else {
                 /* The bar is only 6 px tall; the target has to be the band
                  * around it or it is unhittable with a finger. */
@@ -5085,9 +5858,37 @@ int music_entry(void *a0, void *a1) {
                             pod_notes_scroll_px = 0;
                         }
                     } else {
-                        if (x < FB_W / 3)            play_index(cur_track - 1);
-                        else if (x > 2 * FB_W / 3)   play_index(cur_track + 1);
-                        else                          audio_toggle();
+                        /* Real hit zones under the drawn icons -- midpoints
+                         * between adjacent element centres, same idiom BG47
+                         * already applied to podcast_mode above -- not blind
+                         * thirds, which stopped matching once the icons
+                         * moved in to offset 96. */
+                        int mid2 = FB_W / 2;
+                        int pmx = mid2 - 96 - 82, prevx = mid2 - 96, nextx = mid2 + 96;
+                        if (x < (pmx + prevx) / 2) {
+                            /* R47: Normal -> Shuffle -> Repeat -> Normal.
+                             * Repeat means the current track, not the whole
+                             * queue -- looping one song is the thing a
+                             * dedicated button is actually for; looping a
+                             * whole album barely differs from just letting
+                             * it play. */
+                            if (shuffle_enabled) {
+                                shuffle_enabled = 0; repeat_mode = REPEAT_ONE;
+                            } else if (repeat_mode == REPEAT_ONE) {
+                                repeat_mode = REPEAT_OFF;
+                            } else {
+                                shuffle_enabled = 1;
+                            }
+                            if (shuffle_enabled) shuffle_regenerate();
+                            queue_follower();
+                            save_conf();
+                        } else if (x < (prevx + mid2) / 2) {
+                            play_index(prev_track_index());
+                        } else if (x < (mid2 + nextx) / 2) {
+                            audio_toggle();
+                        } else {
+                            play_index(next_track_index());
+                        }
                     }
                 }
                 }
@@ -5131,7 +5932,7 @@ int music_entry(void *a0, void *a1) {
                     else if (x > MINI_ZONE_BACK) audio_seek_ms(audio_pos_ms() - 30000);
                     else                          screen = SC_PLAYING;
                 } else {
-                    if (x > MINI_ZONE_SIDE)      play_index(cur_track + 1);
+                    if (x > MINI_ZONE_SIDE)      play_index(next_track_index());
                     else if (x > MINI_ZONE_PLAY) audio_toggle();
                     else { screen = SC_PLAYING; played_from_browse = 0; }
                 }
@@ -5213,11 +6014,17 @@ int music_entry(void *a0, void *a1) {
                     }
                 }
             } else if (screen == SC_SETTINGS) {
-                int ry_lock = set_row_lock_y(), ry_theme = set_row_theme_y();
-                int ry_usbbypass = set_row_usbbypass_y();
-                int ry_autooff = set_row_autooff_y(), ry_about = set_row_about_y();
-                int ry_lighttheme = set_row_lighttheme_y();
-                int ry_reindex = set_row_reindex_y();
+                /* Tap coordinates are screen-space; row getters are
+                 * content-space. Same `off` the draw code subtracts, so a
+                 * tap lands on whatever row is actually drawn under the
+                 * finger regardless of how far Settings has been scrolled. */
+                int off = scroll * ROW_H + scroll_px;
+                int ry_lock = set_row_lock_y() - off, ry_theme = set_row_theme_y() - off;
+                int ry_usbbypass = set_row_usbbypass_y() - off;
+                int ry_autooff = set_row_autooff_y() - off, ry_about = set_row_about_y() - off;
+                int ry_lighttheme = set_row_lighttheme_y() - off;
+                int ry_timezone = set_row_timezone_y() - off;
+                int ry_reindex = set_row_reindex_y() - off;
                 if (y >= ry_lock && y < ry_lock + ROW_H) {
                     button_lock_enabled = !button_lock_enabled;
                     save_conf();
@@ -5231,9 +6038,9 @@ int music_entry(void *a0, void *a1) {
                     auto_off_idx = (auto_off_idx + 1) % AUTO_OFF_CHOICE_N;
                     save_conf();
                 } else if (y >= ry_lighttheme && y < ry_lighttheme + ROW_H) {
-                    light_theme = !light_theme;
-                    apply_theme();
-                    save_conf();
+                    screen = SC_SETTINGS_THEMEMODE; reset_scroll();
+                } else if (y >= ry_timezone && y < ry_timezone + ROW_H) {
+                    screen = SC_SETTINGS_TIMEZONE; reset_scroll();
                 } else if (y >= ry_theme && y < ry_theme + ROW_H) {
                     screen = SC_SETTINGS_THEME; reset_scroll();
                 } else if (y >= ry_about && y < ry_about + ROW_H) {
@@ -5248,6 +6055,37 @@ int music_entry(void *a0, void *a1) {
                     g_accent_idx = idx;
                     g_accent = ACCENT_PRESETS[idx].color;
                     save_conf();
+                }
+            } else if (screen == SC_SETTINGS_TIMEZONE) {
+                int off = scroll * ROW_H + scroll_px;
+                int idx = (y - CONTENT_Y + off) / ROW_H;
+                if (idx >= 0 && idx < TZ_N) {
+                    tz_idx = idx;
+                    save_conf();
+                }
+            } else if (screen == SC_SETTINGS_THEMEMODE) {
+                int idx = (y - CONTENT_Y) / ROW_H;
+                if (idx >= 0 && idx < THEME_MODE_N) {
+                    theme_mode = idx;
+                    apply_theme();
+                    save_conf();
+                }
+            } else if (screen == SC_TRACKS && !ab_list && !pod_list) {
+                /* R46: tap coordinates are screen-space; the header/track
+                 * layout is content-space (see the draw side's own `off`).
+                 * A tap on the header itself (cover/title/artist/info) does
+                 * nothing yet -- only a track row is interactive here. */
+                int off = scroll * ROW_H + scroll_px;
+                int header_h = tracks_hdr_h();
+                int content_y = y + off;
+                if (content_y >= header_h) {
+                    int idx = (content_y - header_h) / ROW_H;
+                    if (idx >= 0 && idx < track_n) {
+                        audio_set_speed(1000);
+                        screen = SC_PLAYING;
+                        played_from_browse = 1;
+                        play_from_list(idx);
+                    }
                 }
             } else {
                 /* No +scroll_px: BG2 made rows page instead of slide, so a
@@ -5357,6 +6195,9 @@ int music_entry(void *a0, void *a1) {
                     load_page();
                     mlog("[music] %s -> %d albums\n", cur_artist, total);
                 } else if (screen == SC_TRACKS && scroll + idx < track_n) {
+                    /* Plain albums are caught by their own SC_TRACKS branch
+                     * above now (R46) -- only ab_list/pod_list ever reach
+                     * here. */
                     if (pod_list) {
                         /* This list is one feed's episodes. An undownloaded
                          * one starts its download instead of playing --
@@ -5374,15 +6215,6 @@ int music_entry(void *a0, void *a1) {
                         /* This list is the book's chapters. */
                         screen = SC_PLAYING;
                         ab_play_chapter(scroll + idx);
-                    } else {
-                        /* A regular track. Clear the mode and speed
-                         * explicitly rather than leaving them wherever an
-                         * earlier book left them, or a book's 1.3x would
-                         * carry into a song. */
-                        audio_set_speed(1000);
-                        screen = SC_PLAYING;
-                        played_from_browse = 1;
-                        play_from_list(scroll + idx);
                     }
                 } else if (screen == SC_PLAYLISTS && scroll + idx < playlist_n) {
                     static char paths[PAGE_MAX * 8][LIB_PATH_LEN];
@@ -5405,6 +6237,24 @@ int music_entry(void *a0, void *a1) {
                     if (audio_is_active()) screen = SC_PLAYING;
                     else if (!radio_msg[0])
                         snprintf(radio_msg, sizeof(radio_msg), "Could not reach that station");
+                } else if (screen == SC_QUEUE && scroll + idx < queue_n) {
+                    int qidx = queue_display_index(scroll + idx);
+                    if (qidx >= 0) {
+                        audio_set_speed(1000);
+                        screen = SC_PLAYING;
+                        /* Reported live: backing all the way out to Albums
+                         * afterward showed the queued track's own artist
+                         * (e.g. "Oasis") as Albums' own filter/title instead
+                         * of "Albums". go_back()'s SC_PLAYING case only
+                         * protects albums_artist from being overwritten by
+                         * q_artist when played_from_browse is set (BG7) --
+                         * every other route into playing a track that
+                         * matters here already sets it (play_from_list()'s
+                         * own caller does), this one just hadn't been
+                         * updated to. */
+                        played_from_browse = 1;
+                        play_index(qidx);
+                    }
                 } else if (screen == SC_ALBUMS && row_at(scroll + idx)) {
                     lib_row_t *row = row_at(scroll + idx);
                     snprintf(cur_album, sizeof(cur_album), "%s", row->name);
@@ -5438,6 +6288,13 @@ int music_entry(void *a0, void *a1) {
                                   (t1.tv_nsec - t0.tv_nsec) / 1000000L;
                         mlog("[music] %s -> %d tracks (%ld ms)\n", cur_album, track_n, ms);
                     }
+                    /* BG70: view_art_request(), not art_request() -- the
+                     * album-detail screen's cover is what's being *browsed*,
+                     * completely independent of art_bits/the playing track,
+                     * so the mini-player and Now Playing are never at risk
+                     * of showing it (see view_art_request()'s own comment). */
+                    if (track_n > 0)
+                        view_art_request(tracks[0].path, cur_artist, cur_album);
                 } else if (screen == SC_AUDIOBOOKS && scroll + idx < ab_book_n) {
                     ab_book_t *b = &ab_books[scroll + idx];
                     if (audiobook_mode && !strcmp(b->dir, ab_book.dir)) {
@@ -5722,11 +6579,19 @@ int music_entry(void *a0, void *a1) {
         {
             int scrollable = screen == SC_ARTISTS || screen == SC_ALBUMS ||
                              screen == SC_TRACKS || screen == SC_PLAYLISTS ||
-                             screen == SC_RADIO || screen == SC_EQ_BANDS;
+                             screen == SC_RADIO || screen == SC_EQ_BANDS ||
+                             screen == SC_SETTINGS || screen == SC_SETTINGS_TIMEZONE ||
+                             screen == SC_QUEUE;
+            /* R46: the album-detail screen has no status bar to keep a drag
+             * from starting under -- its cover runs from y=0, same as Now
+             * Playing's own art, and a touch-down anywhere on it has to be
+             * draggable or the whole top of the screen would be dead to
+             * scrolling. */
+            int drag_top = (screen == SC_TRACKS && !ab_list && !pod_list) ? 0 : CONTENT_Y;
             int was = list_dragging;
             list_dragging = touch_down && scrollable && !index_active &&
                             !scrub_active && !qs_open &&
-                            touch_y >= CONTENT_Y && !edge_active;
+                            touch_y >= drag_top && !edge_active;
             if (list_dragging && !was) {
                 /* A raw drag on the list itself is free browsing, not bound
                  * by wherever the index last landed — otherwise a stale
@@ -5741,7 +6606,18 @@ int music_entry(void *a0, void *a1) {
                 list_velocity = 0;
                 inertia_active = 0;
             } else if (list_dragging) {
-                if (scroll_to_px(list_start_px + (list_down_y - live_y))) dirty = 1;
+                int changed = scroll_to_px(list_start_px + (list_down_y - live_y));
+                /* R46 follow-up: everywhere else, holding dirty for a whole
+                 * row's worth of drag (BG2) is the right trade -- redrawing a
+                 * plain text list every pixel bought nothing anyone could see
+                 * and cost a redraw on nearly every tick. The album-detail
+                 * screen is different: it's a full-screen cover image sliding
+                 * along with the text, and holding it frozen between row
+                 * crossings read as chunky/laggy rather than smooth, reported
+                 * live right after this screen shipped. Continuous redraw
+                 * only for this one screen, not a blanket change. */
+                int continuous = (screen == SC_TRACKS && !ab_list && !pod_list);
+                if (changed || continuous) dirty = 1;
                 unsigned dt = g_tick - list_last_tick;
                 if (dt > 0) {
                     /* Forward-positive: finger moving up (y decreasing)
@@ -5754,13 +6630,55 @@ int music_entry(void *a0, void *a1) {
             } else if (was) {
                 /* Release: hand off to inertia if the finger was moving. */
                 inertia_active = list_velocity > 0.6f || list_velocity < -0.6f;
+                /* R46 follow-up: a slow release that ends inside the
+                 * rubber-banded overscroll has near-zero velocity and would
+                 * otherwise never spring back -- force the coast tick to
+                 * run regardless, so out-of-bounds always resolves rather
+                 * than sticking wherever the finger happened to let go. */
+                if (screen == SC_TRACKS && !ab_list && !pod_list) {
+                    int cur = scroll * ROW_H + scroll_px;
+                    if (cur < 0 || cur > tracks_max_px()) inertia_active = 1;
+                }
                 dirty = 1;
             }
         }
         if (inertia_active && !list_dragging) {
-            if (scroll_to_px((int)(scroll * ROW_H + scroll_px + list_velocity))) dirty = 1;
+            int continuous = (screen == SC_TRACKS && !ab_list && !pod_list);
+            if (continuous) {
+                /* Spring pull toward whichever bound is exceeded, layered
+                 * onto the ordinary fling velocity below -- proportional to
+                 * how far out of bounds, so it eases in rather than jumping,
+                 * and settles the position rather than just decaying
+                 * whatever residual velocity release happened to leave. */
+                int cur = scroll * ROW_H + scroll_px;
+                int max_px = tracks_max_px();
+                if (cur < 0) list_velocity += (0 - cur) * 0.15f;
+                else if (cur > max_px) list_velocity += (max_px - cur) * 0.15f;
+            }
+            int changed = scroll_to_px((int)(scroll * ROW_H + scroll_px + list_velocity));
+            /* Same continuous-redraw reasoning as the drag tick above, for
+             * the coast after release. */
+            if (changed || continuous) dirty = 1;
             list_velocity *= 0.90f;     /* friction: dead within about a second */
-            if (list_velocity < 0.6f && list_velocity > -0.6f) inertia_active = 0;
+            if (list_velocity < 0.6f && list_velocity > -0.6f) {
+                /* Still out of bounds with velocity spent -- keep the spring
+                 * alone driving it home rather than declaring the coast
+                 * finished while a gap is still visible. Snapped exactly
+                 * once within 2px rather than left to the spring's own
+                 * asymptotic approach: float-to-int truncation on a
+                 * shrinking velocity could otherwise stall a pixel or two
+                 * short of the boundary forever, never quite satisfying
+                 * cur < 0 / cur > max_px again but never reaching 0 either. */
+                int still_out = 0;
+                if (continuous) {
+                    int cur = scroll * ROW_H + scroll_px;
+                    int max_px = tracks_max_px();
+                    if (cur < 0 && cur > -2) scroll_to_px(0);
+                    else if (cur > max_px && cur < max_px + 2) scroll_to_px(max_px);
+                    else still_out = cur < 0 || cur > max_px;
+                }
+                if (!still_out) inertia_active = 0;
+            }
             idle = 0;
         }
         /* Deliberately keyed on inertia_active alone -- see its own comment
@@ -5870,15 +6788,30 @@ int music_entry(void *a0, void *a1) {
          * queue of tracks, and a book's chapters are not that — acting on
          * them would rewrite the chapter table out from under the player. */
         if (touch_down && !touch_moved && !edge_active && !hold_fired && !sheet_open &&
-            screen == SC_TRACKS && !ab_list && touch_y >= CONTENT_Y) {
+            screen == SC_TRACKS && !ab_list &&
+            touch_y >= (pod_list ? CONTENT_Y : 0)) {
             struct timespec now;
             clock_gettime(CLOCK_MONOTONIC, &now);
             long held = (now.tv_sec - touch_at.tv_sec) * 1000L +
                         (now.tv_nsec - touch_at.tv_nsec) / 1000000L;
             if (held >= HOLD_MS) {
-                int idx = scroll + (touch_y - CONTENT_Y) / ROW_H;   /* see idx above */
+                /* R46: plain albums address a row via the header-relative
+                 * off/header_h math (see the draw/tap-handling code above),
+                 * not scroll+((touch_y-CONTENT_Y)/ROW_H) -- that assumed
+                 * content starting at CONTENT_Y, which is only still true
+                 * for pod_list's unchanged layout. */
+                int idx;
+                if (pod_list) {
+                    idx = scroll + (touch_y - CONTENT_Y) / ROW_H;
+                } else {
+                    int off = scroll * ROW_H + scroll_px;
+                    int header_h = tracks_hdr_h();
+                    int content_y = touch_y + off;
+                    idx = (content_y - header_h) / ROW_H;
+                    if (content_y < header_h) idx = -1;
+                }
                 hold_fired = 1;
-                if (idx < track_n) {
+                if (idx >= 0 && idx < track_n) {
                     sheet_open = 1;
                     sheet_track = idx;
                     dirty = 1; idle = 0;
@@ -5897,6 +6830,12 @@ int music_entry(void *a0, void *a1) {
             if (sec != last_sec) { last_sec = sec; dirty = 1; }
             int seq = art_seq();
             if (seq != art_seen) { art_seen = seq; dirty = 1; }
+            /* BG70: the album-detail screen's own cover fetch, independent
+             * of the playing track's -- needs its own redraw trigger the
+             * same way, or a slow network fetch would only ever show up
+             * whenever something else happened to mark the screen dirty. */
+            int vseq = view_art_seq();
+            if (vseq != view_art_seen) { view_art_seen = vseq; dirty = 1; }
             /* The status bar changes on its own — battery drains, the jack is
              * pulled — so it gets a slow tick of its own rather than relying
              * on the clock, which only runs during playback. */
@@ -5910,6 +6849,16 @@ int music_entry(void *a0, void *a1) {
                  * than this ~2s tick while locked, so this would otherwise
                  * fight the pulse with a periodic flat value. */
                 if (!button_locked) { write_int_file(LED_BLUE, 0); write_int_file(LED_RED, 0); }
+                /* R45: rides this same ~2s tick rather than adding a new
+                 * one -- cheap enough (a handful of trig calls) to just redo
+                 * every time it fires, and only reached at all in Auto mode.
+                 * dirty=1 below already covers redrawing once this changes
+                 * the six colour variables. */
+                if (theme_mode == THEME_AUTO) {
+                    static int was_day = -1;
+                    int is_day = is_daytime();
+                    if (is_day != was_day) { was_day = is_day; apply_theme(); }
+                }
                 dirty = 1;
             }
         }
@@ -6200,6 +7149,7 @@ __attribute__((constructor))
 static void music_init(void) {
     if (!is_hiby_player()) return;
     mlog("[music] init pid=%d entry=%p\n", (int)getpid(), &music_entry);
+    srand((unsigned)time(NULL));   /* R47: shuffle_regenerate()'s rand() */
 
     /* Manual only, on request -- an earlier auto-start here (regardless of
      * the tile hijack below succeeding) made the whole HiBy launcher UI
