@@ -658,20 +658,33 @@ static int mp3_probe(const char *path, int *rate_out, int *bitrate_bps_out) {
     static const int mpeg2_rates[4] = { 22050, 24000, 16000, 0 };
     static const int mpeg25_rates[4] = { 11025, 12000, 8000, 0 };
 
-    unsigned char buf[8192];
+    unsigned char hdr[10];
     FILE *f = fopen(path, "rb");
     if (!f) return -1;
-    size_t n = fread(buf, 1, sizeof(buf), f);
-    fclose(f);
-    if (n < 10) return -1;
+    size_t hn = fread(hdr, 1, sizeof(hdr), f);
+    if (hn < 10) { fclose(f); return -1; }
 
+    /* Seek past the ID3v2 tag before reading the scan window, rather than
+     * reading a fixed buffer from byte 0 and hoping the tag fits inside it.
+     * A well-tagged rip's embedded cover art routinely pushes the tag itself
+     * past a few hundred KB -- reported live on "Revolver", whose 0 kbps
+     * traced to exactly this: a tag bigger than the old 8192-byte read, so
+     * `start` (computed correctly from the tag's own size field) landed
+     * past the end of the only bytes actually in memory, and the sync scan
+     * below never ran at all. */
     size_t start = 0;
-    if (!memcmp(buf, "ID3", 3)) {
-        uint32_t sz = ((uint32_t)(buf[6] & 0x7F) << 21) | ((uint32_t)(buf[7] & 0x7F) << 14) |
-                     ((uint32_t)(buf[8] & 0x7F) << 7) | (buf[9] & 0x7F);
+    if (!memcmp(hdr, "ID3", 3)) {
+        uint32_t sz = ((uint32_t)(hdr[6] & 0x7F) << 21) | ((uint32_t)(hdr[7] & 0x7F) << 14) |
+                     ((uint32_t)(hdr[8] & 0x7F) << 7) | (hdr[9] & 0x7F);
         start = 10 + sz;
     }
-    for (size_t i = start; i + 4 <= n; i++) {
+    if (fseek(f, (long)start, SEEK_SET) != 0) { fclose(f); return -1; }
+
+    unsigned char buf[8192];
+    size_t n = fread(buf, 1, sizeof(buf), f);
+    fclose(f);
+
+    for (size_t i = 0; i + 4 <= n; i++) {
         if (buf[i] != 0xFF || (buf[i + 1] & 0xE0) != 0xE0) continue;
         int ver_bits = (buf[i + 1] >> 3) & 0x03;    /* 00=v2.5, 10=v2, 11=v1 */
         int layer_bits = (buf[i + 1] >> 1) & 0x03;   /* 01=Layer III */

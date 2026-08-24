@@ -719,6 +719,22 @@ static int tracks_query(const char *artist, const char *album, int use_artist,
         int cached = index_lookup(t->path, fst.st_mtime, &idx_track, &idx_disc, &idx_dur);
         if (cached && idx_dur > 0) t->dur_ms = idx_dur;
 
+        /* BG-revolver: bitrate can be genuinely 0 in the database from
+         * before audio.c's mp3_probe() fix (a large ID3v2 tag -- embedded
+         * cover art routinely pushes one past a few hundred KB -- used to
+         * push the sync scan past the only bytes actually read, silently
+         * leaving bitrate unprobed). A plain rescan won't self-heal this:
+         * scanner.c skips a file whose mtime hasn't changed, and nothing
+         * here touches the file itself. Same live-probe-on-miss shape
+         * R28's dur_ms fallback below already uses, and for the same
+         * reason: cheap per file (a header parse, not a decode), so paying
+         * it only for the rows that actually need it costs nothing for a
+         * library that's already fine. */
+        if (t->bitrate <= 0) {
+            int pbits, prate, pbitrate, pdur;
+            if (audio_probe_format(t->path, &pbits, &prate, &pbitrate, &pdur) == 0 && pbitrate > 0)
+                t->bitrate = pbitrate;
+        }
         if (t->dur_ms <= 0) t->dur_ms = audio_probe_dur_ms(t->path, t->bitrate);
         copy_text(t->artist, sizeof(t->artist), sqlite3_column_text(st, 7));
         /* Ask the file first. The filename is a guess that happens to be right
@@ -934,6 +950,13 @@ int lib_track_by_path(const char *real, lib_track_t *out) {
         int cached = stat(out->path, &fst) == 0 &&
                      index_lookup(out->path, fst.st_mtime, &idx_track, &idx_disc, &idx_dur);
         if (out->dur_ms <= 0 && cached && idx_dur > 0) out->dur_ms = idx_dur;
+        /* Same live-probe-on-miss fallback as the sibling query above --
+         * see its own comment (BG-revolver). */
+        if (out->bitrate <= 0) {
+            int pbits, prate, pbitrate, pdur;
+            if (audio_probe_format(out->path, &pbits, &prate, &pbitrate, &pdur) == 0 && pbitrate > 0)
+                out->bitrate = pbitrate;
+        }
         if (out->dur_ms <= 0) out->dur_ms = audio_probe_dur_ms(out->path, out->bitrate);
         if (cached) {
             out->track = idx_track;
