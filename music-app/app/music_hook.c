@@ -3832,6 +3832,14 @@ static void draw_keyboard(uint16_t *fb) {
 
 static void draw_screen(uint16_t *fb) {
     if (screen == SC_KEYBOARD) { draw_keyboard(fb); return; }
+    /* R14 flagged skipping this full clear (header/mini-player strips are
+     * unconditionally repainted anyway) as the next lever -- tried, live on
+     * device, 2026-08-24: real corruption during list scroll (stale text
+     * overlapping between rows), root cause not fully tracked down against
+     * this app's double-buffered page-flip. Reverted rather than ship it
+     * broken. Left as a known-attempted, not-yet-safe idea, not an open
+     * "try this" -- the double-buffer staleness reasoning needs more than
+     * a same-frame-combination-stable counter to actually hold. */
     fill_rect(fb, 0, 0, FB_W, FB_H, COL_BG);
     /* The player has no title bar at all: a strip saying "Now playing" over a
      * screen showing the track, the artist and the artwork was telling you
