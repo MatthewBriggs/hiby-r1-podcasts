@@ -24,6 +24,8 @@
 #define PODSYNC_CA   RESUME_DIR "/cacert.pem"
 #define DL_HDR_PATH  "/tmp/.pod_dl_headers"
 #define SYNC_LOG     "/tmp/.podsync_run.log"
+#define FEEDS_PATH   RESUME_DIR "/feeds.txt"
+#define SETTINGS_PATH "/data/mnt/sd_0/settings.txt"
 
 static void sort_feeds(pod_feed_t *items, int n) {
     for (int i = 1; i < n; i++) {
@@ -434,12 +436,59 @@ int pod_download_poll(void) {
 
 /* ---- whole-feed sync ------------------------------------------------- */
 
+/* R64: feeds.txt used to be the only place to manage subscriptions -- hand-
+ * edited directly on the card, with no connection to settings.txt at all.
+ * Regenerated here from a "Podcasts" section in settings.txt, one URL per
+ * line, same blank-line-ends-the-section convention every other section
+ * (WiFi/Radio/LastFM/Spotify) already uses -- run right before every sync,
+ * so settings.txt is the actual source of truth and feeds.txt becomes a
+ * generated file rather than something to hand-edit. podsync_once.sh itself
+ * is untouched: it still just reads feeds.txt, one format to trust, rather
+ * than teaching a shell script to parse settings.txt's section format too.
+ *
+ * Deliberately non-destructive when there's nothing to generate from: no
+ * settings.txt, or a settings.txt with no "Podcasts" section (or one with a
+ * section header but zero URLs under it) at all, means the section is
+ * missing rather than genuinely emptied on purpose -- leaves feeds.txt
+ * exactly as it already was rather than truncating a subscription list
+ * whose real source hasn't migrated yet. */
+static void pod_sync_feeds_from_settings(void) {
+    FILE *in = fopen(SETTINGS_PATH, "r");
+    if (!in) return;
+    char line[512];
+    int in_section = 0;
+    char tmp_path[300];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.new", FEEDS_PATH);
+    FILE *out = NULL;
+    while (fgets(line, sizeof(line), in)) {
+        char *nl = strchr(line, '\n'); if (nl) *nl = '\0';
+        char *cr = strchr(line, '\r'); if (cr) *cr = '\0';
+        char *s = line;
+        while (*s == ' ' || *s == '\t') s++;
+        if (!in_section) {
+            if (!strcmp(s, "Podcasts")) in_section = 1;
+            continue;
+        }
+        if (s[0] == '\0') break;      /* blank line: end of section */
+        if (s[0] == '#') continue;
+        if (!out) {
+            out = fopen(tmp_path, "w");
+            if (!out) break;
+            fprintf(out, "# Generated from settings.txt's Podcasts section -- edit there, not here.\n");
+        }
+        fprintf(out, "%s\n", s);
+    }
+    fclose(in);
+    if (out) { fclose(out); rename(tmp_path, FEEDS_PATH); }
+}
+
 static pid_t update_pid = -1;
 static int   update_running_flag;
 static int   update_died_flag;
 
 void pod_update_start(void) {
     if (update_running_flag) return;
+    pod_sync_feeds_from_settings();
     unlink(SYNC_LOG);
     pid_t pid = fork();
     if (pid == 0) {

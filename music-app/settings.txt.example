@@ -19,3 +19,8 @@ Spotify
 # Client ID, followed by client secret. Get these at https://developer.spotify.com/dashboard
 YOUR_SPOTIFY_CLIENT_ID
 YOUR_SPOTIFY_CLIENT_SECRET
+
+Podcasts
+# One RSS feed URL per line. Regenerated into .podsync/feeds.txt every time
+# Update feeds is pressed -- edit here, not feeds.txt directly.
+https://example.com/podcast.rss
