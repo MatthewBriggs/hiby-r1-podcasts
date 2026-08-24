@@ -28,6 +28,15 @@ from PIL import Image
 # speaker itself between volume states, which is what this family grouping
 # exists to prevent. Singletons (bt/usb/wifi) are families of one.
 SPECS = [
+    # Skip-back/skip-forward rings for the podcast/audiobook players,
+    # replacing the old hand-drawn dots-along-an-arc approximation
+    # (draw_skip_arc()). Family, not two singletons: these are mirror
+    # images of each other and sit side by side around the same play
+    # button, so they need the shared-crop-box treatment to come out the
+    # same size -- an independent fit would size them off the individual
+    # arrow's own bbox, which differs slightly left vs right.
+    ("skiprot", "arrow-rotate-left-solid-full.svg.png",  "skip_back",    [(56, 56, "")]),
+    ("skiprot", "arrow-rotate-right-solid-full.svg.png", "skip_forward", [(56, 56, "")]),
     ("bt",   "bluetooth-brands-solid-full.svg.png", "bt",   [(26, 38, "_qs"), (16, 16, "_sm")]),
     ("usb",  "usb-brands-solid-full.svg.png",       "usb",  [(16, 16, "_sm"), (32, 32, "_qs")]),
     ("wifi", "wifi-solid-full.svg.png",             "wifi", [(48, 34, "_qs")]),

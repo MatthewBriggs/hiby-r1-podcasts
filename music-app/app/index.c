@@ -42,6 +42,7 @@
 #include "library.h"
 #include "tags.h"
 #include "audio.h"
+#include "scanner.h"
 
 #define STOCK_DB_PATH "/usr/data/usrlocal_media.db"
 /* Internal UBIFS storage, not the SD card: /usr/data/usrlocal_media.db (the
@@ -416,15 +417,40 @@ static void *scan_worker(void *arg) {
     ilog("[index] scan thread started\n");
 
     for (;;) {
-        /* Retried on the stock DB failing to open rather than given up on
-         * outright: it may not exist yet at process load (unlikely by the
-         * time hiby_player is running at all, but cheap to be defensive
-         * about, matching this codebase's general SD-card caution). */
+        /* RBR/BG95: this used to open STOCK_DB_PATH unconditionally, same
+         * as library.c's own lib_open() did before RP6 -- and like that
+         * function, it needed the identical fix. hiby_player's own scanner
+         * is gone for good once RP1 is committed to, so STOCK_DB_PATH is
+         * frozen: a file scanner.c discovers that the frozen stock table
+         * never knew about (a box set added to the card after hiby_player
+         * stopped scanning, in the case that surfaced this) was invisible
+         * to this scan pass forever, no matter how many times "Scan
+         * library" ran -- every browse of it kept paying the full,
+         * uncached tag_read()+audio_probe_dur_ms() cost, live, since this
+         * cache never had a row for it to serve instead. Same preference
+         * order as lib_open(): scanner.c's own database first (the one
+         * actually being kept current -- see its own header comment on
+         * the manual rescan), stock only as a fallback for a device that
+         * hasn't run a scan yet. */
         sqlite3 *rodb = NULL;
-        if (sqlite3_open_v2(STOCK_DB_PATH, &rodb,
-                            SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, NULL) != SQLITE_OK) {
+        int rc = sqlite3_open_v2(SCANNER_DB_PATH, &rodb,
+                                 SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, NULL);
+        if (rc == SQLITE_OK) {
+            sqlite3_stmt *cst;
+            int has_rows = 0;
+            if (sqlite3_prepare_v2(rodb, "select 1 from MEDIA_TABLE limit 1", -1, &cst, NULL) == SQLITE_OK) {
+                has_rows = sqlite3_step(cst) == SQLITE_ROW;
+                sqlite3_finalize(cst);
+            }
+            if (!has_rows) { sqlite3_close(rodb); rodb = NULL; }
+        } else if (rodb) {
+            sqlite3_close(rodb);   /* open_v2 can return a non-NULL handle even on failure */
+            rodb = NULL;
+        }
+        if (!rodb && sqlite3_open_v2(STOCK_DB_PATH, &rodb,
+                                     SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, NULL) != SQLITE_OK) {
             if (rodb) sqlite3_close(rodb);
-            ilog("[index] stock db not ready, retrying in 30s\n");
+            ilog("[index] neither scanner nor stock db ready, retrying in 30s\n");
             sleep(30);
             continue;
         }

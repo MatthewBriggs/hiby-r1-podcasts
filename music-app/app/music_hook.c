@@ -1060,47 +1060,6 @@ static void fill_tri3(uint16_t *fb, int x0, int y0, int x1, int y1,
     }
 }
 
-/* The "skip ten seconds" glyph the audiobook mockup used: a ring left open
- * near the top, with an arrowhead where it breaks -- forward sweeps
- * clockwise from just before 12 o'clock, rewind counter-clockwise from just
- * after it, mirror images of each other. Screen space is y-down, so
- * increasing angle already sweeps visually clockwise; forward is therefore
- * the increasing-angle case and rewind the decreasing one, with no sign
- * flip needed beyond that. */
-static void draw_skip_arc(uint16_t *fb, int cx, int cy, int r, int forward, uint16_t c) {
-    const double gap = 0.38;                  /* radians of open space at the break */
-    const double span = 2.0 * M_PI - 2.0 * gap;
-    double a0 = -M_PI / 2 + (forward ? gap : -gap);
-    double dir = forward ? 1.0 : -1.0;
-    /* Stamped as overlapping dots along the arc, not a true stroke -- cheap,
-     * but fill_circle's integer rounding makes a radius-2 dot's outermost row
-     * vanish entirely (sqrt(4-4)+0.5 rounds to 0 width), so at the old r=2/
-     * steps=40 the dots' usable extent could fall short of their ~3.6px
-     * spacing and leave a visible notch at this screen's resolution. r=3
-     * keeps a solid band down to a single vanishing row instead of three, and
-     * steps=64 shrinks the spacing to ~2.6px -- comfortably inside that
-     * band's overlap even at the dot's worst (most-vertical) orientation. */
-    int steps = 64;
-    for (int i = 0; i <= steps; i++) {
-        double a = a0 + dir * span * i / steps;
-        int px = cx + (int)(r * cos(a) + 0.5);
-        int py = cy + (int)(r * sin(a) + 0.5);
-        fill_circle(fb, px, py, 3, c);
-    }
-    /* Arrowhead at the traveling end, its long axis along the path's
-     * tangent so it reads as continuing the sweep rather than just sitting
-     * on the ring. */
-    double aEnd = a0 + dir * span;
-    double tx = -sin(aEnd) * dir, ty = cos(aEnd) * dir;   /* unit tangent */
-    double nx = -ty, ny = tx;                             /* unit normal */
-    int hx = cx + (int)(r * cos(aEnd) + 0.5);
-    int hy = cy + (int)(r * sin(aEnd) + 0.5);
-    int ax = hx + (int)(9 * tx), ay = hy + (int)(9 * ty);
-    int bx = hx - (int)(3 * tx) + (int)(6 * nx), by = hy - (int)(3 * ty) + (int)(6 * ny);
-    int cx2 = hx - (int)(3 * tx) - (int)(6 * nx), cy2 = hy - (int)(3 * ty) - (int)(6 * ny);
-    fill_tri3(fb, ax, ay, bx, by, cx2, cy2, c);
-}
-
 static void draw_text(uint16_t *fb, int x, int y, const char *s,
                       uint16_t c, int px, int right_edge) {
     text_draw(fb, FB_W, FB_H, 0, x, y, s, c, px, right_edge ? right_edge : FB_W);
@@ -1631,7 +1590,7 @@ static int settings_content_rows(void) {
  * pushed by hand, not by CI against a tagged commit), so this stays a
  * literal that a human edits; the discipline is remembering to, not the
  * mechanism. */
-#define LIBRARY_VERSION "0.42"
+#define LIBRARY_VERSION "0.43"
 
 /* A custom-built kernel keeps uname()'s own release string exactly
  * "4.4.94+" on purpose -- that string is also the vermagic every one of the
@@ -4188,9 +4147,11 @@ static void draw_screen(uint16_t *fb) {
             int mid = FB_W / 2;
 
             /* -10s / +10s, not the regular player's prev/next glyphs: a
-             * curved skip-arrow with the number inside, the way the design
-             * mockup drew it -- a seek amount isn't inferable from a plain
-             * triangle, and this is what it actually agreed to. */
+             * curved skip-arrow icon with the number inside -- a seek
+             * amount isn't inferable from a plain triangle. Vendored Font
+             * Awesome arrow-rotate icons (icon_skip_back/_forward,
+             * icons_data.h), replacing this app's own hand-drawn
+             * arc approximation on explicit request. */
             {
                 /* Closer to the play button than the regular player's
                  * prev/next (128) sat -- pulled in so the row reads as one
@@ -4198,13 +4159,15 @@ static void draw_screen(uint16_t *fb) {
                  * the edges with a gap to it. The input handler's hit test
                  * uses this same 96 for its speed-ring position; keep them
                  * in sync if this moves again. */
-                int ring_r = 26, off = 96;
-                draw_skip_arc(fb, mid - off, cyy, ring_r, 0, COL_TEXT);
-                draw_skip_arc(fb, mid + off, cyy, ring_r, 1, COL_TEXT);
-                const char *n = "10";
-                int nw = text_width(n, TEXT_PX_BODY);
-                draw_text(fb, mid - off - nw / 2, cyy - TEXT_PX_BODY / 2 + 2, n, COL_TEXT, TEXT_PX_BODY, FB_W);
-                draw_text(fb, mid + off - nw / 2, cyy - TEXT_PX_BODY / 2 + 2, n, COL_TEXT, TEXT_PX_BODY, FB_W);
+                int off = 96;
+                draw_icon(fb, FB_W, FB_H, mid - off - icon_skip_back.w / 2,
+                         cyy - icon_skip_back.h / 2, &icon_skip_back, COL_TEXT);
+                draw_icon(fb, FB_W, FB_H, mid + off - icon_skip_forward.w / 2,
+                         cyy - icon_skip_forward.h / 2, &icon_skip_forward, COL_TEXT);
+                const char *n = "10s";
+                int nw = text_width(n, TEXT_PX_SMALL);
+                draw_text(fb, mid - off - nw / 2, cyy - TEXT_PX_SMALL / 2 + 2, n, COL_TEXT, TEXT_PX_SMALL, FB_W);
+                draw_text(fb, mid + off - nw / 2, cyy - TEXT_PX_SMALL / 2 + 2, n, COL_TEXT, TEXT_PX_SMALL, FB_W);
             }
 
             fill_circle(fb, mid, cyy, 42, COL_ACCENT);
@@ -4372,11 +4335,14 @@ static void draw_screen(uint16_t *fb) {
         int mid = FB_W / 2;
 
         if (podcast_mode) {
-            /* BG47 (revised): just two skip arcs -- -10s left of play/pause,
-             * +30s right of it, per explicit correction away from the
-             * original symmetric +/-10/+/-30 four-button set. Drawn in this
-             * app's own arc style (draw_skip_arc(), already used by the
-             * audiobook screen's +/-10s). Speed control is unchanged from
+            /* BG47 (revised): just two skip buttons -- -10s left of
+             * play/pause, +30s right of it, per explicit correction away
+             * from the original symmetric +/-10/+/-30 four-button set.
+             * Vendored Font Awesome arrow-rotate icons (icon_skip_back/
+             * _forward, icons_data.h), same pair the audiobook screen's
+             * +/-10s uses -- replaced this app's own hand-drawn arc
+             * approximation (draw_skip_arc(), removed) on explicit request.
+             * Speed control is unchanged from
              * before: ported from that same audiobook screen's concentric-
              * ring control and cycling behaviour, backed by its own
              * pod_speed_permille rather than ab_speed_permille -- separate
@@ -4384,12 +4350,14 @@ static void draw_screen(uint16_t *fb) {
              * with a book's. POD_SKIP_OFF is shared with the tap handler
              * below so the two cannot drift apart -- same reasoning as
              * bar_y(). */
-            draw_skip_arc(fb, mid - POD_SKIP_OFF, cyy, 26, 0, COL_TEXT);
-            draw_skip_arc(fb, mid + POD_SKIP_OFF, cyy, 26, 1, COL_TEXT);
-            const char *n10 = "10", *n30 = "30";
-            int w10 = text_width(n10, TEXT_PX_BODY), w30 = text_width(n30, TEXT_PX_BODY);
-            draw_text(fb, mid - POD_SKIP_OFF - w10 / 2, cyy - TEXT_PX_BODY / 2 + 2, n10, COL_TEXT, TEXT_PX_BODY, FB_W);
-            draw_text(fb, mid + POD_SKIP_OFF - w30 / 2, cyy - TEXT_PX_BODY / 2 + 2, n30, COL_TEXT, TEXT_PX_BODY, FB_W);
+            draw_icon(fb, FB_W, FB_H, mid - POD_SKIP_OFF - icon_skip_back.w / 2,
+                     cyy - icon_skip_back.h / 2, &icon_skip_back, COL_TEXT);
+            draw_icon(fb, FB_W, FB_H, mid + POD_SKIP_OFF - icon_skip_forward.w / 2,
+                     cyy - icon_skip_forward.h / 2, &icon_skip_forward, COL_TEXT);
+            const char *n10 = "10s", *n30 = "30s";
+            int w10 = text_width(n10, TEXT_PX_SMALL), w30 = text_width(n30, TEXT_PX_SMALL);
+            draw_text(fb, mid - POD_SKIP_OFF - w10 / 2, cyy - TEXT_PX_SMALL / 2 + 2, n10, COL_TEXT, TEXT_PX_SMALL, FB_W);
+            draw_text(fb, mid + POD_SKIP_OFF - w30 / 2, cyy - TEXT_PX_SMALL / 2 + 2, n30, COL_TEXT, TEXT_PX_SMALL, FB_W);
 
             int scx = pod_speed_x(mid), scy = cyy;
             fill_circle(fb, scx, scy, 22, COL_LINE);
