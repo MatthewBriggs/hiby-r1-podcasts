@@ -9,6 +9,27 @@
 # modern podcast host rejects the handshake. A static curl and a CA bundle live
 # alongside this script.
 
+# BG-lockup: reported live as a full system lockup (not just this script
+# dying) requiring a hard power-cycle to recover -- no crash log survived it
+# (this device has no persistent crash storage), so the exact trigger inside
+# this run isn't pinned down. What is known: this device has ~36 MB RAM and
+# no swap, and this script's own per-episode sanitize() forks two sed and a
+# cut per call, run once per manifest entry (up to MANIFEST_EPISODES=200)
+# for every feed -- thousands of fork/execs in one run, on a single core,
+# against a tight memory ceiling. Whatever the actual culprit turns out to
+# be, a hard virtual-memory ceiling on this whole process tree is a direct
+# safety net against the failure mode actually observed (something here
+# consuming enough memory to take the whole system down) regardless of
+# which specific step it was: a process that hits the cap fails cleanly
+# (ENOMEM, this script logs it and moves on) instead of dragging the kernel
+# into unrecoverable reclaim/thrash. 24 MB is generous headroom above what
+# curl (streams straight to disk, doesn't buffer the download) or awk
+# (bounded by parse_rss.awk's own max= cap) should ever legitimately need --
+# inherited by every child this script forks. Kept intentionally
+# conservative; revisit once the real trigger is actually reproduced with a
+# live memory trace, not tightened further blind.
+ulimit -v 24576 2>/dev/null
+
 BASE=/data/mnt/sd_0/.podsync
 FEEDS="$BASE/feeds.txt"
 CURL="$BASE/curl"
