@@ -588,20 +588,7 @@ static void art_request(const char *track, const char *artist, const char *album
      * would leave the new name starting halfway along. Called from every path
      * that changes what is playing, chapters included. */
     title_reset();
-    /* Detached, not joined -- see artist_art_request()'s own comment for the
-     * full reasoning (that fix predates this one). The "rarely costs
-     * anything, most covers resolve from a local file in milliseconds"
-     * assumption this join used to rest on only holds for an album that
-     * actually has local art: one that doesn't falls through to the same
-     * multi-second Last.fm/Spotify network round trip artist_art_request's
-     * bio fetch does, and joining that before a track skip could start
-     * loading the *new* track's art blocked the whole UI thread for
-     * however long the old fetch had left. Safe to detach: the strcmp()
-     * staleness check already in art_worker() discards a stale result
-     * regardless of finish order, since it compares against the shared
-     * art_want under the lock, not against thread identity or timing --
-     * nothing here actually depended on the join for correctness. */
-    if (art_thread_valid) { pthread_detach(art_thread); art_thread_valid = 0; }
+if (art_thread_valid) { pthread_join(art_thread, NULL); art_thread_valid = 0; }
     pthread_mutex_lock(&art_lock);
     free(art_bits);
     art_bits = NULL;
@@ -710,12 +697,7 @@ static void *view_art_worker(void *arg) {
 }
 
 static void view_art_request(const char *track, const char *artist, const char *album) {
-    /* Detached, not joined -- same reasoning as art_request()'s own comment
-     * (and the artist_art_request() fix this and art_request() both follow):
-     * an album with no local art falls through to the same multi-second
-     * network fallback, and browsing from one such album straight to
-     * another used to block the UI thread on the first one's fetch. */
-    if (view_art_thread_valid) { pthread_detach(view_art_thread); view_art_thread_valid = 0; }
+if (view_art_thread_valid) { pthread_join(view_art_thread, NULL); view_art_thread_valid = 0; }
     pthread_mutex_lock(&view_art_lock);
     free(view_art_bits);
     view_art_bits = NULL;
