@@ -488,7 +488,14 @@ static int   update_died_flag;
 
 void pod_update_start(void) {
     if (update_running_flag) return;
-    pod_sync_feeds_from_settings();
+    /* Reported live: crashed the app repeatedly (crash-counted supervisor
+     * forced a reboot) right after this was added and the user tried
+     * Update feeds. Reverted the call immediately rather than debug it
+     * live with the user locked out -- root cause not yet found, the
+     * function itself read clean on review. Left in place, unused, so the
+     * fix (whatever it turns out to be) doesn't have to be rewritten from
+     * scratch. DO NOT re-enable this call until the actual crash is
+     * reproduced and understood. */
     unlink(SYNC_LOG);
     pid_t pid = fork();
     if (pid == 0) {

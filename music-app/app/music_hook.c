@@ -520,7 +520,7 @@ static void *art_worker(void *arg) {
      * named .jpg simply fails. Any of those used to mean a blank panel even
      * when the track had good embedded art a few candidates further down. */
     for (int n = 0; !bits; n++) {
-        int rc = art_candidate(track, n, jpg, sizeof(jpg), key, sizeof(key));
+        int rc = art_candidate(track, n, jpg, sizeof(jpg), key, sizeof(key), ART_SCRATCH);
         if (rc == -1) break;
         if (rc == ART_SKIP) continue;
         bits = cover_load(jpg, key, ART_PX);
@@ -674,7 +674,7 @@ static void *view_art_worker(void *arg) {
     char jpg[512], key[512];
     uint16_t *bits = NULL;
     for (int n = 0; !bits; n++) {
-        int rc = art_candidate(track, n, jpg, sizeof(jpg), key, sizeof(key));
+        int rc = art_candidate(track, n, jpg, sizeof(jpg), key, sizeof(key), ART_SCRATCH);
         if (rc == -1) break;
         if (rc == ART_SKIP) continue;
         bits = cover_load(jpg, key, ART_PX);

@@ -49,8 +49,8 @@
 
 /* Extracted art is a means to an end: it is decoded immediately and only the
  * scaled bitmap is kept. Writing it to tmpfs rather than storage keeps a
- * 1.5 MB spill per album out of the filesystem entirely. */
-#define ART_SCRATCH "/tmp/.music_art.jpg"
+ * 1.5 MB spill per album out of the filesystem entirely. ART_SCRATCH itself
+ * now lives in art.h (art_candidate()'s own comment explains why). */
 #define MAX_PIC (4 * 1024 * 1024)   /* refuse absurd embedded art outright */
 
 static int file_exists(const char *p) {
@@ -284,7 +284,7 @@ static int folder_art(const char *dir, char out[][ART_NAME_LEN], int max) {
  * the folder fallback was ever tried, and folding it into slot 1 instead
  * would offer the first folder image twice. */
 int art_candidate(const char *track_path, int n, char *out, size_t out_n,
-                  char *key, size_t key_n) {
+                  char *key, size_t key_n, const char *scratch) {
     char dir[512];
     album_dir(track_path, dir, sizeof(dir));
     snprintf(key, key_n, "%s", dir);
@@ -292,12 +292,12 @@ int art_candidate(const char *track_path, int n, char *out, size_t out_n,
     if (n == 0) {
         FILE *f = fopen(track_path, "rb");
         if (!f) return ART_SKIP;
-        int rc = flac_picture(f, ART_SCRATCH);
-        if (rc != 0) { rewind(f); rc = id3_apic(f, ART_SCRATCH); }
-        if (rc != 0) { rewind(f); rc = mp4_cover(f, ART_SCRATCH); }
+        int rc = flac_picture(f, scratch);
+        if (rc != 0) { rewind(f); rc = id3_apic(f, scratch); }
+        if (rc != 0) { rewind(f); rc = mp4_cover(f, scratch); }
         fclose(f);
         if (rc != 0) return ART_SKIP;
-        snprintf(out, out_n, "%s", ART_SCRATCH);
+        snprintf(out, out_n, "%s", scratch);
         /* BG46: keyed by the file, not the folder -- nothing guarantees
          * every track/episode sharing a folder embeds the same picture
          * (a podcast feed's episodes routinely don't; some classical
