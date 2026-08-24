@@ -382,7 +382,16 @@ done
 
 while true; do
     if [ -x "$BINARY" ]; then
-        "$BINARY" &
+        # RP8: this SoC is single-core, so scheduling contention against the
+        # still-resident bluealsa/bluetoothd/dbus-daemon(x2)/sys_server is a
+        # more plausible stutter cause than anything RAM-related turned out
+        # to be (see BACKLOG.md's RP8) -- there is no second core for the UI
+        # to hide behind. A one-line nice bump costs nothing to try and
+        # directly targets that: -5 is a real edge over the others' default
+        # 0 without going so negative it starves them outright (none of them
+        # need to run often, but bluetoothd/dbus still need to be schedulable
+        # at all for pairing/connection events to work).
+        nice -n -5 "$BINARY" &
     else
         sleep 5 &   # nothing to run; still counts as a fast "crash" below
     fi

@@ -149,6 +149,10 @@ static int ensure_read_db(void) {
         return -1;
     }
     sqlite3_busy_timeout(g_read_db, 200);
+    /* Same reasoning as library.c's lib_db_mmap(): small file, comfortable
+     * RAM headroom, mmap avoids a read()+copy per page on top of whatever
+     * the OS page cache is already doing. */
+    sqlite3_exec(g_read_db, "pragma mmap_size = 33554432", NULL, NULL, NULL);
     return 0;
 }
 

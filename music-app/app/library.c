@@ -62,12 +62,27 @@ static int has_rows(sqlite3 *db) {
     return n > 0;
 }
 
+/* Every DB this app queries is small (a few MB even for a large library) --
+ * comfortably inside the RAM headroom RP8 measured (tens of MB free). A
+ * plain read() through SQLite's pager still costs a syscall and a copy per
+ * page even once the page cache is hot; mmap hands SQLite a pointer straight
+ * into the kernel's already-cached pages instead, which matters most for the
+ * random-access pattern list scrolling and A-Z jumps produce. Cheaper and
+ * safer than a manual ":memory:" copy: no second RSS-resident copy, no
+ * write-back-on-exit path to get wrong (this handle is read-only regardless).
+ * Sized generously above any DB this app has produced so far -- SQLite clamps
+ * to the file's real size, so an oversized request just means "map whatever
+ * is there," not an over-allocation. */
+static void lib_db_mmap(sqlite3 *db) {
+    sqlite3_exec(db, "pragma mmap_size = 33554432", NULL, NULL, NULL);
+}
+
 int lib_open(void) {
     if (g_db) return 0;
     /* nomutex: only the UI thread touches this handle. */
     int rc = sqlite3_open_v2(SCANNER_DB_PATH, &g_db,
                              SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, NULL);
-    if (rc == SQLITE_OK && has_rows(g_db)) return 0;
+    if (rc == SQLITE_OK && has_rows(g_db)) { lib_db_mmap(g_db); return 0; }
     if (g_db) { sqlite3_close(g_db); g_db = NULL; }
 
     rc = sqlite3_open_v2(DB_PATH, &g_db,
@@ -76,6 +91,7 @@ int lib_open(void) {
         if (g_db) { sqlite3_close(g_db); g_db = NULL; }
         return -1;
     }
+    lib_db_mmap(g_db);
     return 0;
 }
 
