@@ -588,7 +588,20 @@ static void art_request(const char *track, const char *artist, const char *album
      * would leave the new name starting halfway along. Called from every path
      * that changes what is playing, chapters included. */
     title_reset();
-    if (art_thread_valid) { pthread_join(art_thread, NULL); art_thread_valid = 0; }
+    /* Detached, not joined -- see artist_art_request()'s own comment for the
+     * full reasoning (that fix predates this one). The "rarely costs
+     * anything, most covers resolve from a local file in milliseconds"
+     * assumption this join used to rest on only holds for an album that
+     * actually has local art: one that doesn't falls through to the same
+     * multi-second Last.fm/Spotify network round trip artist_art_request's
+     * bio fetch does, and joining that before a track skip could start
+     * loading the *new* track's art blocked the whole UI thread for
+     * however long the old fetch had left. Safe to detach: the strcmp()
+     * staleness check already in art_worker() discards a stale result
+     * regardless of finish order, since it compares against the shared
+     * art_want under the lock, not against thread identity or timing --
+     * nothing here actually depended on the join for correctness. */
+    if (art_thread_valid) { pthread_detach(art_thread); art_thread_valid = 0; }
     pthread_mutex_lock(&art_lock);
     free(art_bits);
     art_bits = NULL;
@@ -618,12 +631,35 @@ static char      view_art_want_album[LIB_NAME_LEN];
 static pthread_t view_art_thread;
 static int       view_art_thread_valid;
 static int       view_art_seq_v;
+/* R63: set once view_art_worker() has exhausted every candidate (local, and
+ * network if it got that far) for the *current* request -- lets the album
+ * page tell "nothing to show yet, still working" apart from "confirmed,
+ * nothing is ever coming for this album", so it can stop reserving ART_PX
+ * of blank cover space above the tracklist once the second one is actually
+ * known, rather than leaving it there forever. With no network to fall back
+ * to, the worker resolves this almost immediately (the local candidate scan
+ * is a handful of stat()s plus at most one decode); with a network it waits
+ * for the real fetch, same as the cover itself would. Reset by
+ * view_art_request() at the start of every new request; only the worker
+ * whose track still matches view_art_want at the end may set it -- same
+ * staleness rule view_art_bits itself already follows, so a late-finishing
+ * stale worker can't mark a newer, still-in-flight request "done". */
+static int       view_art_done;
 
 static int view_art_seq(void) {
     pthread_mutex_lock(&view_art_lock);
     int v = view_art_seq_v;
     pthread_mutex_unlock(&view_art_lock);
     return v;
+}
+
+/* True once view_art_done is set and no bitmap turned up: confirmed nothing
+ * is coming for the album currently on screen, not merely nothing yet. */
+static int view_art_gone(void) {
+    pthread_mutex_lock(&view_art_lock);
+    int gone = view_art_done && !view_art_bits;
+    pthread_mutex_unlock(&view_art_lock);
+    return gone;
 }
 
 static void *view_art_worker(void *arg) {
@@ -668,17 +704,23 @@ static void *view_art_worker(void *arg) {
 
     pthread_mutex_lock(&view_art_lock);
     if (strcmp(track, view_art_want) != 0) { free(bits); }
-    else { free(view_art_bits); view_art_bits = bits; view_art_seq_v++; }
+    else { free(view_art_bits); view_art_bits = bits; view_art_seq_v++; view_art_done = 1; }
     pthread_mutex_unlock(&view_art_lock);
     return NULL;
 }
 
 static void view_art_request(const char *track, const char *artist, const char *album) {
-    if (view_art_thread_valid) { pthread_join(view_art_thread, NULL); view_art_thread_valid = 0; }
+    /* Detached, not joined -- same reasoning as art_request()'s own comment
+     * (and the artist_art_request() fix this and art_request() both follow):
+     * an album with no local art falls through to the same multi-second
+     * network fallback, and browsing from one such album straight to
+     * another used to block the UI thread on the first one's fetch. */
+    if (view_art_thread_valid) { pthread_detach(view_art_thread); view_art_thread_valid = 0; }
     pthread_mutex_lock(&view_art_lock);
     free(view_art_bits);
     view_art_bits = NULL;
     view_art_seq_v++;
+    view_art_done = 0;
     snprintf(view_art_want, sizeof(view_art_want), "%s", track);
     snprintf(view_art_want_artist, sizeof(view_art_want_artist), "%s", artist ? artist : "");
     snprintf(view_art_want_album, sizeof(view_art_want_album), "%s", album ? album : "");
@@ -1319,7 +1361,17 @@ static int title_y(void) { return ART_PX + 20; }
  * Now Playing already uses for its own title/artist block (title_y()+44,
  * +82), so the two screens read consistently even though this one scrolls
  * and Now Playing doesn't. */
-static int tracks_hdr_title_y(void)  { return ART_PX + 20; }
+/* R63: once view_art_gone() confirms no cover is ever coming for this album
+ * (no local file, and either no network to try Last.fm/Spotify with or the
+ * fetch already came back empty), reserving ART_PX (a full screen width) of
+ * blank COL_ROW box above the title was just dead space the user had to
+ * scroll past to reach the tracklist -- collapse to a small top margin
+ * instead, the same 24px left/top rhythm the rest of this screen already
+ * uses. Every other measurement in this header (artist_y, info_y, hdr_h,
+ * tracks_max_px()'s scroll bound, the cover draw itself below) derives from
+ * this one function, so nothing else needs its own check. */
+#define NO_ART_TOP_PAD 24
+static int tracks_hdr_title_y(void)  { return view_art_gone() ? NO_ART_TOP_PAD : ART_PX + 20; }
 static int tracks_hdr_artist_y(void) { return tracks_hdr_title_y() + 44; }
 static int tracks_hdr_info_y(void)   { return tracks_hdr_artist_y() + 38; }
 static int tracks_hdr_h(void)        { return tracks_hdr_info_y() + 40; }
@@ -4548,9 +4600,16 @@ static void draw_screen(uint16_t *fb) {
         int off = scroll * ROW_H + scroll_px;
         int header_h = tracks_hdr_h();
 
-        int cover_y = 0 - off;
-        fill_rect_clip(fb, 0, cover_y, ART_PX, ART_PX, COL_ROW, 0, clip_bot);
-        view_blit_art_clip(fb, 0, cover_y, 0, clip_bot);
+        /* R63: skip the cover box entirely once view_art_gone() has confirmed
+         * there's nothing to show -- tracks_hdr_title_y() (and everything
+         * derived from it) has already collapsed the reserved space to
+         * match, so drawing an ART_PX COL_ROW placeholder here would just
+         * paint a big blank square nothing above it left room to explain. */
+        if (!view_art_gone()) {
+            int cover_y = 0 - off;
+            fill_rect_clip(fb, 0, cover_y, ART_PX, ART_PX, COL_ROW, 0, clip_bot);
+            view_blit_art_clip(fb, 0, cover_y, 0, clip_bot);
+        }
 
         draw_text_clip(fb, 24, tracks_hdr_title_y() - off, cur_album,
                        COL_TEXT, TEXT_PX_TITLE, FB_W - 24, 0, clip_bot);
