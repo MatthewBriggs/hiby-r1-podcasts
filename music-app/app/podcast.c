@@ -534,6 +534,26 @@ int pod_update_tail(char out[][POD_NAME_LEN], int max_lines) {
     return n;
 }
 
+/* Whether the run wrote its own completion marker. The caller's poll loop
+ * normally consumes "__DONE__" itself (pod_update_tail() clears the running
+ * flag on it), but that depends on a poll landing between the marker being
+ * written and the process exiting -- microseconds apart. Checked here too so
+ * "did it finish?" is answered by what the script actually recorded rather
+ * than by which of the two won a race. */
+static int sync_log_has_done(void) {
+    FILE *f = fopen(SYNC_LOG, "r");
+    if (!f) return 0;
+    char line[256];
+    int done = 0;
+    while (fgets(line, sizeof(line), f)) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+        if (strcmp(line, "__DONE__") == 0) { done = 1; break; }
+    }
+    fclose(f);
+    return done;
+}
+
 void pod_update_reap(void) {
     if (update_pid <= 0) return;
     int status;
@@ -541,7 +561,11 @@ void pod_update_reap(void) {
     update_pid = -1;
     if (update_running_flag) {
         update_running_flag = 0;
-        update_died_flag = 1;
+        /* Only a run that ended *without* its completion marker actually
+         * stopped early -- see sync_log_has_done(). Reporting death purely
+         * on "the child is gone" turned every normal finish into a red
+         * "Sync stopped early." */
+        if (!sync_log_has_done()) update_died_flag = 1;
     }
 }
 

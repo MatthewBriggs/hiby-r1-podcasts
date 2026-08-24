@@ -8271,7 +8271,19 @@ int music_entry(void *a0, void *a1) {
             pod_rebuild_tracks();
             dirty = 1;
         }
-        pod_update_reap();
+        /* Read the log BEFORE reaping, not after. podsync_once.sh writes its
+         * final "__DONE__" line and then exits microseconds later, while this
+         * loop only polls every ~33ms -- so reaping first meant waitpid()
+         * almost always saw the child gone while update_running_flag was
+         * still set, which pod_update_reap() reports as "died". Worse, it
+         * clears the running flag on the way out, so the pod_update_tail()
+         * below (gated on exactly that flag) never ran again and the
+         * "__DONE__" that says otherwise was never read at all. The result
+         * was a red "Sync stopped early." after essentially every
+         * *successful* sync. Reading first means a completed run has always
+         * consumed its own "__DONE__" (and cleared the flag itself) by the
+         * time reap looks, leaving reap to flag only a genuine early exit --
+         * one that ended without ever writing that line. */
         if (pod_update_running()) {
             pod_sync_log_n = pod_update_tail(pod_sync_log, POD_SYNC_LOG_N);
             if (!pod_update_running() && (screen == SC_PODCASTS || screen == SC_POD_SYNC)) {
@@ -8284,6 +8296,7 @@ int music_entry(void *a0, void *a1) {
             }
             dirty = 1;
         }
+        pod_update_reap();
 
         /* Pulling the headphones out should not carry on broadcasting to the
          * room. Only for the wired route — unplugging the jack says nothing
