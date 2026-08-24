@@ -1631,7 +1631,7 @@ static int settings_content_rows(void) {
  * pushed by hand, not by CI against a tagged commit), so this stays a
  * literal that a human edits; the discipline is remembering to, not the
  * mechanism. */
-#define LIBRARY_VERSION "0.41"
+#define LIBRARY_VERSION "0.42"
 
 /* A custom-built kernel keeps uname()'s own release string exactly
  * "4.4.94+" on purpose -- that string is also the vermagic every one of the
@@ -7735,13 +7735,26 @@ int music_entry(void *a0, void *a1) {
                 int ry_wifi = set_row_wifi_y() - off, ry_bt = set_row_bt_y() - off;
                 int ry_usb = set_row_usb_y() - off;
                 int ry_scan = set_row_scan_y() - off;
-                if (y >= ry_lock && y < ry_lock + ROW_H) {
+                /* RBR: these first three rows are taller than ROW_H -- each
+                 * carries a two-line description underneath the label (see
+                 * the draw side's own lock_h/usbbypass_h/autooff_h), and
+                 * their toggle switches/values are centred within that
+                 * *taller* block, not within a plain ROW_H slot. Hit-testing
+                 * against plain ROW_H here left the switch itself (drawn
+                 * lower, since there's more row to center within) outside
+                 * its own tap zone -- reported live as "tapping the toggle
+                 * is ignored, only the label works" (the label sits higher,
+                 * at ry+20, still inside the shorter ROW_H-based zone). */
+                int lock_h = set_row_usbbypass_y() - set_row_lock_y();
+                int usbbypass_h = set_row_autooff_y() - set_row_usbbypass_y();
+                int autooff_h = set_row_lighttheme_y() - set_row_autooff_y();
+                if (y >= ry_lock && y < ry_lock + lock_h) {
                     button_lock_enabled = !button_lock_enabled;
                     save_conf();
-                } else if (y >= ry_usbbypass && y < ry_usbbypass + ROW_H) {
+                } else if (y >= ry_usbbypass && y < ry_usbbypass + usbbypass_h) {
                     usb_bypass_enabled = !usb_bypass_enabled;
                     save_conf();
-                } else if (y >= ry_autooff && y < ry_autooff + ROW_H) {
+                } else if (y >= ry_autooff && y < ry_autooff + autooff_h) {
                     /* Cycles rather than opening a picker: six short values,
                      * and a whole screen for them would be more chrome than
                      * the choice is worth. */
