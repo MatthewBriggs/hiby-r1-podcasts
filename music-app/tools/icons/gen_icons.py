@@ -29,7 +29,7 @@ from PIL import Image
 # exists to prevent. Singletons (bt/usb/wifi) are families of one.
 SPECS = [
     ("bt",   "bluetooth-brands-solid-full.svg.png", "bt",   [(26, 38, "_qs"), (16, 16, "_sm")]),
-    ("usb",  "usb-brands-solid-full.svg.png",       "usb",  [(16, 16, "_sm"), (26, 26, "_qs")]),
+    ("usb",  "usb-brands-solid-full.svg.png",       "usb",  [(16, 16, "_sm"), (32, 32, "_qs")]),
     ("wifi", "wifi-solid-full.svg.png",             "wifi", [(48, 34, "_qs")]),
     ("gear", "gear-solid-full.svg.png",             "gear", [(20, 20, "_qs")]),
     ("disc", "compact-disc-solid-full.svg.png",     "disc", [(28, 28, "")]),

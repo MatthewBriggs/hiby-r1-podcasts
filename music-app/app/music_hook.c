@@ -126,6 +126,22 @@ static int theme_mode;
  * declared here so apply_theme() can call it regardless of definition
  * order. */
 static int is_daytime(void);
+/* RP1 follow-up: defined near music_init() below, forward declared here so
+ * go_back() and the header tap handler can both read g_is_standalone
+ * regardless of definition order. See g_is_standalone's own comment. */
+static int is_hiby_player(void);
+/* Set once, at the top of music_entry(), from is_hiby_player() -- true in
+ * the LD_PRELOAD-hooked build (running inside hiby_player's own process),
+ * false in the standalone build (library_standalone, its own process, no
+ * launcher underneath). Backing out of Main Menu means something different
+ * in each: hooked, it hands control back to hiby_player's own launcher
+ * (go_back() returning 0, same as always); standalone, there is no launcher
+ * to hand back to, and go_back() returning 0 there just made
+ * standalone_main.c's own re-entry loop restart the whole app -- which
+ * looked exactly like a crash-restart from the outside, reported live as
+ * one. Main Menu is the true root in standalone; nowhere left to go from
+ * there is nowhere left to go, not a boundary to bounce off. */
+static int g_is_standalone;
 static void apply_theme(void) {
     /* R45: Auto isn't its own palette -- it picks Light or Dark by time of
      * day and applies that one, same as if the user had picked it directly.
@@ -1615,7 +1631,7 @@ static int settings_content_rows(void) {
  * pushed by hand, not by CI against a tagged commit), so this stays a
  * literal that a human edits; the discipline is remembering to, not the
  * mechanism. */
-#define LIBRARY_VERSION "0.4"
+#define LIBRARY_VERSION "0.41"
 
 /* A custom-built kernel keeps uname()'s own release string exactly
  * "4.4.94+" on purpose -- that string is also the vermagic every one of the
@@ -3859,7 +3875,13 @@ static void draw_screen(uint16_t *fb) {
     }
 
     const char *title = "Main Menu";
-    const char *right = "EXIT";
+    /* R?? follow-up: Main Menu had no "back" to offer even in the hooked
+     * build (go_back() here just hands control to hiby_player's launcher,
+     * which the edge swipe already does identically), and in standalone it
+     * did nothing but restart the app -- see g_is_standalone's own comment.
+     * A button that either duplicates the swipe or does nothing isn't worth
+     * the screen space in either build. */
+    const char *right = "";
     if (screen == SC_ARTISTS) { title = cur_facet_label; right = "BACK"; }
     else if (screen == SC_ALBUMS)  {
         title = recent_mode == RECENT_ADDED ? "Recently added"
@@ -5388,7 +5410,17 @@ static void draw_screen(uint16_t *fb) {
 /* 1 = tap at (ox,oy); 2 = vertical drag, oy carries the distance. A drag has to
  * be distinguished from a tap or every scroll also opens whatever was under the
  * finger. */
-#define DRAG_MIN 18
+/* RBR: bumped 18 -> 24. Reported live as "the capture area for a tap is too
+ * small" on Settings specifically -- extensive live testing (precise
+ * synthetic taps at exact row boundaries, every Settings sub-screen) never
+ * reproduced an actual hitbox/draw-geometry mismatch; every row's tap zone
+ * matched what was drawn exactly. Left as a best-effort widening of the
+ * plain threshold rather than a confirmed root-cause fix: Settings rows
+ * carry more text than most lists (title + description), so a tap aimed at
+ * a specific line rather than dead-center of the row is more likely to
+ * carry a few extra pixels of aim/tremor than this app's list screens
+ * generally see. */
+#define DRAG_MIN 24
 /* A fixed 18px threshold, checked continuously from the moment of touch-down,
  * misclassifies both directions: a fast, decisive tap with a little finger
  * tremor easily exceeds 18px and reads as a scroll, while a slow, deliberate
@@ -5587,7 +5619,10 @@ static int go_back(void) {
     pod_save_current_pos();
     switch (screen) {
         case SC_MENU:
-            return 0;
+            /* Standalone: nowhere to go -- see g_is_standalone's own
+             * comment. Swallow the gesture (return 1, "did something")
+             * rather than let the caller treat 0 as "leave the app". */
+            return g_is_standalone ? 1 : 0;
         case SC_PLAYING:
             if (radio_mode) { screen = SC_RADIO; reset_scroll(); break; }
             /* BG73 follow-up: reported live -- once Play Next has spliced in
@@ -6133,7 +6168,7 @@ static void draw_quick_settings(uint16_t *fb) {
      * two rows are switches. */
     int byu = qs_usb_y();
     int usb_mode = st_usb_mode();
-    draw_usb_icon(fb, 34, byu + 10, COL_DIM);
+    draw_usb_icon(fb, 34, byu + 7, COL_DIM);
     draw_text(fb, QS_LABEL_X, byu + 6, "USB working mode", COL_TEXT, TEXT_PX_SMALL, 260);
     draw_text(fb, QS_LABEL_X, byu + 32,
               usb_mode == 0 ? "ADB" : usb_mode == 1 ? "USB Storage" : "unplugged",
@@ -6987,6 +7022,7 @@ static void scan_inputs(void) {
  * change for that build to coexist with the normal LD_PRELOAD one. */
 int music_entry(void *a0, void *a1) {
     (void)a0; (void)a1;
+    g_is_standalone = !is_hiby_player();
     mlog("[music] entering app\n");
     load_conf();
     screen = SC_MENU; reset_scroll();
@@ -7556,7 +7592,7 @@ int music_entry(void *a0, void *a1) {
                         if (!q_is_playlist) queue_mixed = 1;
                         queue_follower();
                     }
-                } else if (x > FB_W - 120) go_back();
+                } else if (screen != SC_MENU && x > FB_W - 120) go_back();
             } else if (index_visible() && x >= FB_W - INDEX_TOUCH_W && y >= CONTENT_Y &&
                        y < index_bottom()) {
                 index_jump(y);
