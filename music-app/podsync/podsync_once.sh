@@ -145,7 +145,24 @@ adopt_existing() {
 # fail fast) and the original generous one kept only for the actual
 # episode download, which legitimately needs the room.
 get() { "$CURL" -fsSL --cacert "$CA" --connect-timeout 10 --max-time 30 -o "$2" "$1" 2>>"$LOG"; }
-get_episode() { "$CURL" -fsSL --cacert "$CA" --connect-timeout 20 --max-time 900 -o "$2" "$1" 2>>"$LOG"; }
+# BG-lockup: two full-system hard lockups reported live, each leaving an
+# abandoned .part file mid-episode-download -- but on two different feeds
+# (The Incomparable Mothership, Språket) on two different runs, ruling out
+# one poisoned file. Memory stayed flat and healthy in the seconds leading
+# into both (see ulimit's own comment above this function, added first and
+# not the actual fix) and nothing was ever logged before the reset -- the
+# signature of the hardware watchdog forcing an instant reset because the
+# kernel hung, not a graceful panic. Consistent with what index.c/scanner.c
+# already document about this device's exFAT driver mishandling concurrent
+# access. No serial console or crash-dump storage on this device to actually
+# prove which driver, so this is a mitigation aimed at what's actually
+# controllable from here -- change the I/O pattern rather than confirm the
+# exact kernel bug: --limit-rate paces the write instead of bursting network
+# data at the card as fast as it arrives, which is the one variable most
+# likely to matter for a locking/timing-shaped driver bug. Conservative
+# (2 MB/s -- a 45 MB episode still finishes in under 25s), not tuned against
+# a reproduction, since there isn't a reliable one yet.
+get_episode() { "$CURL" -fsSL --cacert "$CA" --connect-timeout 20 --max-time 900 --limit-rate 2M -o "$2" "$1" 2>>"$LOG"; }
 
 total_new=0
 
@@ -248,6 +265,14 @@ while read -r url; do
             # Download order is the reverse of publication order, so mtime would
             # otherwise put the newest episode last.
             [ -n "$pubdate" ] && touch -d "$pubdate" "$out" 2>/dev/null
+            # BG-lockup: same mitigation as get_episode()'s own --limit-rate --
+            # an explicit sync plus a short pause right after the write that
+            # actually stresses the card (tens of MB), giving the exFAT
+            # driver a clear point to finish whatever it's doing before the
+            # next feed's work starts, rather than moving straight on to more
+            # I/O while it may still be settling.
+            sync
+            sleep 1
             total_new=$((total_new + 1))
             log "  ok $base"
             # The player decodes MP3 only. Downloading anything else is still
