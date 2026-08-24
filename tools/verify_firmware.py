@@ -385,7 +385,7 @@ def main():
                 for k in removed:
                     print(f"    - {k}")
                 expected = {SCRIPT, MOUNT_SCRIPT, CONFIG_JSON, VERSION_FILE,
-                            BT_INIT}
+                            BT_INIT, "module_driver/sa_hgl_dma.sh"}
                 expected |= set(SET_FUNCTIONS_FILES)
                 # kernel_build_id: --kernel-build-id re-stamps this file, which
                 # shows up as "changed" (not "added") whenever the base image

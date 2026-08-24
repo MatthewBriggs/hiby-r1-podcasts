@@ -479,6 +479,42 @@ def enable_about_tile(root):
 S90ADB_SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "S90adb")
 
 
+# RP7 follow-up (BG-none-yet, live measurement 2026-08-24): sa_hgl_dma is
+# HGL's graphics-acceleration DMA pool -- 6MB reserved at boot from a fixed
+# `sahd_hgl_mem_size` module parameter, confirmed live to be a boot-time
+# reservation rather than a lazy per-open allocation (force-opening the
+# device and separately `rmmod`-ing the module both left MemAvailable
+# completely unchanged, ruling out "nothing opens it so it's already free"
+# -- that assumption was wrong and had never actually been tested before
+# this). Library's own UI never touches HGL, confirmed by source: it mmaps
+# /dev/fb0 directly. Only meaningful for --standalone: a hooked build still
+# runs hiby_player, whose own native screens do use this. Loaded from
+# module_driver/sa_hgl_dma.sh (`insmod sa_hgl_dma.ko
+# sahd_hgl_mem_size=6291456`), called after soc_fb (the real framebuffer
+# driver, already up) in driver_default_init_script.sh's own load order --
+# nothing loads after it depends on it, confirmed by reading that order
+# directly, so skipping it outright is safe. Made a no-op rather than
+# deleted or removed from the load order: the orchestrator script's own
+# `sh sa_hgl_dma.sh` call is left completely alone, so a smaller, more
+# obviously-correct diff.
+HGL_SCRIPT = "module_driver/sa_hgl_dma.sh"
+
+
+def disable_hgl(root):
+    """Turn module_driver/sa_hgl_dma.sh into a no-op. Standalone builds only
+    -- see this module's own comment for why. Returns False if the file
+    isn't where expected, so the caller can decide whether that's fatal."""
+    path = os.path.join(root, HGL_SCRIPT)
+    if not os.path.exists(path):
+        return False
+    with open(path, "w") as fh:
+        fh.write("# RP1/RP7: no hiby_player, and Library's own UI never "
+                 "touches HGL (mmaps /dev/fb0 directly) -- this 6MB boot-"
+                 "time reservation has no consumer in a standalone build. "
+                 "Originally: insmod sa_hgl_dma.ko sahd_hgl_mem_size=6291456\n")
+    return True
+
+
 def install_boot_adb(root):
     """Add the boot-time ADB wrapper if this rootfs doesn't already have one."""
     dest = os.path.join(root, "etc/init.d/S90adb")
@@ -925,6 +961,12 @@ def main():
             fh.write(patched)
         print(f"patched {SCRIPT} ({kind} base, "
               f"{len(original.splitlines())} -> {len(patched.splitlines())} lines)")
+
+        if args.standalone:
+            if disable_hgl(root):
+                print(f"disabled {HGL_SCRIPT} (no consumer in a standalone build)")
+            else:
+                print(f"note: {HGL_SCRIPT} not found — nothing to disable")
 
         mtarget = os.path.join(root, MOUNT_SCRIPT)
         if os.path.exists(mtarget):

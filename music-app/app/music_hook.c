@@ -44,6 +44,23 @@
 #include <linux/fb.h>
 #include <linux/input.h>
 
+/* RP7 musl experiment: <linux/input.h>'s struct input_event is polymorphic
+ * on __USE_TIME_BITS64 -- glibc on this 32-bit target leaves it undefined
+ * (the legacy 4+4-byte `struct timeval time` layout), but musl always
+ * defines it (64-bit time_t on every platform, no override exists -- a
+ * deliberate musl design choice, not a bug). This device's actual kernel
+ * (4.4.94, ~2016) only ever emits the legacy layout, so a musl build using
+ * the system struct directly would desync every read() at the very first
+ * event: not just a wrong timestamp, a wrong *stride*, corrupting touch and
+ * key input outright. Bypassing the system struct entirely for this one
+ * interface -- own fixed layout, correct on both builds, never dependent on
+ * which time_t width the toolchain defaults to. */
+typedef struct {
+    int32_t tv_sec, tv_usec;
+    uint16_t type, code;
+    int32_t value;
+} r1_input_event_t;
+
 #include "text.h"
 #include "icons.h"
 #include "library.h"
@@ -4325,6 +4342,14 @@ static void draw_screen(uint16_t *fb) {
         snprintf(buf, sizeof(buf), "%d:%02d", pos / 60000, (pos / 1000) % 60);
         draw_text(fb, 24, by + 14, buf, COL_DIM, TEXT_PX_SMALL, FB_W);
         int rem = dur - pos; if (rem < 0) rem = 0;
+        /* Real-world time, not content time -- same reasoning as the
+         * audiobook screen's Book/Chapter countdowns: position/duration
+         * stay in content time (unaffected by speed, what the bar fill
+         * above already assumes), but the countdown label should shrink
+         * faster at faster speeds. Music has no speed control, so this is
+         * a no-op there (pod_speed_permille only changes in podcast_mode). */
+        if (podcast_mode)
+            rem = (int)(rem / (pod_speed_permille / 1000.0));
         snprintf(buf, sizeof(buf), "-%d:%02d", rem / 60000, (rem / 1000) % 60);
         draw_right(fb, by + 14, buf);
 
@@ -5369,6 +5394,13 @@ static void draw_screen(uint16_t *fb) {
         fill_rect_clip(fb, 0, y + ROW_H - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
         y += ROW_H;
     }
+    /* Every other screen branch above ends with this same check before its
+     * own return -- this shared fallthrough (Artists/Albums/Audiobooks/
+     * Podcasts, the only row_at()-driven lists with no earlier explicit
+     * branch) had gone without it: clip_bot already reserves MINI_H of
+     * space for it via mini_visible() above, so rows correctly stopped
+     * short of the bottom, but nothing ever painted into the gap that left. */
+    if (mini_visible()) draw_mini(fb);
 }
 
 /* ---- input --------------------------------------------------------------- */
@@ -5484,7 +5516,7 @@ static int drag_threshold(void) {
 }
 
 static int read_gesture(int fd, int *ox, int *oy) {
-    struct input_event ev;
+    r1_input_event_t ev;
     static int x, y, down_x = -1, down_y = -1, moved, have_down;
     int out = 0;
     while (read(fd, &ev, sizeof(ev)) == sizeof(ev)) {
@@ -6516,7 +6548,7 @@ static int button_locked;
  * apart and measure as however long that poll took, quietly putting a real
  * double press outside DOUBLE_PRESS_MS. Reading ev.time makes the window mean
  * what it says regardless of how often anyone looks. */
-static struct timeval last_power_press;
+static r1_input_event_t last_power_press;   /* only .tv_sec/.tv_usec read */
 static int have_last_power_press;
 
 static int read_int_file(const char *path) {
@@ -6744,7 +6776,7 @@ typedef enum { KEYS_BUTTONS = 0, KEYS_REMOTE } key_src_t;
  * -1 means the fd itself has died and the caller should close and forget it
  * (see the comment below the loop). */
 static int handle_keys(int fd, key_src_t src) {
-    struct input_event ev;
+    r1_input_event_t ev;
     int acted = 0;
     ssize_t r;
     while (fd >= 0 && (r = read(fd, &ev, sizeof(ev))) == (ssize_t)sizeof(ev)) {
@@ -6757,10 +6789,10 @@ static int handle_keys(int fd, key_src_t src) {
          * swallowing every other key below. */
         if (ev.code == KEY_POWER_) {
             long ms = have_last_power_press
-                    ? (ev.time.tv_sec - last_power_press.tv_sec) * 1000L +
-                      (ev.time.tv_usec - last_power_press.tv_usec) / 1000L
+                    ? (ev.tv_sec - last_power_press.tv_sec) * 1000L +
+                      (ev.tv_usec - last_power_press.tv_usec) / 1000L
                     : -1;
-            last_power_press = ev.time;
+            last_power_press = ev;
             have_last_power_press = 1;
 
             if (button_lock_enabled && ms >= 0 && ms < DOUBLE_PRESS_MS) {
