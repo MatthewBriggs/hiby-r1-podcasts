@@ -230,6 +230,63 @@ void st_bt_name(char *out, unsigned n) {
     snprintf(out, n, "%s", cached);
 }
 
+/* ---- Bluetooth pairing ---------------------------------------------------
+ * NoInputNoOutput agent throughout: this device has no PIN-entry UI, and
+ * that capability tells BlueZ's pairing negotiation not to need one --
+ * "Just Works" pairing, which covers the overwhelming majority of BT
+ * audio gear (headphones/speakers have no display or keypad of their own
+ * either, so they already expect this). A device that specifically
+ * demands MITM-protected (PIN/passkey) pairing will fail to pair here;
+ * there is no PIN prompt anywhere in this app to satisfy one with, and
+ * building one is future work, not silently pretended to exist now. */
+void bt_scan_start(void) {
+    if (system("printf 'agent NoInputNoOutput\\ndefault-agent\\nscan on\\n' | "
+               "timeout 8 bluetoothctl >/dev/null 2>&1 &") == -1) return;
+}
+
+/* Every device bluetoothd currently knows about -- already-paired and
+ * freshly-discovered alike, `bluetoothctl devices` doesn't distinguish --
+ * one "Device XX:XX:XX:XX:XX:XX Name..." line each. Parsed into a fixed
+ * array rather than returned as text: the caller needs the MAC (to pair)
+ * and the name (to display) as separate fields, not one blob to re-parse
+ * itself. Returns how many were found, capped at max. */
+int bt_scan_devices(bt_found_dev_t *out, int max) {
+    char buf[4096];
+    run_cmd("bluetoothctl devices 2>/dev/null", buf, sizeof(buf));
+    int n = 0;
+    char *line = buf;
+    while (line && *line && n < max) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+        if (!strncmp(line, "Device ", 7) && strlen(line) > 24) {
+            const char *mac = line + 7;
+            const char *name = line + 7 + 17;   /* "XX:XX:XX:XX:XX:XX" is 17 chars */
+            if (*name == ' ') name++;
+            memcpy(out[n].mac, mac, 17); out[n].mac[17] = '\0';
+            snprintf(out[n].name, sizeof(out[n].name), "%s", name);
+            n++;
+        }
+        line = nl ? nl + 1 : NULL;
+    }
+    return n;
+}
+
+/* pair, then trust (so it reconnects on its own next time without asking
+ * again), then connect -- the standard bluetoothctl sequence, scripted the
+ * same way st_bt_name()'s own "info" lookup already pipes commands in.
+ * Backgrounded: pairing a real device takes a few seconds of radio
+ * handshake, which would otherwise freeze the UI thread for that whole
+ * time -- same reasoning st_wifi_set() already gives for its own
+ * backgrounded restart. */
+void bt_pair(const char *mac) {
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd),
+        "printf 'agent NoInputNoOutput\\ndefault-agent\\npair %s\\ntrust %s\\nconnect %s\\n' | "
+        "timeout 15 bluetoothctl >/dev/null 2>&1 &",
+        mac, mac, mac);
+    if (system(cmd) == -1) return;
+}
+
 /* ---- quick settings ------------------------------------------------------ */
 #define BACKLIGHT_NODE "/sys/class/backlight/backlight_pwm0"
 
@@ -286,6 +343,61 @@ void st_wifi_set(int on) {
 void st_bt_set(int on) {
     if (system(on ? "/usr/bin/bt_enable >/dev/null 2>&1 &"
                   : "/usr/bin/bt_disable >/dev/null 2>&1 &") == -1) return;
+}
+
+/* USB working mode, take 2. The first version wrote a byte into
+ * /usr/data/user.ini at an offset our own boot-ADB wrapper (S90adb) reads
+ * on the way in -- but that script only confirms what 0 and 1 mean to
+ * *itself* (whether to bother starting ADB), never what hiby_player's own
+ * native code does with the byte, or when it acts on it. A setting that
+ * might only take effect God-knows-when is not "switching modes", it's
+ * hoping. Reverted -- see git history if that offset is ever worth
+ * revisiting with real evidence.
+ *
+ * This version calls the exact same commands stock's own adbon/adboff
+ * (/usr/bin/adbon, /usr/bin/adboff) already run, confirmed by reading
+ * them directly: they toggle between ADB and USB mass-storage by
+ * stopping one gadget function and starting the other on the *live*
+ * configfs gadget, not by writing a preference anywhere. Proven safe by
+ * ordinary use, not guessed at -- the actual fix for the same lesson the
+ * first version was trying to apply and didn't quite land: don't invent
+ * behaviour for undocumented state, reuse the vendor's own, already-
+ * working mechanism instead. */
+int st_usb_mode(void) {
+    /* Live, not persisted: which gadget the UDC is actually bound to right
+     * now. adb_demo bound + adbd running -> ADB mode; android0's
+     * mass_storage.0 bound -> Storage mode. Mirrors how st_bt_on() already
+     * asks the real hardware state instead of trusting a cached flag. */
+    FILE *f = fopen("/sys/kernel/config/usb_gadget/adb_demo/UDC", "r");
+    if (f) {
+        char s[64] = "";
+        if (fgets(s, sizeof(s), f)) { /* non-empty line = bound */ }
+        fclose(f);
+        if (s[0] && s[0] != '\n') return 0;   /* ADB */
+    }
+    f = fopen("/sys/kernel/config/usb_gadget/android0/UDC", "r");
+    if (f) {
+        char s[64] = "";
+        if (fgets(s, sizeof(s), f)) { }
+        fclose(f);
+        if (s[0] && s[0] != '\n') return 1;   /* Storage */
+    }
+    return -1;   /* neither bound -- e.g. USB not plugged in */
+}
+
+/* Switching TO Storage mode (mode == 1) stops ADB as an unavoidable part
+ * of what adboff actually does -- the two gadget functions need exclusive
+ * ownership of the one UDC, same as DAC/OTG do per S90adb's own comment.
+ * A session driving this over ADB will be disconnected by its own action;
+ * that's adboff working correctly, not a bug, and switching back to ADB
+ * mode needs the device's own touchscreen from that point (expected, and
+ * why this was never tested live from this side of an ADB connection --
+ * doing so would strand the very session testing it, with no way back
+ * except the screen). Backgrounded either way: both scripts bring up a
+ * new gadget and, for ADB, wait on enumeration -- not instant. */
+void st_usb_mode_set(int mode) {
+    if (system(mode == 1 ? "/usr/bin/adboff >/dev/null 2>&1 &"
+                          : "/usr/bin/adbon >/dev/null 2>&1 &") == -1) return;
 }
 
 /* Radio needs a route off the device. wlan0 exists whether or not Wi-Fi is

@@ -5,6 +5,22 @@ int  audio_play(const char *path);
 void audio_stop(void);
 void audio_toggle(void);
 void audio_seek_ms(int ms);
+/* The target of the most recent audio_seek_ms() call, until the worker
+ * thread has actually applied it (-1 once caught up or if none is
+ * outstanding). audio_pos_ms() alone reads 0 for however long the worker
+ * takes to open the decoder/output after audio_play() -- opening a fresh
+ * Bluetooth PCM connection especially -- so anything drawing a resumed
+ * position right after audio_play()+audio_seek_ms() should prefer this
+ * over audio_pos_ms() while it's non-negative, or it shows the wrong spot
+ * (usually the very start) until the seek lands. */
+int  audio_seek_pending_ms(void);
+/* Container-header probe, no decode: bits/rate/bitrate/duration for a
+ * scanner populating a database row, not for playback. Any output pointer
+ * may be NULL. Returns 0 on success (a format this app can open at all),
+ * -1 otherwise. See audio_probe_format()'s own comment in audio.c for what
+ * each field costs to get and how MP3 differs from everything else. */
+int audio_probe_format(const char *path, int *bits, int *rate,
+                       int *bitrate_bps, int *dur_ms);
 /* Pitch-preserving playback speed (WSOLA), permille: 1000 = 1.0x, clamped to
  * [800,2000]. 1000 bypasses WSOLA entirely -- exact passthrough, same as
  * before this existed. Applies to the 16-bit output path only; a hires

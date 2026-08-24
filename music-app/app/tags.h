@@ -16,4 +16,16 @@ int tag_track_number(const char *path);
 int tag_disc_number(const char *path);
 /* The title the file states, for tracks the index never saw. 0 on success. */
 int tag_title(const char *path, char *out, unsigned n);
+
+/* Artist/album/album_artist/genre in one open, for the library scanner
+ * (scanner.c) populating its own MEDIA_TABLE-shaped row -- track/disc/title
+ * are covered by tag_read() above and not repeated here. Any output pointer
+ * may be NULL to skip that field; a field left unset by the container (or
+ * the container itself unsupported) comes back an empty string, never
+ * uninitialized. Every buffer is NUL-terminated UTF-8 on return -- ID3v2's
+ * ISO-8859-1/UTF-16 encodings are converted, not passed through raw. */
+void tag_read_meta(const char *path, char *artist, unsigned artist_n,
+                   char *album, unsigned album_n,
+                   char *album_artist, unsigned aa_n,
+                   char *genre, unsigned genre_n);
 #endif

@@ -59,6 +59,7 @@
 #include "lastfm.h"
 #include "spotify.h"
 #include "index.h"
+#include "scanner.h"
 #include "status.h"
 #include "radio.h"
 #include "playlist.h"
@@ -273,6 +274,11 @@ static int usb_bypass_bt_was_on;
 #define STATUS_H  32
 #define CONTENT_Y (STATUS_H + HEADER_H)
 #define ROW_H     72
+/* R50: the Queue screen's one extra header line (track count + remaining
+ * playtime), fixed above the scrolling rows rather than the first row's own
+ * slot -- vis_rows()/scroll_to_px() both need to know the list itself has
+ * this much less room on that one screen. */
+#define QUEUE_SUMMARY_H 44
 /* How many consecutive ticks since inertia was last active a scrollable
  * list needs before a tap is trusted as a real row selection rather than
  * the tail end of a fling. ~100ms at the ~30/s tick rate this loop runs
@@ -662,6 +668,213 @@ static void view_blit_art_clip(uint16_t *fb, int x, int y, int clip_top, int cli
     pthread_mutex_unlock(&view_art_lock);
 }
 
+/* Artist page: a third independent buffer, same reasoning BG70 already
+ * established for view_art_bits above -- this can't share art_bits (the
+ * playing track's own cover) or view_art_bits (the browsed album's cover)
+ * without the exact cross-contamination bug those two were split apart to
+ * fix. Also carries the bio text, fetched in the same worker call since
+ * Last.fm's artist.getinfo returns both in one response -- no reason to
+ * pay for a second round trip.
+ *
+ * Unlike album covers (cached as cover.jpg right in the album's own
+ * folder), an artist has no single folder to cache into -- their albums
+ * can be scattered across many. Cached instead under a dedicated
+ * directory, one photo/bio/no-match-sentinel trio per artist, keyed on a
+ * filesystem-safe version of the artist's name. */
+#define ARTIST_CACHE_DIR "/data/mnt/sd_0/.artist_cache"
+static pthread_mutex_t artist_art_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint16_t *artist_art_bits;
+static char      artist_bio_text[8192];
+static char      artist_art_want[LIB_NAME_LEN];
+static pthread_t artist_art_thread;
+static int       artist_art_thread_valid;
+static int       artist_art_seq_v;
+/* Distinguishes "fetch still running" from "fetch finished and found
+ * nothing" -- artist_bio_text[0] alone can't tell those apart, and the
+ * draw side needs to (a placeholder "Loading..." vs simply no bio section
+ * at all, per "their bio, if there is one"). */
+static int       artist_art_loading;
+
+static int artist_art_seq(void) {
+    pthread_mutex_lock(&artist_art_lock);
+    int v = artist_art_seq_v;
+    pthread_mutex_unlock(&artist_art_lock);
+    return v;
+}
+
+/* Same "replace anything not filesystem-safe with '_'" this app applies
+ * nowhere else (podcast feed names are trusted as-is from feeds.txt, the
+ * one existing precedent) -- artist names routinely carry '/' (a genuine
+ * character in some names, not just a tag-writer quirk), which would
+ * otherwise be read as a path separator by every fopen() below. */
+static void artist_cache_key(const char *artist, char *out, size_t out_n) {
+    size_t j = 0;
+    for (size_t i = 0; artist[i] && j + 1 < out_n; i++) {
+        unsigned char c = (unsigned char)artist[i];
+        out[j++] = (isalnum(c) || c == '-' || c == ' ') ? (char)c : '_';
+    }
+    out[j] = '\0';
+}
+
+static void *artist_art_worker(void *arg) {
+    (void)arg;
+    char artist[LIB_NAME_LEN];
+    pthread_mutex_lock(&artist_art_lock);
+    snprintf(artist, sizeof(artist), "%s", artist_art_want);
+    pthread_mutex_unlock(&artist_art_lock);
+
+    char key[LIB_NAME_LEN];
+    artist_cache_key(artist, key, sizeof(key));
+    mkdir(ARTIST_CACHE_DIR, 0755);
+    char jpg[560], bio_path[560], nomatch[560];
+    snprintf(jpg, sizeof(jpg), "%s/%s.jpg", ARTIST_CACHE_DIR, key);
+    snprintf(bio_path, sizeof(bio_path), "%s/%s.bio.txt", ARTIST_CACHE_DIR, key);
+    snprintf(nomatch, sizeof(nomatch), "%s/%s.no_match", ARTIST_CACHE_DIR, key);
+
+    uint16_t *bits = NULL;
+    char bio[8192] = "";
+
+    /* Cached from an earlier visit this device has already made -- no
+     * network at all, same as any local-file art candidate. */
+    struct stat st;
+    int have_jpg = stat(jpg, &st) == 0 && st.st_size > 0;
+    if (have_jpg) bits = cover_load(jpg, key, ART_PX);
+    if (have_jpg && !bits) {
+        /* Cached file exists but doesn't decode -- confirmed live this is
+         * Last.fm's own "no photo for this artist" response, which still
+         * points to an *image* URL rather than omitting one: a generic
+         * placeholder graphic served as a PNG, which this device's JPEG-
+         * only decoder (cover.c dlopens libjpeg, nothing else -- same gap
+         * BG52 found for a podcast cover) can't read. Discarded rather than
+         * trusted forever, so the fetch below gets a real second chance --
+         * at Spotify, if nothing else. */
+        unlink(jpg);
+        have_jpg = 0;
+    }
+    FILE *bf = fopen(bio_path, "rb");
+    if (bf) {
+        size_t n = fread(bio, 1, sizeof(bio) - 1, bf);
+        bio[n] = '\0';
+        fclose(bf);
+    }
+
+    int need_jpg = !bits;
+    int need_bio = !bio[0];
+    if ((need_jpg || need_bio) && artist[0] && st_net_up() &&
+        (lastfm_has_key() || spotify_has_key())) {
+        struct stat nm_st;
+        if (stat(nomatch, &nm_st) != 0) {
+            int got_jpg = have_jpg, got_bio = bio[0] != '\0';
+            if (lastfm_has_key()) {
+                char lf_bio[8192] = "";
+                int rc = lastfm_fetch_artist(artist, jpg, lf_bio, sizeof(lf_bio));
+                if (rc > 0) {
+                    /* Decode it now, not just trust the download -- see the
+                     * cached-file comment above for why a "successful"
+                     * fetch can still be an undecodable placeholder. Only
+                     * a real decode counts as having a photo, and only
+                     * that skips the Spotify fallback below. */
+                    if (rc & 1) {
+                        bits = cover_load(jpg, key, ART_PX);
+                        if (bits) got_jpg = 1;
+                        else unlink(jpg);
+                    }
+                    if ((rc & 2) && lf_bio[0]) {
+                        snprintf(bio, sizeof(bio), "%s", lf_bio);
+                        got_bio = 1;
+                        FILE *wf = fopen(bio_path, "wb");
+                        if (wf) { fputs(bio, wf); fclose(wf); }
+                    }
+                }
+            }
+            if (!got_jpg && spotify_has_key() &&
+                spotify_fetch_artist_image(artist, jpg) == 0) {
+                bits = cover_load(jpg, key, ART_PX);
+                if (bits) got_jpg = 1;
+            }
+            if (!got_jpg && !got_bio) {
+                FILE *f = fopen(nomatch, "w");
+                if (f) fclose(f);
+            }
+            /* Reported live: photo and bio worked fine within a session but
+             * were gone after a full device reboot -- fclose() only flushes
+             * to the OS's own page cache, not to the physical SD card, and
+             * this app's own deploy-time reboots are the only ones that
+             * think to call sync() first (see deploy.sh's own comment on
+             * this exact class of loss). A user-initiated reboot has no
+             * reason to wait for a background fetch's writes to reach the
+             * card, and FAT-family filesystems (what these cards format
+             * as) have no journal to replay lost writes from afterward.
+             * Forced durable here, once per fetch rather than per write,
+             * since this already only runs on a background thread and a
+             * fetch is inherently a multi-second operation next to which
+             * one sync() is noise. */
+            if (got_jpg || got_bio) sync();
+            mlog("[music] artist page: %s -> photo %s, bio %s\n",
+                 artist, got_jpg ? "yes" : "no", got_bio ? "yes" : "no");
+        }
+    }
+
+    pthread_mutex_lock(&artist_art_lock);
+    if (strcmp(artist, artist_art_want) != 0) {
+        free(bits);
+    } else {
+        free(artist_art_bits);
+        artist_art_bits = bits;
+        snprintf(artist_bio_text, sizeof(artist_bio_text), "%s", bio);
+        artist_art_seq_v++;
+        artist_art_loading = 0;
+    }
+    pthread_mutex_unlock(&artist_art_lock);
+    return NULL;
+}
+
+static void artist_art_request(const char *artist) {
+    /* Reported live: navigating to the artist page took a couple of
+     * seconds, every time. Root cause -- unlike view_art_request()/
+     * art_request() above (whose own pthread_join here rarely costs
+     * anything, since most album covers resolve from a local file in
+     * milliseconds), this screen has no local fallback at all: every visit
+     * is a real network round trip, several seconds long. Joining a
+     * still-running previous fetch before starting a new one meant
+     * re-entering this screen while an earlier fetch was still in flight
+     * blocked the UI thread for however long that earlier fetch had left.
+     * Detached instead of joined: the old thread finishes and cleans up on
+     * its own, and its eventual result is silently discarded by the
+     * strcmp() staleness check already in artist_art_worker() (artist_art_
+     * want is overwritten below, under the same lock, before that check
+     * ever runs) -- nothing here actually depended on the join for
+     * correctness, only for tidiness. */
+    if (artist_art_thread_valid) {
+        pthread_detach(artist_art_thread);
+        artist_art_thread_valid = 0;
+    }
+    pthread_mutex_lock(&artist_art_lock);
+    free(artist_art_bits);
+    artist_art_bits = NULL;
+    artist_bio_text[0] = '\0';
+    artist_art_seq_v++;
+    artist_art_loading = 1;
+    snprintf(artist_art_want, sizeof(artist_art_want), "%s", artist ? artist : "");
+    pthread_mutex_unlock(&artist_art_lock);
+    if (pthread_create(&artist_art_thread, NULL, artist_art_worker, NULL) == 0)
+        artist_art_thread_valid = 1;
+}
+
+static void artist_blit_art_clip(uint16_t *fb, int x, int y, int clip_top, int clip_bot) {
+    pthread_mutex_lock(&artist_art_lock);
+    if (artist_art_bits) {
+        for (int r = 0; r < ART_PX; r++) {
+            int py = y + r;
+            if (py < clip_top || py >= clip_bot || py < 0 || py >= FB_H) continue;
+            memcpy(fb + (size_t)py * FB_W + x,
+                   artist_art_bits + (size_t)r * ART_PX,
+                   (size_t)ART_PX * sizeof(uint16_t));
+        }
+    }
+    pthread_mutex_unlock(&artist_art_lock);
+}
+
 static void blit_art(uint16_t *fb, int x, int y) {
     pthread_mutex_lock(&art_lock);
     if (art_bits) {
@@ -966,7 +1179,9 @@ typedef enum { SC_MENU = 0, SC_MUSIC_MENU, SC_ARTISTS, SC_ALBUMS, SC_TRACKS, SC_
                SC_RADIO, SC_PLAYLISTS, SC_AUDIOBOOKS, SC_PODCASTS, SC_POD_SYNC,
                SC_EQ, SC_EQ_BANDS, SC_EQ_BAND, SC_MSEB,
                SC_SETTINGS, SC_SETTINGS_THEME, SC_SETTINGS_ABOUT,
-               SC_SETTINGS_TIMEZONE, SC_SETTINGS_THEMEMODE, SC_QUEUE } screen_t;
+               SC_SETTINGS_TIMEZONE, SC_SETTINGS_THEMEMODE, SC_QUEUE,
+               SC_ARTIST_PAGE,
+               SC_SETTINGS_WIFI, SC_SETTINGS_BT, SC_SETTINGS_USB, SC_KEYBOARD } screen_t;
 
 /* L2: the top-level menu ("Main Menu", EXIT on the right) stays small on
  * purpose rather than listing every library-browsing facet alongside
@@ -1033,7 +1248,7 @@ static int live_x, live_y;          /* where the finger is now, while it is down
 /* Quick settings, pulled down from the status strip. Brightness, Wi-Fi and
  * Bluetooth are wanted often enough that leaving the app to reach them is the
  * annoyance; everything else stays in the firmware's own settings. */
-#define QS_H       490
+#define QS_H       562   /* +QS_ROW_H over the original 490, for the new USB row */
 #define QS_ROW_H   72
 /* Row label column. Was a bare 68 until the Wi-Fi/Bluetooth/EQ row icons grew
  * larger -- Wi-Fi's natural width at its new height puts its right edge
@@ -1073,6 +1288,21 @@ static int  kfd_n;
 #define VOL_H       96
 #define VOL_TICKS   90        /* ~3 s at the loop's cadence */
 static int vol_ticks, vol_dragging;
+
+/* R60: a hardware seek has no on-screen tap to show it happened -- the user
+ * may not even be looking at the screen when they press it, which is the
+ * whole point of a hardware button, so there is nothing else that tells them
+ * the press landed or how far it actually skipped. Same countdown-in-ticks
+ * pattern as vol_ticks/VOL_TICKS just above, shorter-lived since this is a
+ * glance-and-gone confirmation, not a slider the user is actively watching. */
+#define SEEK_TOAST_TICKS 45   /* ~1.5 s at the loop's cadence */
+static int  seek_toast_ticks;
+static char seek_toast_text[24];
+
+static void seek_toast(int delta_ms) {
+    snprintf(seek_toast_text, sizeof(seek_toast_text), "%+d s", delta_ms / 1000);
+    seek_toast_ticks = SEEK_TOAST_TICKS;
+}
 static int vol_drag_pct = -1, vol_applied = -1, vol_apply_tick;
 
 static int scrub_active;
@@ -1101,6 +1331,70 @@ static int tracks_hdr_title_y(void)  { return ART_PX + 20; }
 static int tracks_hdr_artist_y(void) { return tracks_hdr_title_y() + 44; }
 static int tracks_hdr_info_y(void)   { return tracks_hdr_artist_y() + 38; }
 static int tracks_hdr_h(void)        { return tracks_hdr_info_y() + 40; }
+
+/* Artist page: same layout rhythm as the album page's own header just
+ * above -- photo, then name, then a summary line -- one less tier (no
+ * "artist" line under the title, since this page *is* that artist). */
+static int artist_page_title_y(void) { return ART_PX + 20; }
+static int artist_page_info_y(void)  { return artist_page_title_y() + 44; }
+static int artist_page_hdr_h(void)   { return artist_page_info_y() + 40; }
+
+/* Word-wrapped bio text -- same wrap loop pod_draw_notes() below uses for
+ * podcast show notes (see its own comment for why this isn't cached), but
+ * split from the drawing itself: the artist page needs the *total* wrapped
+ * height up front to compute how far the whole page can scroll, the way
+ * tracks_max_px() needs track_n up front, which pod_draw_notes() never
+ * needed since its own box scrolls independently rather than folding into
+ * one page's overall content height.
+ *
+ * fb == NULL measures only (returns the wrapped height in px, draws
+ * nothing, ignores off/clip_top/clip_bot); otherwise draws each line at
+ * ty - off, clipped to [clip_top, clip_bot), and returns the same height
+ * either way, so a caller can measure and draw with the same call shape. */
+static int artist_bio_layout(uint16_t *fb, int x, int y, int w, int off,
+                             int clip_top, int clip_bot) {
+    const int lh = 32, px = TEXT_PX_SMALL;
+    int ty = y;
+    const char *p = artist_bio_text;
+    if (!p[0]) return 0;
+    while (*p) {
+        while (*p == ' ') p++;
+        if (*p == '\n') { p++; ty += lh; continue; }
+        char line[256];
+        line[0] = '\0';
+        for (;;) {
+            const char *ws = p;
+            while (*p && *p != ' ' && *p != '\n') p++;
+            int wlen = (int)(p - ws);
+            if (wlen == 0) break;
+            char probe[300];
+            if (line[0]) snprintf(probe, sizeof(probe), "%s %.*s", line, wlen, ws);
+            else         snprintf(probe, sizeof(probe), "%.*s", wlen, ws);
+            if (line[0] && text_width(probe, px) > w) { p = ws; break; }
+            snprintf(line, sizeof(line), "%s", probe);
+            if (*p == '\n') { p++; break; }
+            while (*p == ' ') p++;
+            if (!*p) break;
+        }
+        if (line[0] && fb) {
+            int draw_y = ty - off;
+            /* Reported live: line ends were clipped off. draw_text_clip()'s
+             * own right_edge param (confirmed by reading text_draw() --
+             * it computes available width as right_edge - x internally) is
+             * an absolute screen-space x-coordinate, not a width the way
+             * every wrap decision above measures against -- w alone here
+             * was ~x px short of where the wrap loop actually allowed text
+             * to reach, silently truncating the last word or two of every
+             * line. x + w is the boundary that actually matches what was
+             * wrapped for. */
+            if (draw_y + lh > clip_top && draw_y < clip_bot)
+                draw_text_clip(fb, x, draw_y, line, COL_TEXT, px, x + w, clip_top, clip_bot);
+            if (draw_y > clip_bot + 400) break;   /* far enough past the visible window */
+        }
+        ty += lh;
+    }
+    return ty - y;
+}
 
 /* Growing the art to edge-to-edge (ART_PX == FB_W, up from 384) ate more
  * vertical space than removing the status strip freed -- 96px added against
@@ -1183,6 +1477,16 @@ static int mseb_reset_x(void) {
 static int pod_sync_x(void) {
     int sync_w = text_width("Sync", TEXT_PX_SMALL);
     return header_back_x() - 20 - sync_w;
+}
+
+/* R52: same idea again, for SC_QUEUE's "Clear" header action. */
+static int queue_clear_x(void) {
+    int clear_w = text_width("Clear", TEXT_PX_SMALL);
+    /* Reported live: wanted further from BACK than mseb_reset_x()/
+     * pod_sync_x()'s shared 20px -- unlike Reset or Sync, this one actually
+     * discards something (the rest of the queue), so a bit more separation
+     * from the tap zone right next to it is worth the extra width. */
+    return header_back_x() - 40 - clear_w;
 }
 
 /* BG47 (revised): just two skip arcs now, -10s left of play/pause and +30s
@@ -1283,13 +1587,25 @@ static int set_row_theme_y(void) { return set_row_timezone_y() + ROW_H; }
  * trailing divider back (it used to be the last row and closed the list
  * itself), and this row takes over closing the list instead. */
 static int set_row_about_y(void) { return set_row_theme_y() + ROW_H; }
-/* Same idea again: Rebuild index takes over closing the list from About. */
-static int set_row_reindex_y(void) { return set_row_about_y() + ROW_H; }
+/* Wi-Fi/Bluetooth: reachable here too, not just via holding their row in
+ * quick settings -- that hold is fast once you know it's there, but
+ * nothing on screen ever told a first-time user it existed. */
+static int set_row_wifi_y(void) { return set_row_about_y() + ROW_H; }
+static int set_row_bt_y(void)   { return set_row_wifi_y() + ROW_H; }
+static int set_row_usb_y(void)  { return set_row_bt_y() + ROW_H; }
+/* RP1/RP6: one button for both scans -- used to be two separate rows
+ * ("Rebuild library index" alongside this one), dropped once RP1 shipped
+ * (v0.32) made scanner.c the sole source of what files exist at all
+ * (see library.c's lib_open() and its own comment on why). Two passes are
+ * still run underneath (scanner_rescan_now() kicks index_rescan_now() too,
+ * see its own comment in scanner.c) but a user tapping "check for new
+ * music" has one question, not two, and only ever needs the one number. */
+static int set_row_scan_y(void) { return set_row_usb_y() + ROW_H; }
 /* R44: total content height, for the Settings screen's own scroll clamp --
  * ceil() so a last row that doesn't fill a whole ROW_H still gets fully
  * scrollable rather than clipped short. */
 static int settings_content_rows(void) {
-    int content_px = set_row_reindex_y() + ROW_H - CONTENT_Y;
+    int content_px = set_row_scan_y() + ROW_H - CONTENT_Y;
     return (content_px + ROW_H - 1) / ROW_H;
 }
 
@@ -1299,7 +1615,7 @@ static int settings_content_rows(void) {
  * pushed by hand, not by CI against a tagged commit), so this stays a
  * literal that a human edits; the discipline is remembering to, not the
  * mechanism. */
-#define LIBRARY_VERSION "0.31"
+#define LIBRARY_VERSION "0.4"
 
 /* A custom-built kernel keeps uname()'s own release string exactly
  * "4.4.94+" on purpose -- that string is also the vermagic every one of the
@@ -1632,6 +1948,313 @@ static int         eq_profile_n;
 static char        eq_cur_path[EP_PATH_LEN];
 static eq_profile_t eq_cur;
 static int         eq_editing_band;       /* index into eq_cur.band[] on SC_EQ_BAND */
+
+/* ---- T9 on-screen keyboard -------------------------------------------
+ * The only text-entry surface this app has ever needed -- WiFi SSIDs/
+ * passphrases -- so a real multi-tap T9 keypad rather than a cramped
+ * QWERTY grid: fewer, bigger touch targets on a 480px-wide screen, and it
+ * matches how this device's physical remote/button navigation already
+ * thinks in a numeric grid.
+ *
+ * Two modes, switched by a dedicated key, and between them every
+ * printable ASCII character 0x20-0x7e is reachable -- checked by hand
+ * against the full printable set, since a WPA passphrase can legally
+ * contain nearly any of it. Letters mode: each digit key cycles its
+ * lowercase letters, then uppercase, then its own digit -- the same
+ * grouping every physical phone keypad used, including 1 and 0 carrying
+ * punctuation/space instead of letters (neither ever had letters on a
+ * real phone either). Symbols mode swaps all ten keys to the printable
+ * ASCII letters mode doesn't reach. A couple of characters (^ and ~) are
+ * reachable from two different keys -- harmless, not worth trimming for
+ * one fewer keystroke on an already-short list. */
+#define KB_BUF_MAX 96
+static char       kb_buf[KB_BUF_MAX];
+static int        kb_len;
+static char       kb_title[64];
+static screen_t   kb_return_screen;
+/* What Done actually does -- kept as a purpose enum rather than a function
+ * pointer so kb_buf's lifetime and the action are both plain state, visible
+ * to mlog() and safe across a screen redraw, rather than a pointer that has
+ * to be re-armed correctly on every kb_open() call site. */
+typedef enum { KB_PURPOSE_NONE = 0, KB_PURPOSE_WIFI_PASSWORD, KB_PURPOSE_WIFI_SSID_MANUAL } kb_purpose_t;
+static kb_purpose_t kb_purpose;
+/* Three modes, not two. The original pair had the mode key labelled "123"
+ * while actually switching to *symbols* -- reported as exactly that
+ * confusion. Digits were only reachable by cycling several taps into a
+ * letter key, which is also poor for a passphrase. So: a real numbers
+ * mode where each key is simply its own digit, and the mode key now names
+ * what you will GET rather than where you are (letters shows "123",
+ * numbers shows "#+=", symbols shows "ABC") -- the convention phone and
+ * tablet keyboards already use. */
+typedef enum { KB_MODE_LETTERS = 0, KB_MODE_NUMBERS, KB_MODE_SYMBOLS, KB_MODE_N } kb_mode_t;
+static int         kb_mode;           /* kb_mode_t */
+static int         kb_last_key = -1;  /* which key the pending char came from, -1 = none pending */
+static int         kb_cycle_pos;      /* position within that key's own cycle string */
+static int         kb_cursor;         /* insertion point: 0..kb_len, index into kb_buf */
+static struct timespec kb_last_tap_at;
+#define KB_CYCLE_MS 600   /* same tap-timing feel as HOLD_MS elsewhere -- long enough to
+                            * land a deliberate second tap, short enough not to feel laggy */
+
+/* Between the three modes these cover all 95 printable ASCII characters
+ * (0x20-0x7e) exactly once, counted by hand rather than assumed: space +
+ * 4 punctuation + 52 letters + 10 digits + 28 symbols = 95. That matters
+ * because a WPA passphrase may legally contain any of them, and a
+ * keyboard that silently cannot type one is worse than no keyboard.
+ *
+ * Key 1 previously carried ".,'-_1" and rendered as an unreadable smear
+ * of punctuation -- reported. Trimmed to the four that actually earn a
+ * top-level slot; the rest moved into symbols mode, which has room. */
+static const char *KB_LETTERS[10] = {
+    /*0*/ " ",
+    /*1*/ ".,?!",
+    /*2*/ "abc2ABC",
+    /*3*/ "def3DEF",
+    /*4*/ "ghi4GHI",
+    /*5*/ "jkl5JKL",
+    /*6*/ "mno6MNO",
+    /*7*/ "pqrs7PQRS",
+    /*8*/ "tuv8TUV",
+    /*9*/ "wxyz9WXYZ",
+};
+static const char *KB_NUMBERS[10] = {
+    "0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
+};
+static const char *KB_SYMBOLS[10] = {
+    /*0*/ " ",
+    /*1*/ "\"#$",
+    /*2*/ "%&'",
+    /*3*/ "()*",
+    /*4*/ "+-/",
+    /*5*/ ":;=",
+    /*6*/ "<>@",
+    /*7*/ "[\\]",
+    /*8*/ "^_`",
+    /*9*/ "{|}~",
+};
+
+static const char **kb_table(void) {
+    return kb_mode == KB_MODE_NUMBERS ? KB_NUMBERS
+         : kb_mode == KB_MODE_SYMBOLS ? KB_SYMBOLS : KB_LETTERS;
+}
+
+static long kb_ms_since_last_tap(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (now.tv_sec - kb_last_tap_at.tv_sec) * 1000L +
+           (now.tv_nsec - kb_last_tap_at.tv_nsec) / 1000000L;
+}
+
+/* Open the keyboard for one specific purpose. buf/init_text let a caller
+ * pre-fill it (editing an existing value) -- both WiFi call sites so far
+ * start empty, but the mechanism is generic rather than assuming that. */
+static void kb_open(const char *title, kb_purpose_t purpose, const char *init_text) {
+    snprintf(kb_title, sizeof(kb_title), "%s", title);
+    kb_purpose = purpose;
+    snprintf(kb_buf, sizeof(kb_buf), "%s", init_text ? init_text : "");
+    kb_len = (int)strlen(kb_buf);
+    kb_cursor = kb_len;   /* editing a pre-filled value starts at its end */
+    kb_mode = KB_MODE_LETTERS;
+    kb_last_key = -1;
+    kb_cycle_pos = 0;
+    /* kb_commit() re-opens the keyboard for a second step (SSID then
+     * password) while `screen` is still SC_KEYBOARD from the first step --
+     * capturing that here would make Cancel-from-the-password-step land
+     * back on the keyboard it just left instead of on whatever screen
+     * this whole flow actually started from. Only a *fresh* open (called
+     * from a real screen) gets to set it. */
+    if (screen != SC_KEYBOARD) kb_return_screen = screen;
+    screen = SC_KEYBOARD;
+}
+
+/* All edits happen at kb_cursor rather than at the end of the buffer, so
+ * text can be corrected mid-string instead of only backspaced to. */
+static void kb_insert_at_cursor(char ch) {
+    if (kb_len >= KB_BUF_MAX - 1) return;
+    /* +1 moves the NUL along with the tail. */
+    memmove(kb_buf + kb_cursor + 1, kb_buf + kb_cursor,
+            (size_t)(kb_len - kb_cursor) + 1);
+    kb_buf[kb_cursor] = ch;
+    kb_len++;
+    kb_cursor++;
+}
+
+/* Same key tapped again inside the cycle window -- replace the character
+ * that same key just inserted with the next one in its cycle, rather than
+ * inserting a second character. A different key, the window elapsing, or
+ * the cursor having been moved by a tap (kb_last_key = -1) all commit
+ * what's there and start fresh. */
+static void kb_apply_key(int key) {
+    const char *cyc = kb_table()[key];
+    int cyclen = (int)strlen(cyc);
+    if (cyclen == 0) return;
+    int same_key = (key == kb_last_key) && kb_ms_since_last_tap() < KB_CYCLE_MS
+                   && kb_cursor > 0;
+    if (same_key) {
+        kb_cycle_pos = (kb_cycle_pos + 1) % cyclen;
+        kb_buf[kb_cursor - 1] = cyc[kb_cycle_pos];   /* in place: length unchanged */
+    } else {
+        kb_cycle_pos = 0;
+        kb_insert_at_cursor(cyc[0]);
+    }
+    kb_last_key = key;
+    clock_gettime(CLOCK_MONOTONIC, &kb_last_tap_at);
+}
+
+static void kb_backspace(void) {
+    if (kb_cursor <= 0) return;
+    memmove(kb_buf + kb_cursor - 1, kb_buf + kb_cursor,
+            (size_t)(kb_len - kb_cursor) + 1);
+    kb_len--;
+    kb_cursor--;
+    kb_last_key = -1;   /* backspacing shouldn't cycle into whatever's now before the cursor */
+}
+
+/* x of the caret when it sits before character index `idx` -- measured with
+ * the same text_width() the field itself draws through, so the caret lands
+ * exactly between the glyphs rather than at an estimated pitch. */
+#define KB_FIELD_X 36
+static int kb_caret_x(int idx) {
+    char tmp[KB_BUF_MAX];
+    if (idx < 0) idx = 0;
+    if (idx > kb_len) idx = kb_len;
+    memcpy(tmp, kb_buf, (size_t)idx);
+    tmp[idx] = '\0';
+    return KB_FIELD_X + text_width(tmp, TEXT_PX_BODY);
+}
+
+/* Tapping in the field puts the caret at the nearest character boundary --
+ * every boundary is measured and the closest wins, rather than dividing by
+ * an average character width, because this is a proportional font where
+ * "il" and "MW" are nothing like the same width. kb_len is capped at 96, so
+ * the linear scan costs nothing on a single tap. */
+static void kb_set_cursor_from_x(int tx) {
+    int best = 0, bestd = 1 << 30;
+    for (int i = 0; i <= kb_len; i++) {
+        int cx = kb_caret_x(i);
+        int d = cx > tx ? cx - tx : tx - cx;
+        if (d < bestd) { bestd = d; best = i; }
+    }
+    kb_cursor = best;
+    kb_last_key = -1;   /* a moved caret must not continue the previous key's cycle */
+}
+
+/* Which SSID a KB_PURPOSE_WIFI_PASSWORD session is for -- kb_buf itself
+ * only ever holds the password being typed, so the SSID has to live
+ * somewhere else, set by whichever screen called kb_open(). */
+static char kb_wifi_target_ssid[64];
+
+/* SSIDs and passphrases can contain nearly any byte a shell or a plain
+ * "key = value" line would treat as a control character (spaces, '=',
+ * '#', quotes, even raw newlines are technically legal in a passphrase).
+ * Hex is the same trick st_bt_name() already uses to survive bluetoothctl
+ * output unscathed -- no escaping scheme to get subtly wrong, and every
+ * byte round-trips exactly. */
+static void hex_encode(const char *in, char *out, size_t outsz) {
+    size_t o = 0;
+    for (const unsigned char *p = (const unsigned char *)in; *p && o + 2 < outsz; p++)
+        o += (size_t)snprintf(out + o, outsz - o, "%02x", *p);
+    out[o] = '\0';
+}
+static void hex_decode(const char *in, char *out, size_t outsz) {
+    size_t o = 0;
+    for (const char *p = in; p[0] && p[1] && o + 1 < outsz; p += 2) {
+        int hi = (p[0] >= 'a') ? p[0] - 'a' + 10 : p[0] - '0';
+        int lo = (p[1] >= 'a') ? p[1] - 'a' + 10 : p[1] - '0';
+        out[o++] = (char)((hi << 4) | lo);
+    }
+    out[o] = '\0';
+}
+
+#define WIFI_CREDS_PATH "/usr/data/settings.txt"
+
+/* Read-modify-write, same idiom save_conf() already uses for music.conf --
+ * a network re-entered (password changed, or just reselected) replaces its
+ * own line rather than appending a duplicate. Kept in its own file rather
+ * than folded into music.conf: credentials are a different kind of data
+ * (potentially many rows, not a fixed set of singleton keys) and arguably
+ * deserve being easy to find/wipe on their own. */
+static void wifi_save_credential(const char *ssid, const char *password) {
+    char hex_ssid[80]; hex_encode(ssid, hex_ssid, sizeof(hex_ssid));
+    char lines[64][256];
+    int n = 0;
+    FILE *f = fopen(WIFI_CREDS_PATH, "r");
+    if (f) {
+        char line[256];
+        char prefix[96];
+        snprintf(prefix, sizeof(prefix), "wifi_cred = %s ", hex_ssid);
+        while (n < 64 && fgets(line, sizeof(line), f)) {
+            if (strncmp(line, prefix, strlen(prefix)) != 0)
+                snprintf(lines[n++], sizeof(lines[0]), "%s", line);
+        }
+        fclose(f);
+    }
+    f = fopen(WIFI_CREDS_PATH, "w");
+    if (!f) return;
+    for (int i = 0; i < n; i++) fputs(lines[i], f);
+    char hex_pw[192]; hex_encode(password, hex_pw, sizeof(hex_pw));
+    fprintf(f, "wifi_cred = %s %s\n", hex_ssid, hex_pw);
+    fclose(f);
+}
+
+/* Everything wifi_on.sh already relies on: ctrl_interface is set in
+ * /usr/data/wpa_supplicant.conf (confirmed live), so wpa_cli talks to a
+ * supplicant that's already running rather than needing one started here.
+ * add_network/set_network/enable_network/save_config is the standard
+ * wpa_cli sequence for "remember and connect to this network" -- save_config
+ * is what makes it survive past this boot, same file wifi_on.sh already
+ * reads back on every future Wi-Fi-on. shell-quoted through a fixed-size
+ * buffer with embedded quotes stripped rather than escaped: a passphrase
+ * containing a literal `"` is vanishingly unlikely on this device's actual
+ * use, and getting shell-escaping subtly wrong here is a worse failure mode
+ * (arbitrary command injection from a typed password) than refusing the
+ * one exotic character. */
+static void shell_safe(const char *in, char *out, size_t outsz) {
+    size_t o = 0;
+    for (const char *p = in; *p && o + 1 < outsz; p++)
+        if (*p != '"' && *p != '\\' && *p != '`' && *p != '$') out[o++] = *p;
+    out[o] = '\0';
+}
+static void wifi_connect(const char *ssid, const char *password) {
+    char s_ssid[64], s_pw[128];
+    shell_safe(ssid, s_ssid, sizeof(s_ssid));
+    shell_safe(password, s_pw, sizeof(s_pw));
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd),
+        "id=$(wpa_cli add_network | tail -1); "
+        "wpa_cli set_network $id ssid '\"%s\"' >/dev/null; "
+        "wpa_cli set_network $id psk '\"%s\"' >/dev/null; "
+        "wpa_cli enable_network $id >/dev/null; "
+        "wpa_cli save_config >/dev/null &",
+        s_ssid, s_pw);
+    if (system(cmd) == -1) mlog("[music] wifi_connect: system() failed\n");
+    wifi_save_credential(ssid, password);
+    mlog("[music] wifi: connecting to %s\n", ssid);
+}
+
+/* Done was tapped -- hand the finished buffer to whichever purpose opened
+ * the keyboard, then return to wherever that screen came from. A no-op
+ * default case rather than an assert: KB_PURPOSE_NONE only happens if a
+ * future call site forgets to set one, and silently doing nothing is a
+ * far better failure mode on a device with no attached debugger than a
+ * crash mid-typing. */
+static void kb_commit(void) {
+    switch (kb_purpose) {
+        case KB_PURPOSE_WIFI_PASSWORD:
+            wifi_connect(kb_wifi_target_ssid, kb_buf);
+            break;
+        case KB_PURPOSE_WIFI_SSID_MANUAL:
+            /* Hidden-network entry: the buffer just typed *is* the SSID --
+             * hand off to a second keyboard pass for its password, same
+             * purpose the scan-and-select path already uses from here. */
+            snprintf(kb_wifi_target_ssid, sizeof(kb_wifi_target_ssid), "%s", kb_buf);
+            kb_open("Password for this network", KB_PURPOSE_WIFI_PASSWORD, "");
+            return;   /* stays on SC_KEYBOARD -- do not fall through to the pop below */
+        case KB_PURPOSE_NONE:
+        default:
+            break;
+    }
+    screen = kb_return_screen;
+}
 /* Which slider is being dragged live, on whichever of SC_EQ/SC_EQ_BAND is
  * showing -- 0 none, 1 preamp, 2 frequency, 3 gain, 4 Q. Mirrors qs_dragging/
  * vol_dragging: touch-down-in-band starts it, touch-up ends it, live_x drives
@@ -1649,8 +2272,63 @@ static lib_track_t queue[PAGE_MAX * 8];
 static int  queue_n;
 static char q_artist[LIB_NAME_LEN];
 static char q_album[LIB_NAME_LEN];
+/* BG73: whether the queue's own q_artist/q_album identity is a playlist
+ * rather than an album -- a playlist's order was chosen by the user, so
+ * "Play next" must never drop the rest of it, only an album's leftover
+ * tracks are fair game for that (see queue_play_next()). Set from
+ * browsing_is_playlist at the moment a fresh queue is created. */
+static int  q_is_playlist;
+/* BG85: queue_play_next() used to overwrite q_artist/q_album with the
+ * played-next track's own album the instant it was queued -- but that
+ * track isn't playing yet, it's only next in line, so Now Playing showed
+ * the *new* album's name (q_album, drawn separately from the actual
+ * playing track's own name) against audio that was still very much the
+ * old one, for however long the current track had left to run. Reported
+ * live as "adding to queue changes the name of the currently playing
+ * album." These hold the pending identity instead, applied by
+ * queue_apply_pending() only once playback actually reaches q_pending_at
+ * -- so the header keeps naming whatever is actually audible right up
+ * until it changes for real. -1/empty when nothing is pending. */
+static char q_artist_pending[LIB_NAME_LEN];
+static char q_album_pending[LIB_NAME_LEN];
+static int  q_pending_at = -1;
+/* BG73 follow-up: set the moment queue_play_next() drops an album's
+ * leftover tracks in favour of a played-next one from somewhere else --
+ * from then on queue[] no longer represents one browsable album (its own
+ * earlier entries are still the old album, its tail is the new one), so
+ * swiping back from Now Playing must stop presenting it as a single
+ * album page (one title, one cover) and show the plain queue list instead
+ * (see go_back()'s SC_PLAYING case). Cleared whenever a fresh queue starts
+ * (play_from_list()). Playlists are deliberately not covered by this --
+ * a playlist was already an arbitrary mix of albums/artists from the
+ * start, so a played-next track spliced into one isn't a new kind of
+ * "not really one album" the way it is for a real album's own queue. */
+static int  queue_mixed;
+/* Reported live: once queue_mixed made swipe-back-from-Now-Playing land on
+ * SC_QUEUE, backing out of *that* unconditionally returned to SC_PLAYING --
+ * fine when SC_QUEUE was reached deliberately via the queue button (that's
+ * still exactly what "back" should do there), but a dead loop when it was
+ * reached as the swipe-back fallback instead: the swipe already meant "back
+ * out of Now Playing", so bouncing back to Now Playing on the very next back
+ * goes nowhere. Sourcing SC_QUEUE from two different gestures means "back"
+ * out of it has to know which one got it there -- set on both entries. */
+static int  queue_via_back;
 static char cur_artist[LIB_NAME_LEN];
 static char cur_album[LIB_NAME_LEN];
+/* BG73: whether cur_artist/cur_album (whatever's currently loaded into
+ * tracks[]) is a playlist -- set wherever SC_TRACKS is entered as a browse
+ * target (SC_PLAYLISTS vs SC_ALBUMS), read by play_from_list()/
+ * queue_play_next() so a fresh queue or a Play Next both know which of the
+ * two "leave the rest alone" vs "drop the rest" rules applies. */
+static int  browsing_is_playlist;
+/* Same idea as browsing_is_playlist just above, for a second thing SC_TRACKS
+ * needs to remember about how it was reached: an album opened from the
+ * artist page's own album list has "back" return there directly (nothing
+ * needs re-fetching -- artist_page_name/artist_page_albums/artist_art_bits
+ * are all still sitting in memory untouched), not fall through to the
+ * default "restore the Albums list" case, which would skip past the artist
+ * page entirely and land somewhere the user never actually was browsing. */
+static int  tracks_from_artist_page;
 /* What cur_artist was filtering the Albums list by, before a tap into a
  * specific album's Tracks overwrote it with that one album's artist (BG7):
  * two artists can share an album name, so the track query needs the exact
@@ -1669,6 +2347,27 @@ static char albums_artist[LIB_NAME_LEN];
  * next "back" filtered Albums by a facet value that matched nothing. */
 static int played_from_browse;
 static int  cur_track;          /* index into tracks[] */
+
+/* Artist page: tapping an artist's name on the album page. Own album list
+ * rather than reusing rows[]/row_n -- those belong to whichever paginated
+ * list screen (Albums, Artists) is still sitting underneath this one, and
+ * this screen loads its albums in a single one-shot fetch the same way the
+ * album-detail page loads tracks[] up front, not page by page. */
+static char artist_page_name[LIB_NAME_LEN];
+#define ARTIST_ALBUMS_MAX (PAGE_MAX * 4)
+static lib_row_t artist_page_albums[ARTIST_ALBUMS_MAX];
+static int artist_page_album_n;
+/* Where "back" from the artist page should land -- the album/artist it was
+ * opened from, so backing out returns to browsing that album rather than
+ * always falling to the same generic spot regardless of entry point. */
+static char artist_page_back_album[LIB_NAME_LEN];
+static char artist_page_back_artist[LIB_NAME_LEN];
+/* The artist page has two genuinely different entry points now: an album
+ * page's artist name (back -> that album, the pair above) and the Artists
+ * list itself (back -> the Artists list, same "restore where the list was"
+ * shape SC_ALBUMS's own go_back() case already uses). go_back()'s
+ * SC_ARTIST_PAGE case needs to know which one got it here. */
+static int artist_page_from_list;
 
 /* An A-Z strip down the right edge. 117 artists and 277 albums nine rows at a
  * time is not navigable by swiping, and this is a great deal cheaper to build
@@ -1733,9 +2432,30 @@ static int mini_visible(void);
 static int vis_rows(void) {
     /* R46: the album-detail screen has no status bar or title bar to leave
      * room for -- its content starts at y=0, not CONTENT_Y, same as Now
-     * Playing's own art already does. */
-    int top = (screen == SC_TRACKS && !ab_list && !pod_list) ? 0 : CONTENT_Y;
-    int h = FB_H - top - (mini_visible() ? MINI_H : 40);
+     * Playing's own art already does. Artist page: same, its own photo
+     * runs edge-to-edge from y=0 too. */
+    int plain_album = screen == SC_TRACKS && !ab_list && !pod_list;
+    int artist_page = screen == SC_ARTIST_PAGE;
+    int top = (plain_album || artist_page) ? 0 : CONTENT_Y;
+    /* R50: the Queue screen's one extra header line (track count + playtime)
+     * sits above the rows, not in the first row's own slot -- one fewer
+     * row's worth of height is actually available to scroll through. */
+    if (screen == SC_QUEUE) top += QUEUE_SUMMARY_H;
+    /* Reported live: the plain-album screen reserved the same 40px bottom
+     * margin as every other screen unconditionally, whether or not there
+     * was actually a sheet_note toast to show in it -- a track could settle
+     * with its bottom half cut off right at that boundary even with nothing
+     * drawn there. That margin only ever holds sheet_note on this screen
+     * (see the draw side), so it's only reserved while one is actually
+     * showing; every other screen's reasons for the same 40px (route info,
+     * Wi-Fi-off messages, etc.) aren't audited here, so they keep the
+     * unconditional margin. The artist page has no sheet_note gesture at
+     * all, so it never reserves this margin unless the mini player needs it. */
+    int bottom_margin = mini_visible() ? MINI_H
+                       : plain_album    ? (sheet_note[0] ? 40 : 0)
+                       : artist_page    ? 0
+                       : 40;
+    int h = FB_H - top - bottom_margin;
     return h / ROW_H;
 }
 
@@ -1985,6 +2705,7 @@ static void pod_play_episode(int idx) {
     cur_track = 0;
     q_album[0] = '\0';
     q_artist[0] = '\0';
+    q_pending_at = -1;   /* BG85: podcasts never go through queue_play_next() */
     audio_set_next(NULL);
     audio_set_speed(pod_speed_permille);
     audio_play(pod_eps[idx].path);
@@ -2052,18 +2773,123 @@ static lib_row_t *row_at(int absolute) {
  * raised on the tick a row actually crosses. That is the whole fix for the
  * smoothness this was chasing — not a cheaper redraw, just far fewer of
  * them: one per 72px of travel instead of one on nearly every tick. */
+/* Reported live: replaces the old inline disc-number-next-to-track-number
+ * column with a full-width banner (icon, "Disc N", that disc's own total
+ * playtime) inserted before each disc's first track. Height chosen to sit
+ * clearly apart from a ROW_H (72) track row without dominating the list. */
+#define DISC_BANNER_H 56
+
+static int track_disc_num(int idx) {
+    return tracks[idx].disc > 0 ? tracks[idx].disc : 1;
+}
+
+/* Whether this album's tracks span more than one disc -- same rule the
+ * banner and the old inline number both gate on: a single-disc album (or
+ * one where every track is untagged, normalising to disc 1) gets no
+ * marking at all, nothing to distinguish.
+ *
+ * BG86: never for a playlist. Each track's `disc` field is leftover
+ * metadata from whichever album it originally belonged to, not something
+ * meaningful about the playlist's own ordering -- a playlist mixing tracks
+ * from several discs/albums saw banners inserted between essentially
+ * unrelated songs, at whatever points their carried-over disc numbers
+ * happened to differ. track_index_at() and the draw loop agree with each
+ * other about where those banners shift every row below them to, so there
+ * was never an actual draw/tap mismatch -- but nobody browsing a playlist
+ * expects disc banners to begin with, so the shift reads as "tapped one
+ * row, a different track got selected." */
+static int tracks_multi_disc(void) {
+    if (browsing_is_playlist) return 0;
+    if (track_n <= 1) return 0;
+    int first = track_disc_num(0);
+    for (int i = 1; i < track_n; i++)
+        if (track_disc_num(i) != first) return 1;
+    return 0;
+}
+
+/* Total extra height every disc banner adds -- disc 1 gets one too (same
+ * convention the old inline number used: idx == 0 always counted as a
+ * "disc start"), not just discs 2 onward. Needed up front by
+ * tracks_max_px() the same way track_n * ROW_H already is; the draw loop
+ * and track_index_at() below recompute the same banner positions their own
+ * way rather than sharing this exact number, since they need to know
+ * *where* each one falls, not just how many pixels they add in total. */
+static int tracks_banner_px(void) {
+    if (!tracks_multi_disc()) return 0;
+    int n = 1;
+    for (int i = 1; i < track_n; i++)
+        if (track_disc_num(i) != track_disc_num(i - 1)) n++;
+    return n * DISC_BANNER_H;
+}
+
+/* Content-space y (i.e. content_y = y + off, the same coordinate the draw
+ * loop's own `ry` runs in) to the track index whose row contains it,
+ * walking the identical banner-then-row layout the draw loop below lays
+ * out -- the one place both have to agree, or a tap would land one row
+ * away from what's actually drawn there, the exact class of bug BG2/BG61
+ * already fixed once for scroll_px. Returns -1 for a y landing on a banner
+ * itself, the header, or past the last track -- same "does nothing" rule
+ * every other non-row tap target on this screen already follows. */
+static int track_index_at(int content_y) {
+    int multi_disc = tracks_multi_disc();
+    int ry = tracks_hdr_h();
+    int last_disc = -999;
+    for (int idx = 0; idx < track_n; idx++) {
+        int disc = track_disc_num(idx);
+        if (multi_disc && disc != last_disc) {
+            if (content_y >= ry && content_y < ry + DISC_BANNER_H) return -1;
+            ry += DISC_BANNER_H;
+            last_disc = disc;
+        }
+        if (content_y >= ry && content_y < ry + ROW_H) return idx;
+        ry += ROW_H;
+    }
+    return -1;
+}
+
+/* Disc banner's own icon, same vendored-and-baked pipeline as the gear
+ * icon (R51) -- compact-disc-solid-full.svg via gen_icons.py. */
+static void draw_disc_icon(uint16_t *fb, int x, int y, uint16_t c) {
+    draw_icon(fb, FB_W, FB_H, x, y, &icon_disc, c);
+}
+
 /* R46 follow-up: exact max scroll offset for the album-detail screen, shared
  * by scroll_to_px() and the inertia tick's spring-back -- both need the same
  * number and neither should compute it slightly differently. */
 static int tracks_max_px(void) {
-    int content_px = tracks_hdr_h() + track_n * ROW_H;
-    int visible_px = FB_H - (mini_visible() ? MINI_H : 40);
+    int content_px = tracks_hdr_h() + track_n * ROW_H + tracks_banner_px();
+    /* Reported live: reserving the 40px sheet_note margin even when there's
+     * no toast to show it left a track settling with its bottom half cut
+     * off at that boundary for no reason -- see vis_rows()'s matching
+     * comment. Only this function/vis_rows()/the draw block's own clip_bot
+     * need to agree, since this screen is the only caller of all three. */
+    int bottom_margin = mini_visible() ? MINI_H : (sheet_note[0] ? 40 : 0);
+    int visible_px = FB_H - bottom_margin;
+    int max_px = content_px - visible_px;
+    return max_px < 0 ? 0 : max_px;
+}
+
+/* Artist page's own version of the pair above -- photo/name/count header,
+ * then the album list, then the bio wrapped underneath. No sheet_note
+ * margin to account for: that toast only ever comes from the album page's
+ * own long-press sheet, which this screen has no equivalent gesture for. */
+static int artist_page_content_px(void) {
+    int hdr = artist_page_hdr_h();
+    int albums_px = artist_page_album_n * ROW_H;
+    int bio_y = hdr + albums_px;
+    int bio_h = artist_bio_layout(NULL, 0, bio_y, FB_W - 48, 0, 0, 0);
+    return bio_y + bio_h;
+}
+
+static int artist_page_max_px(void) {
+    int content_px = artist_page_content_px();
+    int visible_px = FB_H - (mini_visible() ? MINI_H : 0);
     int max_px = content_px - visible_px;
     return max_px < 0 ? 0 : max_px;
 }
 
 static int scroll_to_px(int total_px) {
-    if (screen == SC_TRACKS && !ab_list && !pod_list) {
+    if ((screen == SC_TRACKS && !ab_list && !pod_list) || screen == SC_ARTIST_PAGE) {
         /* R46 follow-up: exact pixel bounds, not the ceil()'d row-count
          * `limit` every other screen below uses -- rounding a fractional
          * last row up to a whole ROW_H let scroll go a full row past the
@@ -2073,8 +2899,13 @@ static int scroll_to_px(int total_px) {
          * third of the actual finger travel, so it gives rather than
          * stopping dead -- the spring-back on release lives in the
          * inertia tick below, which also drives this screen since it's
-         * marked "continuous" there. */
-        int max_px = tracks_max_px();
+         * marked "continuous" there.
+         *
+         * The artist page shares this exact same branch, not a parallel
+         * copy -- same continuous-scroll mechanics (photo sliding with a
+         * list beneath it), just artist_page_max_px() instead of
+         * tracks_max_px() for where the bottom actually is. */
+        int max_px = (screen == SC_ARTIST_PAGE) ? artist_page_max_px() : tracks_max_px();
         if (total_px < 0) total_px = total_px / 3;
         else if (total_px > max_px) total_px = max_px + (total_px - max_px) / 3;
         /* Floor division, not C's truncate-toward-zero -- total_px can be
@@ -2162,6 +2993,7 @@ static void queue_insert(int track_idx, int at) {
     if (queue_n == 0) {
         snprintf(q_artist, sizeof(q_artist), "%s", cur_artist);
         snprintf(q_album,  sizeof(q_album),  "%s", cur_album);
+        q_is_playlist = browsing_is_playlist;
     }
     if (queue_n >= QUEUE_MAX) return;
     if (at < 0 || at > queue_n) at = queue_n;
@@ -2170,8 +3002,97 @@ static void queue_insert(int track_idx, int at) {
     queue[at] = tracks[track_idx];
     queue_n++;
     if (at <= cur_track && queue_n > 1) cur_track++;   /* keep pointing at the same song */
+    /* Reported live: "Add to queue" (not just Play Next) from a different
+     * album while one was playing had the same wrong-album-page-on-swipe-
+     * back problem BG73 fixed for Play Next -- queue_insert() is the one
+     * place both funnel through, so it's the one place that has to know
+     * the queue stopped being a single clean album, not the caller. Skipped
+     * for a playlist queue, same reasoning as queue_play_next()'s own
+     * comment: a playlist was already an arbitrary mix of albums/artists
+     * from the start, adding one more track to it isn't a new state. */
+    if (!q_is_playlist) queue_mixed = 1;
     queue_follower();                                  /* what comes next may have changed */
     mlog("[music] queued %s at %d\n", queue[at].name, at);
+}
+
+/* BG73: "Play next" specifically, as opposed to plain queue_insert()'s
+ * splice-and-shift ("add to queue"). Reported live: queuing a track from a
+ * different album while one was already playing left the old album's own
+ * remaining tracks sitting in the queue behind it, and q_artist/q_album
+ * (the queue's own recorded identity, used e.g. when swiping back from Now
+ * Playing to a track's album) never updated to the new track's album either
+ * -- both because queue_insert() only ever sets them from a cold start
+ * (queue_n == 0), not on every insert. An album's remaining tracks are only
+ * queued because that's what starting playback does, not because the user
+ * chose them, so a deliberate Play Next should displace them, not merely
+ * delay them behind one more track. A playlist is different -- its order
+ * was actually chosen -- so Play Next there still just slots the new track
+ * in and leaves the rest of the playlist to resume after it, same as
+ * queue_insert() already does for everyone. */
+static void queue_play_next(int track_idx) {
+    if (track_idx < 0 || track_idx >= track_n) return;
+    if (queue_n > 0 && !q_is_playlist && cur_track + 1 < queue_n) {
+        queue_n = cur_track + 1;      /* drop the old album's leftovers */
+        /* queue_mixed is set below, inside queue_insert() -- true either
+         * way once this truncation has happened, so no need to duplicate
+         * it here. */
+    }
+    if (queue_n == 0) {
+        /* Nothing playing yet -- no "currently playing album" to keep
+         * showing, so this is safe (and needed: queue_insert() below only
+         * sets q_artist/q_album from a cold start, same as it always did). */
+        snprintf(q_artist, sizeof(q_artist), "%s", cur_artist);
+        snprintf(q_album,  sizeof(q_album),  "%s", cur_album);
+        q_is_playlist = browsing_is_playlist;
+    } else if (!q_is_playlist) {
+        /* BG85: defer -- see queue_apply_pending()'s own comment. The new
+         * track lands right after cur_track (queue_insert() below), so
+         * that's exactly the index playback has to reach for this to
+         * become true. */
+        snprintf(q_artist_pending, sizeof(q_artist_pending), "%s", cur_artist);
+        snprintf(q_album_pending,  sizeof(q_album_pending),  "%s", cur_album);
+        q_pending_at = cur_track + 1;
+    }
+    queue_insert(track_idx, cur_track + 1);
+}
+
+/* Whether queueing what's currently being *browsed* into the queue that's
+ * currently *playing* would mix two kinds that have no business sharing one
+ * queue. queue[] is deliberately one array for everything (podcast episodes,
+ * book chapters and music tracks are all just lib_track_t paths by the time
+ * they reach it), which is what let R58 give podcasts real queueing for free
+ * -- but "the queue is generic" is an implementation detail, not a promise
+ * that a podcast episode belongs in the middle of an album.
+ *
+ * The three kinds genuinely don't interchange: a book's queue *is* its
+ * chapter table (ab_follow()/ab_save_current_pos() index straight into
+ * ab_book.chap[] by cur_track, so a foreign entry spliced in desynchronises
+ * both), podcast_mode drives an entirely different Now Playing transport
+ * and its own resume-position store, and each mode's end-of-queue behaviour
+ * differs. Nothing crashes on a mix -- it just plays as an entry the
+ * surrounding UI is describing wrongly, which is worse than refusing.
+ *
+ * Radio isn't listed: it has no queue at all (queue_follower() hands the
+ * worker NULL outright while radio_mode), so there's nothing to mix into --
+ * the guard below treats a radio queue as empty and lets the insert start a
+ * fresh one, same as any other cold start. */
+static int queue_kind_conflict(void) {
+    if (queue_n == 0 || !audio_is_active()) return 0;   /* nothing to mix with */
+    int browsing_pod = pod_list, playing_pod = podcast_mode;
+    if (audiobook_mode) return 1;      /* a book's queue takes no foreign entries at all */
+    return browsing_pod != playing_pod;
+}
+
+/* Call after every cur_track update that could be crossing into a
+ * queue_play_next() track -- play_index() and the natural gapless-advance
+ * path both need this, since either can be how playback actually reaches
+ * it. A no-op whenever nothing is pending, or the newly-current track
+ * hasn't reached it yet. */
+static void queue_apply_pending(void) {
+    if (q_pending_at < 0 || cur_track < q_pending_at) return;
+    snprintf(q_artist, sizeof(q_artist), "%s", q_artist_pending);
+    snprintf(q_album,  sizeof(q_album),  "%s", q_album_pending);
+    q_pending_at = -1;
 }
 
 static void play_station(int i) {
@@ -2307,9 +3228,23 @@ static void queue_follower(void) {
 static void play_index(int i) {
     radio_mode = 0;
     audiobook_mode = 0;
-    podcast_mode = 0;
+    /* R58: NOT podcast_mode = 0 here any more. This is the generic
+     * "advance within queue[]" function -- Next/Prev, a tap in SC_QUEUE,
+     * and the natural end-of-track fallback restart all funnel through it
+     * -- and now that a podcast episode can have a real next-queued
+     * episode (queue_play_next()/queue_insert(), reachable from the
+     * episode list's own long-press sheet same as music), those same
+     * generic callers are exactly how playback advances within a podcast
+     * queue too. Forcing podcast_mode off here would silently drop back
+     * into the plain-music Now Playing UI/end-of-queue behaviour the
+     * moment a queued episode's turn came up. The one place that
+     * legitimately starts something that ISN'T a podcast -- a fresh
+     * browse from Albums/Playlists -- sets podcast_mode = 0 itself
+     * (play_from_list()), same as it already owns queue_mixed/
+     * q_pending_at's fresh-start reset. */
     if (i < 0 || i >= queue_n) return;
     cur_track = i;
+    queue_apply_pending();   /* BG85 */
     audio_play(queue[i].path);
     /* R23: the track's own artist wins when it has one, same reasoning
      * Now Playing's display already uses (BG30) -- q_artist is the
@@ -2336,6 +3271,10 @@ static void play_from_list(int idx) {
     queue_n = track_n;
     snprintf(q_artist, sizeof(q_artist), "%s", cur_artist);
     snprintf(q_album,  sizeof(q_album),  "%s", cur_album);
+    q_is_playlist = browsing_is_playlist;    /* BG73 */
+    queue_mixed = 0;                         /* BG73 follow-up: a fresh queue is always clean */
+    q_pending_at = -1;                       /* BG85: a fresh queue has nothing pending */
+    podcast_mode = 0;                        /* R58: play_index() no longer clears this itself */
     play_index(idx);
 }
 
@@ -2385,6 +3324,7 @@ static void ab_play_chapter(int i) {
         queue_n = track_n;
         snprintf(q_album, sizeof(q_album), "%s", cur_album);
         q_artist[0] = '\0';
+        q_pending_at = -1;   /* BG85: audiobooks never go through queue_play_next() */
     }
     cur_track = i;
     const char *path = ab_book.files[ab_book.chap[i].file];
@@ -2806,7 +3746,100 @@ static void pod_draw_notes(uint16_t *fb, int x, int y, int w, int h) {
     }
 }
 
+/* T9 keyboard's own key geometry -- shared between the draw side and the
+ * tap handler below so the two can never disagree about where a key is,
+ * the same reasoning every other hit-zone pair in this file already
+ * follows (e.g. BG47's skip-arc zones). */
+#define KB_GRID_Y 220
+#define KB_KEY_W  (FB_W / 3)
+#define KB_KEY_H  130
+static int kb_key_x(int col) { return col * KB_KEY_W; }
+static int kb_key_y(int row) { return KB_GRID_Y + row * KB_KEY_H; }
+
+/* Row-major 4x3: rows 0-2 are the phone keypad's 1-9, row 3 is mode-toggle/
+ * space/backspace. -1 marks the two control slots so the tap handler and
+ * draw side share one lookup instead of a parallel special-case list. */
+static const int KB_GRID[4][3] = {
+    { 1, 2, 3 },
+    { 4, 5, 6 },
+    { 7, 8, 9 },
+    { -1, 0, -2 },   /* -1 = mode toggle, -2 = backspace; 0 is the real space key */
+};
+
+/* Labels are hand-written rather than derived from the cycle strings so
+ * the letter keys can read "ABC" instead of "abc2ABC" -- the digit and the
+ * uppercase run are in the cycle for typing, not for display. Symbols and
+ * numbers labels do match their cycles exactly, since there's nothing to
+ * hide there. */
+static const char *kb_key_label(int mode, int key) {
+    static const char *letters[10] = { "space", ".,?!", "ABC", "DEF", "GHI",
+        "JKL", "MNO", "PQRS", "TUV", "WXYZ" };
+    static const char *numbers[10] = { "0", "1", "2", "3", "4",
+        "5", "6", "7", "8", "9" };
+    static const char *symbols[10] = { "space", "\"#$", "%&'", "()*", "+-/",
+        ":;=", "<>@", "[\\]", "^_`", "{|}~" };
+    return mode == KB_MODE_NUMBERS ? numbers[key]
+         : mode == KB_MODE_SYMBOLS ? symbols[key] : letters[key];
+}
+
+/* The mode key names what you'll get, not where you are. */
+static const char *kb_mode_key_label(void) {
+    return kb_mode == KB_MODE_LETTERS ? "123"
+         : kb_mode == KB_MODE_NUMBERS ? "#+=" : "ABC";
+}
+
+static void draw_keyboard(uint16_t *fb) {
+    fill_rect(fb, 0, 0, FB_W, FB_H, COL_BG);
+    draw_text(fb, 24, 56, kb_title, COL_TEXT, TEXT_PX_BODY, FB_W - 180);
+    draw_text(fb, 24, 20, "Cancel", COL_DIM, TEXT_PX_SMALL, 200);
+    draw_right_col(fb, 20, "Done", COL_ACCENT);
+
+    /* The buffer being edited, in a bordered field of its own so it reads
+     * as "the thing you're typing" rather than another button. Right-
+     * aligned scroll would be nicer for a long passphrase overflowing the
+     * field, but this app has never needed that anywhere else either --
+     * plain left-clipped text, same as every list row already does. */
+    int fy = 100;
+    fill_rect(fb, 24, fy, FB_W - 48, 70, COL_ROW);
+    fill_rect(fb, 24, fy + 70 - 1, FB_W - 48, 1, COL_LINE);
+    draw_text_clip(fb, KB_FIELD_X, fy + 22, kb_buf[0] ? kb_buf : "", COL_TEXT, TEXT_PX_BODY,
+                   FB_W - 24, fy, fy + 70);
+    /* Caret. Drawn solid rather than blinking: a blink needs its own
+     * repaint tick, and on a screen that otherwise only redraws on input
+     * that would be the sole reason to wake the UI loop continuously. */
+    {
+        int cx = kb_caret_x(kb_cursor);
+        if (cx > FB_W - 28) cx = FB_W - 28;   /* keep it inside the field on overflow */
+        fill_rect(fb, cx, fy + 16, 2, TEXT_PX_BODY + 10, COL_ACCENT);
+    }
+
+    for (int row = 0; row < 4; row++) {
+        for (int col = 0; col < 3; col++) {
+            int key = KB_GRID[row][col];
+            int x = kb_key_x(col), y = kb_key_y(row);
+            fill_rect(fb, x + 4, y + 4, KB_KEY_W - 8, KB_KEY_H - 8, COL_ROW);
+            const char *label;
+            uint16_t col_txt = COL_TEXT;
+            if (key == -1) { label = kb_mode_key_label(); col_txt = COL_ACCENT; }
+            else if (key == -2) { label = "<-"; col_txt = COL_ACCENT; }
+            else label = kb_key_label(kb_mode, key);
+            int lw = text_width(label, TEXT_PX_BODY);
+            draw_text(fb, x + (KB_KEY_W - lw) / 2, y + (KB_KEY_H - TEXT_PX_BODY) / 2 - 4,
+                     label, col_txt, TEXT_PX_BODY, x + KB_KEY_W);
+            /* The digit itself, small, in the corner -- phone-keypad muscle
+             * memory still applies even though this is a touchscreen. Not in
+             * numbers mode, where the big label already *is* the digit and a
+             * second copy in the corner just reads as a smudge. */
+            if (key >= 0 && kb_mode != KB_MODE_NUMBERS) {
+                char dbuf[2] = { (char)('0' + key), 0 };
+                draw_text(fb, x + KB_KEY_W - 22, y + 10, dbuf, COL_DIM, TEXT_PX_SMALL, x + KB_KEY_W);
+            }
+        }
+    }
+}
+
 static void draw_screen(uint16_t *fb) {
+    if (screen == SC_KEYBOARD) { draw_keyboard(fb); return; }
     fill_rect(fb, 0, 0, FB_W, FB_H, COL_BG);
     /* The player has no title bar at all: a strip saying "Now playing" over a
      * screen showing the track, the artist and the artwork was telling you
@@ -2821,7 +3854,7 @@ static void draw_screen(uint16_t *fb) {
      * way Now Playing already does, for the same reason -- the cover runs
      * edge-to-edge from y=0, and there's no room left for either. Back is
      * the swipe gesture everywhere else already relies on. */
-    if (screen != SC_PLAYING && !(screen == SC_TRACKS && !ab_list && !pod_list)) {
+    if (screen != SC_PLAYING && screen != SC_ARTIST_PAGE && !(screen == SC_TRACKS && !ab_list && !pod_list)) {
         fill_rect(fb, 0, 0, FB_W, CONTENT_Y, COL_HEADER);
     }
 
@@ -2857,6 +3890,9 @@ static void draw_screen(uint16_t *fb) {
     else if (screen == SC_SETTINGS_ABOUT) { title = "About"; right = "BACK"; }
     else if (screen == SC_SETTINGS_TIMEZONE) { title = "Timezone"; right = "BACK"; }
     else if (screen == SC_SETTINGS_THEMEMODE) { title = "Theme"; right = "BACK"; }
+    else if (screen == SC_SETTINGS_WIFI) { title = "Wi-Fi"; right = "BACK"; }
+    else if (screen == SC_SETTINGS_BT)   { title = "Bluetooth"; right = "BACK"; }
+    else if (screen == SC_SETTINGS_USB)  { title = "USB working mode"; right = "BACK"; }
     else if (screen == SC_QUEUE) { title = "Queue"; right = "BACK"; }
     else if (screen == SC_MUSIC_MENU)     { title = "Music"; right = "BACK"; }
 
@@ -2867,7 +3903,7 @@ static void draw_screen(uint16_t *fb) {
      * way Now Playing already does, for the same reason -- the cover runs
      * edge-to-edge from y=0, and there's no room left for either. Back is
      * the swipe gesture everywhere else already relies on. */
-    if (screen != SC_PLAYING && !(screen == SC_TRACKS && !ab_list && !pod_list)) {
+    if (screen != SC_PLAYING && screen != SC_ARTIST_PAGE && !(screen == SC_TRACKS && !ab_list && !pod_list)) {
         int rw = text_width(right, TEXT_PX_SMALL);
         draw_text(fb, 18, STATUS_H + 14, title, COL_TEXT, TEXT_PX_TITLE, FB_W - rw - 40);
         draw_text(fb, FB_W - 24 - rw, STATUS_H + 20, right, COL_DIM, TEXT_PX_SMALL, FB_W);
@@ -2885,6 +3921,16 @@ static void draw_screen(uint16_t *fb) {
             draw_text(fb, pod_sync_x(), STATUS_H + 20,
                       pod_update_running() ? "Syncing" : "Sync",
                       pod_update_running() ? COL_DIM : COL_ACCENT, TEXT_PX_SMALL, FB_W);
+        }
+        /* R52: Queue's one extra header action -- drop everything queued
+         * after the currently-playing track. Dimmed when there's nothing
+         * past it to clear, same "nothing would happen" convention Sync
+         * uses while already running, rather than a tap that silently does
+         * nothing with no indication why. */
+        if (screen == SC_QUEUE) {
+            int has_more = cur_track >= 0 && cur_track + 1 < queue_n;
+            draw_text(fb, queue_clear_x(), STATUS_H + 20, "Clear",
+                      has_more ? COL_ACCENT : COL_DIM, TEXT_PX_SMALL, FB_W);
         }
         draw_status(fb);
         fill_rect(fb, 0, CONTENT_Y - 1, FB_W, 1, COL_LINE);
@@ -2984,6 +4030,26 @@ static void draw_screen(uint16_t *fb) {
     }
 
     if (screen == SC_QUEUE) {
+        /* R50: track count (the whole queue, matching what the list below
+         * actually has rows for) and remaining playtime (summed from the
+         * currently-playing track onward, not the whole queue -- "how much
+         * music is left" is what a summary line is actually useful for, not
+         * a total that includes tracks already heard). Fixed above the
+         * scrolling rows rather than the first row's own slot, so it stays
+         * on screen regardless of scroll position (vis_rows() already
+         * carves out the room for it). */
+        {
+            char cbuf[24], dbuf[16], line[48];
+            snprintf(cbuf, sizeof(cbuf), "%d track%s", queue_n, queue_n == 1 ? "" : "s");
+            int64_t remain_ms = 0;
+            int from = (cur_track >= 0 && cur_track < queue_n) ? cur_track : 0;
+            for (int i = from; i < queue_n; i++) remain_ms += queue[i].dur_ms;
+            fmt_dur(dbuf, sizeof(dbuf), remain_ms);
+            snprintf(line, sizeof(line), "%s \xc2\xb7 %s total", cbuf, dbuf);
+            draw_text_clip(fb, 24, y + 16, line, COL_DIM, TEXT_PX_SMALL, FB_W - 40, CONTENT_Y, clip_bot);
+            fill_rect_clip(fb, 0, y + QUEUE_SUMMARY_H - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
+        }
+        y += QUEUE_SUMMARY_H;
         /* BG71: the actual upcoming play order -- queue_display_index()
          * walks shuffle_order[] when shuffle's on rather than plain array
          * order, so this genuinely reflects what happens next rather than
@@ -3042,8 +4108,21 @@ static void draw_screen(uint16_t *fb) {
                 if (book_total <= 0) book_total = chap_dur;
             }
             int64_t chap_start = ch ? ch->file_start_ms : 0;
+            /* BG80: right after a chapter/book (re)opens, the worker thread
+             * can take a while to actually get to the queued seek -- opening
+             * a decoder, or a fresh Bluetooth PCM connection especially --
+             * during which audio_pos_ms() genuinely reads 0/whatever the
+             * previous file left behind, not where we just asked to resume.
+             * Drawing that raw looks like the player reset to the chapter's
+             * start for a moment before snapping to the real position.
+             * audio_seek_pending_ms() is the target we actually asked for,
+             * still outstanding until the worker applies it -- prefer it
+             * over the live position for exactly that window, after which
+             * it's -1 and audio_pos_ms() has already caught up to it. */
+            int pending = audio_seek_pending_ms();
+            int64_t live_pos = (pending >= 0) ? pending : audio_pos_ms();
             int chap_pos = scrub_active ? scrub_ms(chap_dur)
-                                        : (int)(audio_pos_ms() - chap_start);
+                                        : (int)(live_pos - chap_start);
             if (chap_pos < 0) chap_pos = 0;
             int64_t book_pos = (ch ? ch->book_start_ms : 0) + chap_pos;
 
@@ -3327,16 +4406,24 @@ static void draw_screen(uint16_t *fb) {
              * this anywhere else was what read as "not in line with" that
              * screen. Ring is COL_DIM always, same weight as the artist
              * line -- a first attempt made it COL_TEXT/COL_ACCENT, too bold
-             * for a secondary control; only the letter inside brightens to
-             * COL_ACCENT when a mode is actually engaged. */
+             * for a secondary control; only the icon inside brightens to
+             * COL_ACCENT when a mode is actually engaged.
+             *
+             * Reported live: the plain "S"/"R"/"-" letters replaced with
+             * real icons -- bars (default/off), repeat, shuffle, vendored
+             * through the same gen_icons.py pipeline as every other icon,
+             * grouped as one family (see gen_icons.py's own comment) so
+             * the three share a crop box and come out the same visual
+             * weight, since they swap for each other at this exact spot. */
             int pmx = mid - 96 - 82, pmy = cyy;
             int pm_on = shuffle_enabled || repeat_mode != REPEAT_OFF;
             fill_circle(fb, pmx, pmy, 26, COL_DIM);
             fill_circle(fb, pmx, pmy, 25, COL_BG);
-            const char *pmlabel = shuffle_enabled ? "S" : repeat_mode != REPEAT_OFF ? "R" : "-";
-            int lw = text_width(pmlabel, TEXT_PX_BODY);
-            draw_text(fb, pmx - lw / 2, pmy - TEXT_PX_BODY / 2 + 2, pmlabel,
-                      pm_on ? COL_ACCENT : COL_DIM, TEXT_PX_BODY, FB_W);
+            const icon_t *pmicon = shuffle_enabled ? &icon_mode_shuffle
+                                  : repeat_mode != REPEAT_OFF ? &icon_mode_repeat
+                                  : &icon_mode_off;
+            draw_icon(fb, FB_W, FB_H, pmx - 13, pmy - 13, pmicon,
+                      pm_on ? COL_ACCENT : COL_DIM);
         }
 
         fill_circle(fb, mid, cyy, 42, COL_ACCENT);
@@ -3429,6 +4516,12 @@ static void draw_screen(uint16_t *fb) {
          * technique Settings already uses for its own not-a-clean-multiple-
          * of-ROW_H content) rather than scroll indexing directly into
          * tracks[], since the header's own height isn't a ROW_H multiple. */
+        /* Reported live: shadows the outer clip_bot (declared above, shared
+         * by every other screen) with this screen's own -- matches
+         * vis_rows()/tracks_max_px()'s reasoning exactly, and has to, since
+         * a mismatch here would mean the scroll bounds and what's actually
+         * drawn disagree about where the bottom of the content is. */
+        int clip_bot = FB_H - (mini_visible() ? MINI_H : (sheet_note[0] ? 40 : 0));
         int off = scroll * ROW_H + scroll_px;
         int header_h = tracks_hdr_h();
 
@@ -3473,53 +4566,118 @@ static void draw_screen(uint16_t *fb) {
         }
         fill_rect_clip(fb, 0, header_h - off - 1, FB_W, 1, COL_LINE, 0, clip_bot);
 
-        /* Multi-disc marking, same rule as the ab_list/pod_list path below
-         * (those never carry real disc numbers, so it's always off there --
-         * this is the branch it actually matters for). */
-        int multi_disc = 0;
-        if (track_n > 1) {
-            int first_disc = tracks[0].disc > 0 ? tracks[0].disc : 1;
-            for (int i = 1; i < track_n; i++) {
-                int d = tracks[i].disc > 0 ? tracks[i].disc : 1;
-                if (d != first_disc) { multi_disc = 1; break; }
-            }
-        }
-
-        int first_idx = (off - header_h) / ROW_H;
-        if (first_idx < 0) first_idx = 0;
-        for (int idx = first_idx; idx < track_n; idx++) {
-            int ry = header_h + idx * ROW_H - off;
-            if (ry > clip_bot) break;
+        /* Reported live: a full-width banner (icon, "Disc N", that disc's
+         * own total playtime) before each disc's first track, replacing
+         * the old inline number next to the track number. Walks from
+         * idx == 0 every draw rather than starting from a first_idx shortcut
+         * the way this loop used to -- banners make a row's position
+         * depend on how many came before it, not just a flat idx * ROW_H,
+         * so there's no cheap way to jump straight to an arbitrary offset
+         * any more. track_n tops out in the low hundreds, so walking all of
+         * it every redraw is not a real cost -- tracks_max_px()'s own
+         * duration-summing loop already does the same over every track on
+         * every scroll_to_px() call. */
+        int multi_disc = tracks_multi_disc();
+        int ry = header_h;
+        int last_disc = -999;
+        for (int idx = 0; idx < track_n; idx++) {
             lib_track_t *t = &tracks[idx];
-            int playing = audio_is_active() && idx == cur_track &&
-                         !strcmp(cur_album, q_album) && !strcmp(cur_artist, q_artist);
-            if (playing) {
-                fill_rect_clip(fb, 0, ry, FB_W, ROW_H, COL_ROW, 0, clip_bot);
-                fill_rect_clip(fb, 0, ry, 4, ROW_H, COL_ACCENT, 0, clip_bot);
+            int disc = track_disc_num(idx);
+            if (multi_disc && disc != last_disc) {
+                int by = ry - off;
+                if (by + DISC_BANNER_H > 0 && by < clip_bot) {
+                    int64_t disc_ms = 0;
+                    for (int j = idx; j < track_n && track_disc_num(j) == disc; j++)
+                        disc_ms += tracks[j].dur_ms;
+                    char discbuf[24], dbuf[16];
+                    snprintf(discbuf, sizeof(discbuf), "Disc %d", disc);
+                    fmt_dur(dbuf, sizeof(dbuf), disc_ms);
+                    fill_rect_clip(fb, 0, by, FB_W, DISC_BANNER_H, COL_HEADER, 0, clip_bot);
+                    draw_disc_icon(fb, 20, by + (DISC_BANNER_H - 28) / 2, COL_DIM);
+                    draw_text_clip(fb, 58, by + (DISC_BANNER_H - TEXT_PX_BODY) / 2 - 2, discbuf,
+                                  COL_TEXT, TEXT_PX_BODY, FB_W - 140, 0, clip_bot);
+                    draw_right_clip(fb, by + (DISC_BANNER_H - TEXT_PX_SMALL) / 2, dbuf, 0, clip_bot);
+                    fill_rect_clip(fb, 0, by + DISC_BANNER_H - 1, FB_W, 1, COL_LINE, 0, clip_bot);
+                }
+                ry += DISC_BANNER_H;
+                last_disc = disc;
             }
-            int disc = t->disc > 0 ? t->disc : 1;
-            int disc_start = multi_disc &&
-                (idx == 0 || (tracks[idx - 1].disc > 0 ? tracks[idx - 1].disc : 1) != disc);
-            int track_x = multi_disc ? 44 : 20;
-            if (disc_start) {
-                char discbuf[8];
-                snprintf(discbuf, sizeof(discbuf), "%d", disc);
-                draw_text_clip(fb, 20, ry + 22, discbuf, COL_ACCENT, TEXT_PX_SMALL, 40, 0, clip_bot);
+            int row_y = ry - off;
+            if (row_y > clip_bot) break;   /* rows only get later from here -- nothing further can be visible */
+            if (row_y + ROW_H > 0) {
+                int playing = audio_is_active() && idx == cur_track &&
+                             !strcmp(cur_album, q_album) && !strcmp(cur_artist, q_artist);
+                if (playing) {
+                    fill_rect_clip(fb, 0, row_y, FB_W, ROW_H, COL_ROW, 0, clip_bot);
+                    fill_rect_clip(fb, 0, row_y, 4, ROW_H, COL_ACCENT, 0, clip_bot);
+                }
+                if (t->track > 0) snprintf(buf, sizeof(buf), "%d", t->track);
+                else              buf[0] = '\0';
+                draw_text_clip(fb, 20, row_y + 22, buf, COL_DIM, TEXT_PX_SMALL,
+                              56, 0, clip_bot);
+                draw_text_clip(fb, 68, row_y + 20, t->name, playing ? COL_ACCENT : COL_TEXT,
+                              TEXT_PX_BODY, FB_W - 110, 0, clip_bot);
+                if (t->dur_ms > 0) {
+                    fmt_dur(buf, sizeof(buf), t->dur_ms);
+                    draw_right_clip(fb, row_y + 22, buf, 0, clip_bot);
+                }
+                fill_rect_clip(fb, 0, row_y + ROW_H - 1, FB_W, 1, COL_LINE, 0, clip_bot);
             }
-            if (t->track > 0) snprintf(buf, sizeof(buf), "%d", t->track);
-            else              buf[0] = '\0';
-            draw_text_clip(fb, track_x, ry + 22, buf, COL_DIM, TEXT_PX_SMALL,
-                          track_x + 36, 0, clip_bot);
-            draw_text_clip(fb, 68, ry + 20, t->name, playing ? COL_ACCENT : COL_TEXT,
-                          TEXT_PX_BODY, FB_W - 110, 0, clip_bot);
-            if (t->dur_ms > 0) {
-                fmt_dur(buf, sizeof(buf), t->dur_ms);
-                draw_right_clip(fb, ry + 22, buf, 0, clip_bot);
-            }
-            fill_rect_clip(fb, 0, ry + ROW_H - 1, FB_W, 1, COL_LINE, 0, clip_bot);
+            ry += ROW_H;
         }
         if (sheet_note[0] && !mini_visible())
             draw_text(fb, 24, FB_H - 34, sheet_note, COL_ACCENT, TEXT_PX_SMALL, FB_W - 48);
+        if (mini_visible()) draw_mini(fb);
+        return;
+    }
+
+    if (screen == SC_ARTIST_PAGE) {
+        /* Same continuous-scroll shape as the album page above: photo,
+         * name, a summary line, then content beneath all move together as
+         * one pixel offset -- here the content is an album list followed
+         * by the bio text rather than a track list. */
+        int clip_bot = FB_H - (mini_visible() ? MINI_H : 0);
+        int off = scroll * ROW_H + scroll_px;
+        int header_h = artist_page_hdr_h();
+
+        int photo_y = 0 - off;
+        fill_rect_clip(fb, 0, photo_y, ART_PX, ART_PX, COL_ROW, 0, clip_bot);
+        artist_blit_art_clip(fb, 0, photo_y, 0, clip_bot);
+
+        draw_text_clip(fb, 24, artist_page_title_y() - off, artist_page_name,
+                       COL_TEXT, TEXT_PX_TITLE, FB_W - 24, 0, clip_bot);
+        {
+            char cbuf[32];
+            snprintf(cbuf, sizeof(cbuf), "%d album%s", artist_page_album_n,
+                     artist_page_album_n == 1 ? "" : "s");
+            draw_text_clip(fb, 24, artist_page_info_y() - off, cbuf,
+                           COL_DIM, TEXT_PX_SMALL, FB_W, 0, clip_bot);
+        }
+        fill_rect_clip(fb, 0, header_h - off - 1, FB_W, 1, COL_LINE, 0, clip_bot);
+
+        for (int idx = 0; idx < artist_page_album_n; idx++) {
+            int ry = header_h + idx * ROW_H - off;
+            if (ry + ROW_H < 0) continue;
+            if (ry > clip_bot) break;
+            lib_row_t *r = &artist_page_albums[idx];
+            draw_text_clip(fb, 24, ry + 22, r->name, COL_TEXT,
+                          TEXT_PX_BODY, FB_W - 90, 0, clip_bot);
+            char cbuf[16];
+            snprintf(cbuf, sizeof(cbuf), "%d", r->count);
+            draw_right_clip(fb, ry + 22, cbuf, 0, clip_bot);
+            fill_rect_clip(fb, 0, ry + ROW_H - 1, FB_W, 1, COL_LINE, 0, clip_bot);
+        }
+
+        int bio_y = header_h + artist_page_album_n * ROW_H;
+        if (artist_art_loading) {
+            int ly = bio_y + 24 - off;
+            if (ly + 30 > 0 && ly < clip_bot)
+                draw_text_clip(fb, 24, ly, "Loading artist info...", COL_DIM,
+                               TEXT_PX_SMALL, FB_W - 48, 0, clip_bot);
+        } else if (artist_bio_text[0]) {
+            artist_bio_layout(fb, 24, bio_y + 24, FB_W - 48, off, 0, clip_bot);
+        }
+
         if (mini_visible()) draw_mini(fb);
         return;
     }
@@ -3940,20 +5098,56 @@ static void draw_screen(uint16_t *fb) {
         ry = set_row_about_y() - off;
         fill_rect_clip(fb, 0, ry - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
         draw_text_clip(fb, 24, ry + 20, "About", COL_TEXT, TEXT_PX_BODY, FB_W - 200, CONTENT_Y, clip_bot);
+        /* Reindex used to sit here and drew this row's closing line as part
+         * of its own block (see its own since-removed comment) -- now that
+         * it's gone, About draws its own trailing divider instead of
+         * leaving Wi-Fi with no line above it. */
+        fill_rect_clip(fb, 0, ry + ROW_H - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
 
-        /* Takes over closing the list from About. Status text doubles as
-         * the row's subtitle and its own progress readout -- no separate
-         * screen for something this small. */
-        ry = set_row_reindex_y() - off;
-        fill_rect_clip(fb, 0, ry - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
-        draw_text_clip(fb, 24, ry + 20, "Rebuild library index", COL_TEXT, TEXT_PX_BODY, FB_W - 200, CONTENT_Y, clip_bot);
+        ry = set_row_wifi_y() - off;
+        draw_text_clip(fb, 24, ry + 20, "Wi-Fi", COL_TEXT, TEXT_PX_BODY, FB_W - 200, CONTENT_Y, clip_bot);
         {
+            int on = st_wifi_on();
+            char nm[64] = "";
+            if (on) st_wifi_ssid(nm, sizeof(nm));
+            draw_right_clip(fb, ry + 20, on ? (nm[0] ? nm : "not connected") : "off", CONTENT_Y, clip_bot);
+        }
+        fill_rect_clip(fb, 0, ry + ROW_H - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
+
+        ry = set_row_bt_y() - off;
+        draw_text_clip(fb, 24, ry + 20, "Bluetooth", COL_TEXT, TEXT_PX_BODY, FB_W - 200, CONTENT_Y, clip_bot);
+        {
+            int on = st_bt_on();
+            char nm[64] = "";
+            if (on) st_bt_name(nm, sizeof(nm));
+            draw_right_clip(fb, ry + 20, on ? (nm[0] ? nm : "not connected") : "off", CONTENT_Y, clip_bot);
+        }
+        fill_rect_clip(fb, 0, ry + ROW_H - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
+
+        ry = set_row_usb_y() - off;
+        draw_text_clip(fb, 24, ry + 20, "USB working mode", COL_TEXT, TEXT_PX_BODY, FB_W - 200, CONTENT_Y, clip_bot);
+        {
+            int m = st_usb_mode();
+            draw_right_clip(fb, ry + 20, m == 0 ? "ADB" : m == 1 ? "USB Storage" : "Unplugged", CONTENT_Y, clip_bot);
+        }
+        fill_rect_clip(fb, 0, ry + ROW_H - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
+
+        ry = set_row_scan_y() - off;
+        draw_text_clip(fb, 24, ry + 20, "Scan library", COL_TEXT, TEXT_PX_BODY, FB_W - 200, CONTENT_Y, clip_bot);
+        {
+            /* One row, two passes underneath (scanner_rescan_now() kicks
+             * both -- see its own comment). Reports scanner.c's own count,
+             * the one that actually answers "how much music is there" --
+             * index.c's pass is the quieter per-track detail fill-in behind
+             * it and doesn't need its own number here. Still shown running
+             * if either is, so the row doesn't read "done" while index.c is
+             * still working through what this pass just found. */
             int scanned = 0, written = 0;
-            int started = index_scan_progress(&scanned, &written);
-            if (index_scan_running())
+            int started = scanner_scan_progress(&scanned, &written);
+            if (scanner_scan_running() || index_scan_running())
                 snprintf(buf, sizeof(buf), "Scanning… %d", scanned);
             else if (started)
-                snprintf(buf, sizeof(buf), "%d tracks indexed", scanned);
+                snprintf(buf, sizeof(buf), "%d files found", scanned);
             else
                 snprintf(buf, sizeof(buf), "Not started");
             draw_right_clip(fb, ry + 20, buf, CONTENT_Y, clip_bot);
@@ -4002,6 +5196,87 @@ static void draw_screen(uint16_t *fb) {
         draw_right(fb, ry + 20, ram_free);
         fill_rect(fb, 0, ry + ROW_H - 1, FB_W, 1, COL_LINE);
 
+        if (mini_visible()) draw_mini(fb);
+        return;
+    }
+
+    if (screen == SC_SETTINGS_WIFI) {
+        /* Short, non-scrolling screen -- doesn't need the set_row_*_y()
+         * scroll-position machinery SC_SETTINGS' own longer list uses. */
+        int ry = CONTENT_Y;
+        int on = st_wifi_on();
+        draw_text(fb, 24, ry + 20, "Wi-Fi", COL_TEXT, TEXT_PX_BODY, FB_W - 140);
+        draw_toggle_switch_h(fb, ry, on, ROW_H);
+        ry += ROW_H;
+        fill_rect(fb, 0, ry - 1, FB_W, 1, COL_LINE);
+
+        char nm[64] = "";
+        if (on) st_wifi_ssid(nm, sizeof(nm));
+        draw_text(fb, 24, ry + 20, "Status", COL_TEXT, TEXT_PX_BODY, FB_W - 24);
+        draw_text(fb, 24, ry + 46, on ? (nm[0] ? nm : "not connected") : "off",
+                  COL_DIM, TEXT_PX_SMALL, FB_W - 48);
+        ry += ROW_H;
+        fill_rect(fb, 0, ry - 1, FB_W, 1, COL_LINE);
+
+        /* R58-style scoping decision: scan-and-select (the normal path for
+         * a network in range) is the rest of this ticket's own remaining
+         * work. Manual entry is the one path that has to exist regardless
+         * -- a hidden network never shows up in a scan at all -- so it's
+         * what's wired all the way through this pass, exercising the full
+         * keyboard -> wpa_cli -> settings.txt pipeline end to end. */
+        draw_text(fb, 24, ry + 20, "Add network manually", COL_TEXT, TEXT_PX_BODY, FB_W - 48);
+        draw_text(fb, 24, ry + 46, "Network scanning coming soon", COL_DIM, TEXT_PX_SMALL, FB_W - 48);
+        ry += ROW_H;
+        fill_rect(fb, 0, ry - 1, FB_W, 1, COL_LINE);
+        return;
+    }
+
+    if (screen == SC_SETTINGS_BT) {
+        int ry = CONTENT_Y;
+        int on = st_bt_on();
+        draw_text(fb, 24, ry + 20, "Bluetooth", COL_TEXT, TEXT_PX_BODY, FB_W - 140);
+        draw_toggle_switch_h(fb, ry, on, ROW_H);
+        ry += ROW_H;
+        fill_rect(fb, 0, ry - 1, FB_W, 1, COL_LINE);
+
+        char nm[64] = "";
+        if (on) st_bt_name(nm, sizeof(nm));
+        draw_text(fb, 24, ry + 20, "Status", COL_TEXT, TEXT_PX_BODY, FB_W - 24);
+        draw_text(fb, 24, ry + 46, on ? (nm[0] ? nm : "not connected") : "off",
+                  COL_DIM, TEXT_PX_SMALL, FB_W - 48);
+        ry += ROW_H;
+        fill_rect(fb, 0, ry - 1, FB_W, 1, COL_LINE);
+
+        draw_text(fb, 24, ry + 20, "Scan for devices", COL_ACCENT, TEXT_PX_BODY, FB_W - 48);
+        ry += ROW_H;
+        fill_rect(fb, 0, ry - 1, FB_W, 1, COL_LINE);
+
+        /* Refreshed at most every 2s, not on every redraw -- this screen
+         * gets pulled into the once-a-second clock-tick redraw the same as
+         * every other screen (see the sec != last_sec dirty trigger), and
+         * a popen() to bluetoothctl on every one of those would be wasted
+         * work for a list that hasn't changed. Same shape as st_bt_name()'s
+         * own 10s cache, just a shorter window since this list is what a
+         * scan-in-progress is actively trying to grow. */
+        static bt_found_dev_t devs[8];
+        static int dev_n;
+        static time_t last_refresh;
+        time_t now = time(NULL);
+        if (now - last_refresh >= 2) {
+            dev_n = bt_scan_devices(devs, 8);
+            last_refresh = now;
+        }
+        if (dev_n == 0) {
+            draw_text(fb, 24, ry + 20, "No devices found yet", COL_DIM, TEXT_PX_SMALL, FB_W - 48);
+        } else {
+            for (int i = 0; i < dev_n && ry < FB_H - ROW_H; i++) {
+                draw_text_clip(fb, 24, ry + 20, devs[i].name[0] ? devs[i].name : devs[i].mac,
+                              COL_TEXT, TEXT_PX_BODY, FB_W - 48, CONTENT_Y, FB_H);
+                draw_right_clip(fb, ry + 20, devs[i].mac, CONTENT_Y, FB_H);
+                ry += ROW_H;
+                fill_rect(fb, 0, ry - 1, FB_W, 1, COL_LINE);
+            }
+        }
         if (mini_visible()) draw_mini(fb);
         return;
     }
@@ -4057,6 +5332,31 @@ static void draw_screen(uint16_t *fb) {
             }
             fill_rect(fb, 0, ry + ROW_H - 1, FB_W, 1, COL_LINE);
         }
+        if (mini_visible()) draw_mini(fb);
+        return;
+    }
+
+    if (screen == SC_SETTINGS_USB) {
+        /* ADB / Storage, driven by stock's own adbon/adboff -- see
+         * st_usb_mode()'s own comment in status.c. DAC and OTG need
+         * exclusive gadget ownership the same way Storage does, and
+         * aren't exposed here at all -- stock's own System menu still has
+         * them, untouched. */
+        static const char *names[2] = { "ADB", "USB Storage" };
+        int cur = st_usb_mode();
+        for (int i = 0; i < 2; i++) {
+            int ry = CONTENT_Y + i * ROW_H;
+            draw_text(fb, 24, ry + 20, names[i], COL_TEXT, TEXT_PX_BODY, FB_W - 100);
+            if (i == cur) {
+                int cx = FB_W - 44, cy = ry + ROW_H / 2;
+                draw_line(fb, cx - 10, cy, cx - 3, cy + 7, COL_ACCENT);
+                draw_line(fb, cx - 3, cy + 7, cx + 10, cy - 8, COL_ACCENT);
+            }
+            fill_rect(fb, 0, ry + ROW_H - 1, FB_W, 1, COL_LINE);
+        }
+        int dy = CONTENT_Y + 2 * ROW_H + 20;
+        draw_text(fb, 24, dy, "Switching to USB Storage disconnects ADB --", COL_DIM, TEXT_PX_SMALL, FB_W - 48);
+        draw_text(fb, 24, dy + 26, "the two need the USB port exclusively.", COL_DIM, TEXT_PX_SMALL, FB_W - 48);
         if (mini_visible()) draw_mini(fb);
         return;
     }
@@ -4118,6 +5418,59 @@ static int edge_active, edge_travel, edge_y;
 static int touch_down, touch_x, touch_y, touch_moved, hold_fired;
 static struct timespec touch_at;
 
+/* R59: holding a skip arc repeats it, escalating the per-repeat amount the
+ * longer it's held -- reuses hold_fired (above) to suppress the release-tap
+ * handler's own single skip once a hold has already fired at least one.
+ * skip_hold_dir is 0 (nothing armed yet this touch), -1 (holding the back
+ * arc) or +1 (holding the forward one) -- fixed at the moment the first
+ * repeat fires (from touch_x/touch_y, stable since a hold requires
+ * !touch_moved) so a hold can't retarget mid-gesture by drifting between
+ * zones. skip_hold_next_ms is the held-time threshold for the *next*
+ * repeat, in the same touch_at-relative clock the long-press sheet's own
+ * detection already uses. */
+static int  skip_hold_dir;
+static long skip_hold_next_ms;
+#define SKIP_REPEAT_MS 350   /* cadence once a hold is repeating */
+
+/* Escalation schedule, in the ticket's own words: "first hold = skip 10s,
+ * hold longer = skip 30s, hold even longer = skip 1 min." Keyed on total
+ * held time so it doesn't matter whether the interval above changes later --
+ * hold longer, bigger jumps, however often they land. */
+static int skip_hold_amount(long held_ms) {
+    if (held_ms < 3000) return 10000;
+    if (held_ms < 6000) return 30000;
+    return 60000;
+}
+
+/* -1/+1/0 (back/forward/not a skip zone) for a point in SC_PLAYING's
+ * transport row, mirroring the release-tap handler's own hit zones exactly
+ * -- audiobook's plain left/right thirds, podcast's midpoint-of-adjacent-
+ * centres zones (BG47) -- since a hold has to target the same button a tap
+ * there would have. Only the two skip zones matter here; every other zone
+ * (play/pause, speed ring, notes) has nothing to escalate by holding it. */
+static int skip_zone_at(int x, int y) {
+    if (audiobook_mode) {
+        int cby = ab_chapter_bar_y();
+        int cyy = cby + 58;
+        if (y <= cyy - 48 || y >= cyy + 48) return 0;
+        if (x < FB_W / 3) return -1;
+        if (x > 2 * FB_W / 3) return 1;
+        return 0;
+    }
+    if (podcast_mode) {
+        int bary = bar_y();
+        int cyy = bary + 70;
+        if (y <= cyy - 48 || y >= cyy + 48) return 0;
+        int mid = FB_W / 2;
+        int x10 = mid - POD_SKIP_OFF, xp30 = mid + POD_SKIP_OFF;
+        int xspd = pod_speed_x(mid), xicon = pod_info_x(mid);
+        if (x >= (xspd + x10) / 2 && x < (x10 + mid) / 2) return -1;
+        if (x >= (mid + xp30) / 2 && x < (!pod_notes_avail ? FB_W : (xp30 + xicon) / 2)) return 1;
+        return 0;
+    }
+    return 0;
+}
+
 /* Elapsed ms since touch-down (touch_at), then DRAG_MIN or the more
  * generous FAST_DRAG_MIN depending on whether that's still within the fast-
  * tap window. Shared by both axes below so a diagonal touch is judged by
@@ -4159,6 +5512,7 @@ static int read_gesture(int fd, int *ox, int *oy) {
                 edge_active = 0; edge_travel = 0;
                 touch_down = 1; touch_x = x; touch_y = y;
                 touch_moved = 0; hold_fired = 0;
+                skip_hold_dir = 0;   /* R59: nothing armed yet this touch */
                 clock_gettime(CLOCK_MONOTONIC, &touch_at);
             }
             else if (have_down) {
@@ -4236,6 +5590,20 @@ static int go_back(void) {
             return 0;
         case SC_PLAYING:
             if (radio_mode) { screen = SC_RADIO; reset_scroll(); break; }
+            /* BG73 follow-up: reported live -- once Play Next has spliced in
+             * a track from a different album, this queue no longer
+             * represents one browsable album, so presenting it as a single
+             * title+cover page (the rest of this case, below) is actively
+             * misleading -- the very first row can be from an album the
+             * header no longer names. Land on the plain queue list instead,
+             * the same place the dedicated queue button goes. Audiobooks and
+             * podcasts never set queue_mixed (they don't go through
+             * queue_play_next()), so this can't misfire for them. */
+            if (queue_mixed) {
+                screen = SC_QUEUE; reset_scroll();
+                queue_via_back = 1;
+                break;
+            }
             /* Straight from the queue copy — no second trip to the database,
              * and it is right even if the browser has wandered off. For a
              * book the queue is its chapters, so this is the chapter list. */
@@ -4243,6 +5611,12 @@ static int go_back(void) {
             track_n = queue_n;
             snprintf(cur_artist, sizeof(cur_artist), "%s", q_artist);
             snprintf(cur_album,  sizeof(cur_album),  "%s", q_album);
+            /* BG73: this view *is* the queue, so whether it's a playlist is
+             * unambiguously q_is_playlist -- not whatever browsing_is_playlist
+             * happened to be left at by incidental browsing since. Keeps a
+             * later Play Next from this same view (queue_play_next() reads
+             * browsing_is_playlist) from getting the wrong rule. */
+            browsing_is_playlist = q_is_playlist;
             /* So a further "back" out of this queue view (BG7's fix) restores
              * this same artist rather than whatever an earlier, unrelated
              * Albums browse last left in albums_artist -- but only when we
@@ -4275,12 +5649,32 @@ static int go_back(void) {
              * out of it landing on the *same* cover again just to re-scroll
              * past it read as pointless. Jumps straight past it to where the
              * title sits, ART_PX being exactly the scroll distance that
-             * takes -- scroll_to_px() (called after reset_scroll(), which
-             * would otherwise have zeroed it right back to the top) clamps
-             * against a short album's real content, so this can't overshoot
-             * one with only a few tracks. */
+             * takes.
+             *
+             * BG75: reported live on a genuinely short album (3 tracks,
+             * Bartok's Violin Concerto No. 2) -- its header alone (cover +
+             * title/artist/info) is 622px, and only 216px of track rows sit
+             * below it, so tracks_max_px() is 114, well short of ART_PX
+             * (480). Calling scroll_to_px(ART_PX) directly sends that
+             * through its rubber-band branch (damped to a third of the
+             * overshoot past tracks_max_px()), landing scroll on neither a
+             * clean top-of-tracklist nor the true content end -- a
+             * half-scrolled cover with the title nowhere near the top,
+             * which is what "doesn't scroll away" actually looked like. A
+             * first attempt clamped the target to tracks_max_px() to at
+             * least land cleanly (no gap below the last track), but that
+             * still left the cover mostly uncleared -- for an album this
+             * short there simply isn't enough tracklist beneath the cover
+             * to push it fully off-screen while also ending exactly at the
+             * last track. Confirmed live is the other side of that
+             * trade-off: always land with the title at the top, gap below
+             * the last track and all. That means bypassing scroll_to_px()'s
+             * rubber-band/clamping entirely here -- this is a one-shot
+             * placement, not a drag or inertia tick fighting to overscroll,
+             * so there's nothing to damp against in the first place. */
             if (!ab_list && !pod_list) {
-                scroll_to_px(ART_PX);
+                scroll = ART_PX / ROW_H;
+                scroll_px = ART_PX % ROW_H;
                 /* BG71 sub-bug: swiping back from Now Playing lands here
                  * (the same rich album-detail page the queue button used
                  * to, before it got its own SC_QUEUE) -- reported live as
@@ -4291,9 +5685,20 @@ static int go_back(void) {
                  * each other (BG70) -- but that also means arriving here
                  * has to explicitly ask for the right cover, the same way
                  * tapping an album row in Albums already does, rather than
-                 * inheriting whatever the last view happened to leave. */
-                if (track_n > 0)
-                    view_art_request(tracks[0].path, cur_artist, cur_album);
+                 * inheriting whatever the last view happened to leave.
+                 *
+                 * BG73 follow-up: tracks[0], not tracks[cur_track], used to
+                 * be fine here since every entry in a queue was always from
+                 * the one album cur_album/cur_artist named -- any track's
+                 * path resolved to the same cover. Now that Play Next can
+                 * splice in a track from a different album, tracks[0] can be
+                 * a leftover from an album this queue has already moved on
+                 * from (cur_album now names the *new* one), so it has to be
+                 * the actually-playing entry's own path instead. */
+                if (track_n > 0) {
+                    int a = (cur_track >= 0 && cur_track < track_n) ? cur_track : 0;
+                    view_art_request(tracks[a].path, cur_artist, cur_album);
+                }
             }
             break;
         case SC_RADIO:
@@ -4315,7 +5720,72 @@ static int go_back(void) {
             screen = SC_EQ; reset_scroll();
             break;
         case SC_QUEUE:
-            screen = SC_PLAYING; reset_scroll();
+            /* Reported live: reached via the queue button, "back" means
+             * "close the queue", landing on Now Playing is right. Reached as
+             * the swipe-back-from-Now-Playing fallback for a mixed queue
+             * (queue_via_back), it means "back out of Now Playing" -- and
+             * there's no meaningful "browse this album" state to land on in
+             * between the way the unmixed case has, since the queue no
+             * longer is one album, so this continues straight out to Albums,
+             * same as backing out of that unmixed album page a second time
+             * eventually would. Otherwise this and the default case's own
+             * "back to Albums" branch would bounce forever: SC_PLAYING's
+             * go_back() sends a mixed queue straight back here, so landing
+             * back on SC_PLAYING from here would just re-enter this case on
+             * the very next back with nothing having changed. */
+            if (queue_via_back) {
+                /* BG87: albums_artist/albums_scroll_saved are written only
+                 * at the moment an Albums row is actually tapped -- for a
+                 * mixed queue that write can be from a much earlier,
+                 * unrelated album browse, or may never have happened at all
+                 * (Play Next can splice in a track from the Artist Page, a
+                 * playlist, or Recent, none of which touch these). Reusing
+                 * them here restored Albums already filtered/scrolled to
+                 * wherever that last, unrelated tap happened to leave
+                 * things -- reported live as landing on a mismatched album
+                 * screen, as if mid-scroll through someone else's browse.
+                 * There's no reliable "this queue's own Albums context" to
+                 * restore for a mixed queue, so land on a clean, unfiltered
+                 * list rather than a confidently wrong one. */
+                cur_artist[0] = '\0';
+                screen = SC_ALBUMS; reset_scroll();
+                total = lib_albums_count(cur_facet, NULL);
+                scroll = 0;
+                scroll_px = 0;
+                load_page();
+            } else {
+                screen = SC_PLAYING; reset_scroll();
+            }
+            break;
+        case SC_ARTIST_PAGE:
+            if (artist_page_from_list) {
+                /* Reached via the Artists list itself -- back there, same
+                 * "restore where the list was" shape SC_ALBUMS's own case
+                 * below uses for the identical Artists-list return trip. */
+                screen = SC_ARTISTS; reset_scroll();
+                total = lib_group_count(cur_facet);
+                scroll = artists_scroll_saved;
+                if (scroll > total - 1) scroll = total > 0 ? total - 1 : 0;
+                if (scroll < 0) scroll = 0;
+                scroll_px = artists_scroll_px_saved;
+                load_page();
+            } else {
+                /* Back to the album this was opened from, not a generic
+                 * fallback -- artist_page_back_album/artist_page_back_artist
+                 * were captured at the moment the artist name was tapped,
+                 * specifically so "back" returns to browsing that album
+                 * rather than always landing somewhere else regardless of
+                 * entry point. */
+                snprintf(cur_album, sizeof(cur_album), "%s", artist_page_back_album);
+                snprintf(cur_artist, sizeof(cur_artist), "%s", artist_page_back_artist);
+                screen = SC_TRACKS; reset_scroll();
+                ab_list = 0;
+                pod_list = 0;
+                track_n = lib_tracks_for_album(cur_artist, cur_album, tracks,
+                                               (int)(sizeof(tracks) / sizeof(tracks[0])), 0);
+                if (track_n > 0)
+                    view_art_request(tracks[0].path, cur_artist, cur_album);
+            }
             break;
         case SC_POD_SYNC:
             /* Refreshed the same way opening Podcasts does -- a sync that's
@@ -4331,6 +5801,9 @@ static int go_back(void) {
         case SC_SETTINGS_ABOUT:
         case SC_SETTINGS_TIMEZONE:
         case SC_SETTINGS_THEMEMODE:
+        case SC_SETTINGS_WIFI:
+        case SC_SETTINGS_BT:
+        case SC_SETTINGS_USB:
             screen = SC_SETTINGS; reset_scroll();
             break;
         case SC_EQ_BAND:
@@ -4368,7 +5841,26 @@ static int go_back(void) {
              * (when audiobook_mode) as Chapters -- same screen, same data
              * shape, but "back" has to land somewhere that makes sense for
              * whichever it is, not always the SQL album browser. */
-            if (pod_list) {
+            if (tracks_from_artist_page) {
+                /* Opened from the artist page's own album list -- back
+                 * there directly. Nothing to re-fetch: artist_page_name/
+                 * artist_page_albums/artist_art_bits are all still sitting
+                 * in memory exactly as they were, untouched by having
+                 * browsed into one of the artist's albums and back out.
+                 *
+                 * BG88: clear the flag the moment it's consumed. Left set,
+                 * it stuck around into the artist page's *own* go_back()
+                 * case (SC_ARTIST_PAGE, just above), whose "not from the
+                 * list" branch lands back on this same SC_TRACKS default
+                 * case for the originating album -- reading the still-set
+                 * flag as if THAT visit had also come from the artist
+                 * page's list, and bouncing straight back to SC_ARTIST_PAGE
+                 * again instead of continuing out to Albums/Artists. Two
+                 * taps into an album from the artist page, both backed out
+                 * of, was enough to loop forever between the two screens. */
+                tracks_from_artist_page = 0;
+                screen = SC_ARTIST_PAGE; reset_scroll();
+            } else if (pod_list) {
                 screen = SC_PODCASTS; reset_scroll();
                 pod_feed_n = pod_scan_feeds(pod_feeds, POD_MAX_FEEDS);
                 pod_rebuild_rows();
@@ -4510,8 +6002,15 @@ static void draw_sheet(uint16_t *fb) {
 static int qs_bar_y(void)  { return STATUS_H + 74; }
 static int qs_wifi_y(void) { return STATUS_H + 130; }
 static int qs_bt_y(void)   { return qs_wifi_y() + QS_ROW_H; }
-static int qs_eq_y(void)   { return qs_bt_y() + QS_ROW_H; }
+static int qs_usb_y(void)  { return qs_bt_y() + QS_ROW_H; }
+static int qs_eq_y(void)   { return qs_usb_y() + QS_ROW_H; }
 static int qs_mseb_y(void) { return qs_eq_y() + QS_ROW_H; }
+/* R51: top-right corner, level with "Brightness" opposite it -- not its own
+ * row (tried first, corrected live: too much space for what it does, and
+ * putting a whole row's worth of weight behind a single shortcut read as
+ * more important than it is). */
+static int qs_gear_x(void) { return FB_W - 24 - 20; }
+static int qs_gear_y(void) { return STATUS_H + 6; }
 
 static void draw_bt_icon(uint16_t *fb, int x, int y, uint16_t c) {
     draw_icon(fb, FB_W, FB_H, x, y, &icon_bt_qs, c);
@@ -4519,6 +6018,10 @@ static void draw_bt_icon(uint16_t *fb, int x, int y, uint16_t c) {
 
 static void draw_wifi_icon(uint16_t *fb, int x, int y, uint16_t c) {
     draw_icon(fb, FB_W, FB_H, x, y, &icon_wifi_qs, c);
+}
+
+static void draw_usb_icon(uint16_t *fb, int x, int y, uint16_t c) {
+    draw_icon(fb, FB_W, FB_H, x, y, &icon_usb_qs, c);
 }
 
 /* A small frequency-response squiggle with a control point at each vertex --
@@ -4537,12 +6040,24 @@ static void draw_eq_icon(uint16_t *fb, int x, int y, uint16_t c) {
         fill_circle(fb, x + px[i], y + py[i], 3, c);
 }
 
+/* R51: a cog for the quick-settings row leading to the full Settings menu.
+ * Vendored from Font Awesome's gear-solid-full.svg the same way wifi/
+ * bluetooth's own icons already are -- see gen_icons.py and THIRD_PARTY.md. */
+static void draw_gear_icon(uint16_t *fb, int x, int y, uint16_t c) {
+    draw_icon(fb, FB_W, FB_H, x, y, &icon_gear_qs, c);
+}
+
+
 static void draw_quick_settings(uint16_t *fb) {
     fill_rect(fb, 0, 0, FB_W, QS_H, COL_HEADER);
     fill_rect(fb, 0, QS_H - 1, FB_W, 1, COL_LINE);
     draw_status(fb);
 
     draw_text(fb, 24, STATUS_H + 12, "Brightness", COL_DIM, TEXT_PX_SMALL, FB_W - 48);
+    /* R51: quick access to the full Settings menu. Dim, same weight as
+     * "Brightness" opposite it -- a shortcut, not something with its own
+     * on/off state to draw attention to. */
+    draw_gear_icon(fb, qs_gear_x(), qs_gear_y(), COL_DIM);
     int by = qs_bar_y(), bw = FB_W - 48;
     fill_pill(fb, 24, by, bw, 8, COL_LINE);
     int filled = qs_bright_max > 0 ? bw * qs_bright / qs_bright_max : 0;
@@ -4612,6 +6127,23 @@ static void draw_quick_settings(uint16_t *fb) {
     }
     draw_toggle_switch(fb, by2, qs_bt);
 
+    /* No toggle switch here, unlike Wi-Fi/Bluetooth above -- USB working
+     * mode isn't a binary on/off, so the row is tap-to-open rather than
+     * tap-to-flip. A chevron says that the way the toggle says the other
+     * two rows are switches. */
+    int byu = qs_usb_y();
+    int usb_mode = st_usb_mode();
+    draw_usb_icon(fb, 34, byu + 10, COL_DIM);
+    draw_text(fb, QS_LABEL_X, byu + 6, "USB working mode", COL_TEXT, TEXT_PX_SMALL, 260);
+    draw_text(fb, QS_LABEL_X, byu + 32,
+              usb_mode == 0 ? "ADB" : usb_mode == 1 ? "USB Storage" : "unplugged",
+              COL_DIM, TEXT_PX_SMALL, FB_W - 180);
+    {
+        int cx = FB_W - 24 - 10, cy = byu + QS_ROW_H / 2;
+        draw_line(fb, cx - 8, cy - 8, cx, cy, COL_DIM);
+        draw_line(fb, cx, cy, cx - 8, cy + 8, COL_DIM);
+    }
+
     int by3 = qs_eq_y();
     int on = eq_enabled();
     /* Block-centered vertically, same as Wi-Fi/Bluetooth above (y was +6
@@ -4657,6 +6189,22 @@ static void draw_volume(uint16_t *fb) {
     int filled = bw * v / 100;
     fill_rect(fb, 24, by, filled, 8, COL_ACCENT);
     fill_circle(fb, 24 + filled, by + 4, 13, COL_ACCENT);
+}
+
+/* R60: confirms a hardware seek actually landed, and by how much -- see
+ * seek_toast()'s own comment for why that has no other on-screen affordance.
+ * A small pill under the status bar, same layer vol_ticks/draw_volume()
+ * already draws in, out of the way of every mode's own transport row below
+ * it (cover art, progress bars, skip arcs) since none of them reach this
+ * high up the screen. */
+static void draw_seek_toast(uint16_t *fb) {
+    int tw = text_width(seek_toast_text, TEXT_PX_BODY);
+    int pw = tw + 40, ph = 44;
+    int px = (FB_W - pw) / 2, py = STATUS_H + 12;
+    fill_rect(fb, px, py, pw, ph, COL_HEADER);
+    fill_rect(fb, px, py + ph - 1, pw, 1, COL_LINE);
+    draw_text(fb, px + 20, py + (ph - TEXT_PX_BODY) / 2 - 2, seek_toast_text,
+              COL_ACCENT, TEXT_PX_BODY, FB_W);
 }
 
 /* Just the progress bar and its two clocks. A scrub changes nothing else, and
@@ -4720,6 +6268,7 @@ static void draw_ui(uint16_t *fb) {
     if (sheet_open) draw_sheet(fb);
     if (qs_open) draw_quick_settings(fb);
     else if (vol_ticks > 0) draw_volume(fb);
+    else if (screen == SC_PLAYING && seek_toast_ticks > 0) draw_seek_toast(fb);
     if (edge_active) draw_back_hint(fb);
 
     uint64_t dt = us_now() - t0;
@@ -5257,14 +6806,28 @@ static int handle_keys(int fd, key_src_t src) {
         if (src == KEYS_BUTTONS) {
             switch (ev.code) {
                 case KEY_PLAYPAUSE_:            /* the skip-forward button */
-                    if (audiobook_mode) ab_play_chapter(cur_track + 1);
-                    else if (podcast_mode) audio_seek_ms(audio_pos_ms() + 30000);
+                    /* R60: this unit's own button is physically labelled
+                     * "skip forward", not "next" -- audiobook_mode used to
+                     * jump a whole chapter here, a different amount than
+                     * the on-screen +10s arc (the on-screen design
+                     * deliberately dropped a chapter-skip triangle in
+                     * favour of a seek arc with the amount written on it;
+                     * see that draw code's own comment), so a hardware
+                     * press did something the screen never offered and
+                     * never confirmed happening. Now matches on-screen for
+                     * both audiobook and podcast. */
+                    if (audiobook_mode) { audio_seek_ms(audio_pos_ms() + 10000); seek_toast(+10000); }
+                    else if (podcast_mode) { audio_seek_ms(audio_pos_ms() + 30000); seek_toast(+30000); }
                     else                play_index(next_track_index());
                     acted = 1; break;
                 case KEY_NEXTSONG_:             /* the skip-back button */
                 case KEY_PREVSONG_:
-                    if (audiobook_mode) ab_play_chapter(cur_track - 1);
-                    else if (podcast_mode) audio_seek_ms(audio_pos_ms() - 30000);
+                    /* R60: podcast_mode was -30000 here against the
+                     * on-screen skip-back arc's -10000 (the +30000 side
+                     * above already matched) -- same mismatch, fixed the
+                     * same way. */
+                    if (audiobook_mode) { audio_seek_ms(audio_pos_ms() - 10000); seek_toast(-10000); }
+                    else if (podcast_mode) { audio_seek_ms(audio_pos_ms() - 10000); seek_toast(-10000); }
                     else if (audio_pos_ms() > 3000) audio_seek_ms(0);
                     else play_index(prev_track_index());
                     acted = 1;
@@ -5291,15 +6854,18 @@ static int handle_keys(int fd, key_src_t src) {
                 break;
             case KEY_NEXTSONG_:
                 if (audiobook_mode) ab_play_chapter(cur_track + 1);
-                else if (podcast_mode) audio_seek_ms(audio_pos_ms() + 30000);
+                else if (podcast_mode) { audio_seek_ms(audio_pos_ms() + 30000); seek_toast(+30000); }
                 else                play_index(next_track_index());
                 acted = 1;
                 break;
             case KEY_PREVSONG_:
                 /* Same rule as every other player: part-way in, previous means
                  * back to the start of this track — or of this chapter. A
-                 * podcast episode instead gets the same +/-30s ad-skip as its
-                 * on-screen transport (see the tap handler's comment). */
+                 * podcast episode instead gets the same -10s/+30s ad-skip as
+                 * its on-screen transport (see the tap handler's comment).
+                 * R60: this side used to be -30000, an asymmetric mismatch
+                 * against the on-screen -10s arc even though the +30000 side
+                 * above already matched it -- fixed to match both ways. */
                 if (audiobook_mode) {
                     const ab_chapter_t *ch =
                         (cur_track >= 0 && cur_track < ab_book.chap_n)
@@ -5308,7 +6874,8 @@ static int handle_keys(int fd, key_src_t src) {
                     if (into > 3000) audio_seek_ms((int)(ch ? ch->file_start_ms : 0));
                     else ab_play_chapter(cur_track - 1);
                 } else if (podcast_mode) {
-                    audio_seek_ms(audio_pos_ms() - 30000);
+                    audio_seek_ms(audio_pos_ms() - 10000);
+                    seek_toast(-10000);
                 } else if (audio_pos_ms() > 3000) {
                     audio_seek_ms(0);
                 } else {
@@ -5316,8 +6883,20 @@ static int handle_keys(int fd, key_src_t src) {
                 }
                 acted = 1;
                 break;
-            case KEY_FASTFWD_: audio_seek_ms(audio_pos_ms() + 10000); acted = 1; break;
-            case KEY_REWIND_:  audio_seek_ms(audio_pos_ms() - 10000); acted = 1; break;
+            case KEY_FASTFWD_: {
+                /* R60: was a flat +10000 for every mode, including podcast
+                 * -- ignored its on-screen transport's own +30s forward
+                 * amount (only the on-unit buttons' NEXTSONG_/PREVSONG_
+                 * path had ever been taught that asymmetry). Audiobook and
+                 * plain music already matched the on-screen amount at
+                 * 10000, unchanged. */
+                int d = podcast_mode ? 30000 : 10000;
+                audio_seek_ms(audio_pos_ms() + d); seek_toast(+d);
+                acted = 1; break;
+            }
+            case KEY_REWIND_:
+                audio_seek_ms(audio_pos_ms() - 10000); seek_toast(-10000);
+                acted = 1; break;
             default: break;
         }
     }
@@ -5548,6 +7127,7 @@ int music_entry(void *a0, void *a1) {
                     int nxt = next_track_index();
                     if (nxt < 0) break;
                     cur_track = nxt;
+                    queue_apply_pending();   /* BG85 -- before art_request() reads q_album */
                     art_request(queue[cur_track].path,
                                 queue[cur_track].artist[0] ? queue[cur_track].artist : q_artist,
                                 q_album);
@@ -5635,7 +7215,15 @@ int music_entry(void *a0, void *a1) {
                 qs_open = 0;
             } else if (g == 1) {
                 int by = qs_bar_y();
-                if (y > by - 26 && y < by + 26) {
+                if (x > qs_gear_x() - 16 && y < qs_gear_y() + 36) {
+                    /* R51: straight to the full Settings menu, closing the
+                     * panel first -- left open behind it, the next "back"
+                     * from Settings would have reopened this instead of
+                     * returning to wherever the panel was pulled down over. */
+                    qs_open = 0;
+                    screen = SC_SETTINGS;
+                    reset_scroll();
+                } else if (y > by - 26 && y < by + 26) {
                     int bw = FB_W - 48;
                     int v = (x - 24) * qs_bright_max / (bw > 0 ? bw : 1);
                     qs_bright = v < 1 ? 1 : (v > qs_bright_max ? qs_bright_max : v);
@@ -5647,6 +7235,9 @@ int music_entry(void *a0, void *a1) {
                 } else if (y > qs_bt_y() && y < qs_bt_y() + QS_ROW_H) {
                     qs_bt = !qs_bt;
                     st_bt_set(qs_bt);
+                } else if (y > qs_usb_y() && y < qs_usb_y() + QS_ROW_H) {
+                    qs_open = 0;
+                    screen = SC_SETTINGS_USB; reset_scroll();
                 } else if (y > qs_eq_y() && y < qs_eq_y() + QS_ROW_H) {
                     if (x > FB_W - 100) {
                         eq_set_enabled(!eq_enabled());
@@ -5721,12 +7312,38 @@ int music_entry(void *a0, void *a1) {
                 }
                 sheet_open = 0;
             } else if (i == 0) {
-                queue_insert(sheet_track, cur_track + 1);
-                snprintf(sheet_note, sizeof(sheet_note), "Playing next");
+                /* R58: an undownloaded podcast episode has an empty path
+                 * (pod_rebuild_tracks()'s own comment) -- queueing one is a
+                 * silent dead end later rather than a crash now, but still
+                 * worth catching here with the same message pod_play_
+                 * episode()'s tap-to-play already gives for the same case,
+                 * rather than pretending it queued. */
+                if (sheet_track >= 0 && sheet_track < track_n && !tracks[sheet_track].path[0]) {
+                    snprintf(sheet_note, sizeof(sheet_note), "Not downloaded yet");
+                } else if (queue_kind_conflict()) {
+                    /* See queue_kind_conflict()'s own comment. Named for
+                     * what's already playing rather than a generic refusal,
+                     * so it's obvious *why* -- and it stays true whichever
+                     * direction the mix was attempted from. */
+                    snprintf(sheet_note, sizeof(sheet_note), "%s is playing",
+                             audiobook_mode ? "An audiobook"
+                                            : podcast_mode ? "A podcast" : "Music");
+                } else {
+                    queue_play_next(sheet_track);   /* BG73 */
+                    snprintf(sheet_note, sizeof(sheet_note), "Playing next");
+                }
                 sheet_open = 0;
             } else if (i == 1) {
-                queue_insert(sheet_track, -1);
-                snprintf(sheet_note, sizeof(sheet_note), "Added to queue");
+                if (sheet_track >= 0 && sheet_track < track_n && !tracks[sheet_track].path[0]) {
+                    snprintf(sheet_note, sizeof(sheet_note), "Not downloaded yet");
+                } else if (queue_kind_conflict()) {
+                    snprintf(sheet_note, sizeof(sheet_note), "%s is playing",
+                             audiobook_mode ? "An audiobook"
+                                            : podcast_mode ? "A podcast" : "Music");
+                } else {
+                    queue_insert(sheet_track, -1);
+                    snprintf(sheet_note, sizeof(sheet_note), "Added to queue");
+                }
                 sheet_open = 0;
             } else if (i == 2) {
                 playlist_n = pl_list(playlists, PL_MAX);
@@ -5807,12 +7424,21 @@ int music_entry(void *a0, void *a1) {
                      * old go_back()-into-SC_TRACKS reuse showed the *album*
                      * (now a rich cover/bio page, R46) rather than the
                      * actual upcoming play order, which silently diverges
-                     * from it the moment shuffle is on. podcast_mode's
-                     * queue is genuinely just its feed's episode list
-                     * (see podcast_mode's own comment on this), which the
-                     * unchanged go_back() path still shows correctly. */
-                    if (podcast_mode) go_back();
-                    else { screen = SC_QUEUE; reset_scroll(); }
+                     * from it the moment shuffle is on.
+                     *
+                     * R58: podcast_mode used to special-case this button
+                     * straight to go_back(), on the assumption a podcast's
+                     * queue was always exactly its one playing episode (see
+                     * podcast_mode's own comment) -- true when that was
+                     * written, no longer true now that the episode list's
+                     * own long-press sheet can queue_play_next()/
+                     * queue_insert() another episode the same way music's
+                     * track list already could. SC_QUEUE draws queue[]
+                     * generically (name + duration only), so it needs
+                     * nothing podcast-specific to show an episode queue
+                     * correctly. */
+                    screen = SC_QUEUE; reset_scroll();
+                    queue_via_back = 0;   /* reached deliberately -- back returns to Now Playing */
                 }
                 else {
                 /* The bar is only 6 px tall; the target has to be the band
@@ -5908,6 +7534,28 @@ int music_entry(void *a0, void *a1) {
                 } else if (screen == SC_PODCASTS && x >= pod_sync_x() - 16 && x < header_back_x() - 16) {
                     if (!pod_update_running()) { pod_update_start(); pod_sync_log_n = 0; }
                     screen = SC_POD_SYNC; reset_scroll();
+                } else if (screen == SC_QUEUE && x >= queue_clear_x() - 16 && x < header_back_x() - 16) {
+                    /* R52: drop everything queued after the currently-
+                     * playing track -- that one keeps playing undisturbed
+                     * to its own end, same as reaching it naturally would,
+                     * it just has nothing left queued up behind it once it
+                     * does. No confirmation step: unlike deleting a
+                     * playlist or a file, nothing here is lost for good --
+                     * queuing more is one "Play next"/"Add to queue" away. */
+                    if (cur_track >= 0 && cur_track + 1 < queue_n) {
+                        queue_n = cur_track + 1;
+                        /* Reported live: swiping back afterward showed a
+                         * mangled "album" page -- the real album, but
+                         * missing every track Clear had just dropped. Same
+                         * root cause as the Add-to-Queue/Play-Next case
+                         * above: once queue[] no longer matches what a
+                         * fresh browse of q_album would produce, it can't
+                         * be presented as that album's own page. Playlists
+                         * excluded for the same reason queue_insert()
+                         * excludes them. */
+                        if (!q_is_playlist) queue_mixed = 1;
+                        queue_follower();
+                    }
                 } else if (x > FB_W - 120) go_back();
             } else if (index_visible() && x >= FB_W - INDEX_TOUCH_W && y >= CONTENT_Y &&
                        y < index_bottom()) {
@@ -6013,6 +7661,30 @@ int music_entry(void *a0, void *a1) {
                         eq_save_current();
                     }
                 }
+            } else if (screen == SC_KEYBOARD) {
+                /* Cancel/Done share the same y-band as the title row (see
+                 * draw_keyboard()'s own 20/56 y-values) -- split left/right
+                 * at the field's own horizontal midpoint rather than a tight
+                 * box around each word, so neither is harder to hit than it
+                 * looks. */
+                if (y < 60) {
+                    if (x < FB_W / 2) screen = kb_return_screen;   /* Cancel */
+                    else kb_commit();                              /* Done */
+                } else if (y >= 100 && y < 170) {
+                    kb_set_cursor_from_x(x);   /* tap in the field to place the caret */
+                } else if (y >= KB_GRID_Y && y < KB_GRID_Y + 4 * KB_KEY_H) {
+                    int row = (y - KB_GRID_Y) / KB_KEY_H;
+                    int col = x / KB_KEY_W;
+                    if (row >= 0 && row < 4 && col >= 0 && col < 3) {
+                        int key = KB_GRID[row][col];
+                        if (key == -1) {
+                            kb_mode = (kb_mode + 1) % KB_MODE_N;
+                            kb_last_key = -1;
+                        }
+                        else if (key == -2) kb_backspace();
+                        else kb_apply_key(key);
+                    }
+                }
             } else if (screen == SC_SETTINGS) {
                 /* Tap coordinates are screen-space; row getters are
                  * content-space. Same `off` the draw code subtracts, so a
@@ -6024,7 +7696,9 @@ int music_entry(void *a0, void *a1) {
                 int ry_autooff = set_row_autooff_y() - off, ry_about = set_row_about_y() - off;
                 int ry_lighttheme = set_row_lighttheme_y() - off;
                 int ry_timezone = set_row_timezone_y() - off;
-                int ry_reindex = set_row_reindex_y() - off;
+                int ry_wifi = set_row_wifi_y() - off, ry_bt = set_row_bt_y() - off;
+                int ry_usb = set_row_usb_y() - off;
+                int ry_scan = set_row_scan_y() - off;
                 if (y >= ry_lock && y < ry_lock + ROW_H) {
                     button_lock_enabled = !button_lock_enabled;
                     save_conf();
@@ -6045,9 +7719,39 @@ int music_entry(void *a0, void *a1) {
                     screen = SC_SETTINGS_THEME; reset_scroll();
                 } else if (y >= ry_about && y < ry_about + ROW_H) {
                     screen = SC_SETTINGS_ABOUT; reset_scroll();
-                } else if (y >= ry_reindex && y < ry_reindex + ROW_H) {
-                    index_rescan_now();
+                } else if (y >= ry_wifi && y < ry_wifi + ROW_H) {
+                    screen = SC_SETTINGS_WIFI; reset_scroll();
+                } else if (y >= ry_bt && y < ry_bt + ROW_H) {
+                    screen = SC_SETTINGS_BT; reset_scroll();
+                } else if (y >= ry_usb && y < ry_usb + ROW_H) {
+                    screen = SC_SETTINGS_USB; reset_scroll();
+                } else if (y >= ry_scan && y < ry_scan + ROW_H) {
+                    scanner_rescan_now();
                     dirty = 1;
+                }
+            } else if (screen == SC_SETTINGS_WIFI) {
+                int row = (y - CONTENT_Y) / ROW_H;
+                if (row == 0) {
+                    st_wifi_set(!st_wifi_on());
+                } else if (row == 2) {
+                    kb_open("Network name (SSID)", KB_PURPOSE_WIFI_SSID_MANUAL, "");
+                }
+            } else if (screen == SC_SETTINGS_BT) {
+                int row = (y - CONTENT_Y) / ROW_H;
+                if (row == 0) {
+                    st_bt_set(!st_bt_on());
+                } else if (row == 2) {
+                    bt_scan_start();
+                } else if (row >= 3) {
+                    /* Re-queried fresh rather than sharing the draw block's
+                     * own cached list (a function-local static, out of
+                     * scope here) -- a tap is a rare, deliberate action,
+                     * not a redraw-rate concern, so the extra bluetoothctl
+                     * call costs nothing worth avoiding. */
+                    bt_found_dev_t devs[8];
+                    int n = bt_scan_devices(devs, 8);
+                    int idx = row - 3;
+                    if (idx >= 0 && idx < n) bt_pair(devs[idx].mac);
                 }
             } else if (screen == SC_SETTINGS_THEME) {
                 int idx = (y - CONTENT_Y) / ROW_H;
@@ -6070,21 +7774,71 @@ int music_entry(void *a0, void *a1) {
                     apply_theme();
                     save_conf();
                 }
+            } else if (screen == SC_SETTINGS_USB) {
+                int idx = (y - CONTENT_Y) / ROW_H;
+                if (idx >= 0 && idx < 2) st_usb_mode_set(idx);
             } else if (screen == SC_TRACKS && !ab_list && !pod_list) {
                 /* R46: tap coordinates are screen-space; the header/track
                  * layout is content-space (see the draw side's own `off`).
-                 * A tap on the header itself (cover/title/artist/info) does
-                 * nothing yet -- only a track row is interactive here. */
+                 * A tap on the header itself (cover/title/info) still does
+                 * nothing -- but the artist line is now a real link to that
+                 * artist's own page, the same tap zone the draw side uses
+                 * for it (tracks_hdr_artist_y() to tracks_hdr_info_y()). */
                 int off = scroll * ROW_H + scroll_px;
                 int header_h = tracks_hdr_h();
                 int content_y = y + off;
-                if (content_y >= header_h) {
-                    int idx = (content_y - header_h) / ROW_H;
+                if (cur_artist[0] && content_y >= tracks_hdr_artist_y() &&
+                    content_y < tracks_hdr_info_y()) {
+                    snprintf(artist_page_back_album, sizeof(artist_page_back_album), "%s", cur_album);
+                    snprintf(artist_page_back_artist, sizeof(artist_page_back_artist), "%s", cur_artist);
+                    snprintf(artist_page_name, sizeof(artist_page_name), "%s", cur_artist);
+                    artist_page_from_list = 0;   /* back -> this album */
+                    artist_page_album_n = lib_albums("album_artist", artist_page_name,
+                                                     artist_page_albums, ARTIST_ALBUMS_MAX, 0);
+                    screen = SC_ARTIST_PAGE;
+                    reset_scroll();
+                    artist_art_request(artist_page_name);
+                } else if (content_y >= header_h) {
+                    /* track_index_at(), not a plain (content_y - header_h) /
+                     * ROW_H division -- disc banners mean a row's position
+                     * no longer maps to its index that simply, and the two
+                     * have to agree exactly or a tap lands on the wrong
+                     * track (the same class of bug BG2/BG61 already fixed
+                     * once for scroll_px). Also correctly resolves to
+                     * nothing (-1) for a tap that lands on a banner itself. */
+                    int idx = track_index_at(content_y);
                     if (idx >= 0 && idx < track_n) {
                         audio_set_speed(1000);
                         screen = SC_PLAYING;
                         played_from_browse = 1;
                         play_from_list(idx);
+                    }
+                }
+            } else if (screen == SC_ARTIST_PAGE) {
+                /* Same off/header_h shape as the album page's own tap
+                 * handler just above -- a plain-album screen with a
+                 * different row type (albums instead of tracks) and a
+                 * different destination (another album page instead of
+                 * playback). */
+                int off = scroll * ROW_H + scroll_px;
+                int header_h = artist_page_hdr_h();
+                int content_y = y + off;
+                if (content_y >= header_h) {
+                    int idx = (content_y - header_h) / ROW_H;
+                    if (idx >= 0 && idx < artist_page_album_n) {
+                        lib_row_t *r = &artist_page_albums[idx];
+                        snprintf(cur_album, sizeof(cur_album), "%s", r->name);
+                        snprintf(cur_artist, sizeof(cur_artist), "%s", r->owner);
+                        browsing_is_playlist = 0;   /* BG73 */
+                        tracks_from_artist_page = 1;
+                        screen = SC_TRACKS; reset_scroll();
+                        ab_list = 0;
+                        pod_list = 0;
+                        track_n = lib_tracks_for_album(cur_artist, cur_album,
+                                                       tracks, (int)(sizeof(tracks)/sizeof(tracks[0])),
+                                                       r->count);
+                        if (track_n > 0)
+                            view_art_request(tracks[0].path, cur_artist, cur_album);
                     }
                 }
             } else {
@@ -6095,7 +7849,12 @@ int music_entry(void *a0, void *a1) {
                  * fractional drag still pending, this idx pointed one row
                  * past whatever was actually drawn under the finger, so a
                  * tap opened the row below the one that was visibly tapped. */
-                int idx = (y - CONTENT_Y) / ROW_H;
+                /* R50: the Queue screen's summary line pushes its rows down
+                 * by QUEUE_SUMMARY_H -- without this, every tap on it would
+                 * resolve one row short of what's actually under the finger,
+                 * same class of bug BG2/BG61 already fixed for scroll_px. */
+                int idx = (y - CONTENT_Y - (screen == SC_QUEUE ? QUEUE_SUMMARY_H : 0)) / ROW_H;
+                if (screen == SC_QUEUE && y < CONTENT_Y + QUEUE_SUMMARY_H) idx = -1;
                 if (screen == SC_MENU) {
                     if (idx >= TOP_N) { /* nothing there */ }
                     else if (idx == TOP_MUSIC) {
@@ -6190,10 +7949,23 @@ int music_entry(void *a0, void *a1) {
                     snprintf(albums_artist, sizeof(albums_artist), "%s", cur_artist);
                     artists_scroll_saved = scroll;         /* BG37 */
                     artists_scroll_px_saved = scroll_px;
-                    screen = SC_ALBUMS; reset_scroll();
-                    total = row->count;
-                    load_page();
-                    mlog("[music] %s -> %d albums\n", cur_artist, total);
+                    /* Reported live: tapping an artist row here should land
+                     * on that artist's own page (photo/bio/albums) directly,
+                     * not the plain Albums-filtered-by-artist list -- the
+                     * artist page already shows that same album list, plus
+                     * more, so this isn't losing a destination, just
+                     * skipping a now-redundant stop on the way to it.
+                     * cur_facet (not a hardcoded "album_artist") since this
+                     * list can be reached via either "Album artists" or
+                     * "Artists" from the music menu, and the query has to
+                     * match whichever one actually got tapped. */
+                    snprintf(artist_page_name, sizeof(artist_page_name), "%s", row->name);
+                    artist_page_from_list = 1;   /* back -> the Artists list */
+                    artist_page_album_n = lib_albums(cur_facet, cur_artist,
+                                                     artist_page_albums, ARTIST_ALBUMS_MAX, 0);
+                    screen = SC_ARTIST_PAGE; reset_scroll();
+                    artist_art_request(artist_page_name);
+                    mlog("[music] %s -> %d albums\n", cur_artist, artist_page_album_n);
                 } else if (screen == SC_TRACKS && scroll + idx < track_n) {
                     /* Plain albums are caught by their own SC_TRACKS branch
                      * above now (R46) -- only ab_list/pod_list ever reach
@@ -6227,6 +7999,8 @@ int music_entry(void *a0, void *a1) {
                     /* A playlist is an order someone chose; leave it alone. */
                     snprintf(cur_album, sizeof(cur_album), "%s", playlists[scroll + idx].name);
                     cur_artist[0] = '\0';
+                    browsing_is_playlist = 1;   /* BG73 */
+                    tracks_from_artist_page = 0;
                     screen = SC_TRACKS; reset_scroll();
                     ab_list = 0;
                     pod_list = 0;
@@ -6237,7 +8011,7 @@ int music_entry(void *a0, void *a1) {
                     if (audio_is_active()) screen = SC_PLAYING;
                     else if (!radio_msg[0])
                         snprintf(radio_msg, sizeof(radio_msg), "Could not reach that station");
-                } else if (screen == SC_QUEUE && scroll + idx < queue_n) {
+                } else if (screen == SC_QUEUE && idx >= 0 && scroll + idx < queue_n) {
                     int qidx = queue_display_index(scroll + idx);
                     if (qidx >= 0) {
                         audio_set_speed(1000);
@@ -6272,6 +8046,8 @@ int music_entry(void *a0, void *a1) {
                      * empty artist finds nothing, so writing "" through is
                      * correct, not just harmless. */
                     snprintf(cur_artist, sizeof(cur_artist), "%s", row->owner);
+                    browsing_is_playlist = 0;   /* BG73 */
+                    tracks_from_artist_page = 0;
                     albums_scroll_saved = scroll;          /* BG37 follow-up */
                     albums_scroll_px_saved = scroll_px;
                     screen = SC_TRACKS; reset_scroll();
@@ -6324,6 +8100,15 @@ int music_entry(void *a0, void *a1) {
                     pod_rebuild_tracks();
                     snprintf(cur_album, sizeof(cur_album), "%s", cur_feed);
                     cur_artist[0] = '\0';
+                    /* R58: was never reset here before podcast episodes
+                     * could actually be queued (queue_play_next()'s
+                     * q_is_playlist read was moot either way then) -- left
+                     * stale from a previous Playlists visit, it would now
+                     * make a podcast feed's own queue wrongly behave like a
+                     * playlist's (never truncating a played-next episode's
+                     * leftovers), same class of bug as every other
+                     * SC_TRACKS entry point already guards against. */
+                    browsing_is_playlist = 0;
                     screen = SC_TRACKS; reset_scroll();
                     ab_list = 0;
                     pod_list = 1;
@@ -6419,6 +8204,10 @@ int music_entry(void *a0, void *a1) {
         if (vol_ticks > 0) {
             if (!vol_dragging) vol_ticks--;
             if (vol_ticks == 0) dirty = 1;
+        }
+        if (seek_toast_ticks > 0) {
+            seek_toast_ticks--;
+            if (seek_toast_ticks == 0) dirty = 1;
         }
         if (vol_ticks > 0 && touch_down && !qs_open &&
             touch_y >= STATUS_H && touch_y < STATUS_H + VOL_H) {
@@ -6581,17 +8370,42 @@ int music_entry(void *a0, void *a1) {
                              screen == SC_TRACKS || screen == SC_PLAYLISTS ||
                              screen == SC_RADIO || screen == SC_EQ_BANDS ||
                              screen == SC_SETTINGS || screen == SC_SETTINGS_TIMEZONE ||
-                             screen == SC_QUEUE;
+                             screen == SC_QUEUE || screen == SC_ARTIST_PAGE;
             /* R46: the album-detail screen has no status bar to keep a drag
              * from starting under -- its cover runs from y=0, same as Now
              * Playing's own art, and a touch-down anywhere on it has to be
              * draggable or the whole top of the screen would be dead to
-             * scrolling. */
-            int drag_top = (screen == SC_TRACKS && !ab_list && !pod_list) ? 0 : CONTENT_Y;
+             * scrolling. Artist page: same, its own photo runs edge-to-edge
+             * from y=0 too. */
+            int drag_top = ((screen == SC_TRACKS && !ab_list && !pod_list) ||
+                            screen == SC_ARTIST_PAGE) ? 0 : CONTENT_Y;
+            /* Reported live on the album-detail screen: the cover would
+             * visibly "pop" (a brief, wrong scroll jump) right as a
+             * left-edge swipe-back began, before the gesture was recognised
+             * as a back-swipe and the screen navigated away. Root cause:
+             * edge_active only latches once horizontal travel exceeds 4px
+             * (see the touch-read loop above) -- for a touch that started
+             * inside EDGE_ZONE, the few ticks before that threshold trips
+             * were still wide open to list_dragging, which reads whatever
+             * incidental vertical wobble a real human swipe has (nobody's
+             * finger moves in a perfectly straight horizontal line) as a
+             * genuine scroll position update. continuous redraw on this
+             * screen (below) then painted that transient wrong position on
+             * screen for a frame or two -- the pop. Held off here for
+             * exactly as long as the gesture is still ambiguous: started in
+             * the edge zone, not yet recognised as an edge-swipe, and
+             * horizontal travel so far hasn't fallen behind vertical (i.e.
+             * it could still become one). Once vertical travel clearly
+             * leads, edge_active can never latch anyway (it requires
+             * horizontal to dominate), so there's nothing left to protect
+             * against and the drag is free to start. Touches starting well
+             * clear of the edge zone are entirely unaffected. */
+            int edge_zone_ambiguous = touch_x < EDGE_ZONE && !edge_active &&
+                                       abs(live_x - touch_x) >= abs(live_y - touch_y);
             int was = list_dragging;
             list_dragging = touch_down && scrollable && !index_active &&
                             !scrub_active && !qs_open &&
-                            touch_y >= drag_top && !edge_active;
+                            touch_y >= drag_top && !edge_active && !edge_zone_ambiguous;
             if (list_dragging && !was) {
                 /* A raw drag on the list itself is free browsing, not bound
                  * by wherever the index last landed — otherwise a stale
@@ -6616,7 +8430,7 @@ int music_entry(void *a0, void *a1) {
                  * crossings read as chunky/laggy rather than smooth, reported
                  * live right after this screen shipped. Continuous redraw
                  * only for this one screen, not a blanket change. */
-                int continuous = (screen == SC_TRACKS && !ab_list && !pod_list);
+                int continuous = (screen == SC_TRACKS && !ab_list && !pod_list) || screen == SC_ARTIST_PAGE;
                 if (changed || continuous) dirty = 1;
                 unsigned dt = g_tick - list_last_tick;
                 if (dt > 0) {
@@ -6643,17 +8457,22 @@ int music_entry(void *a0, void *a1) {
             }
         }
         if (inertia_active && !list_dragging) {
-            int continuous = (screen == SC_TRACKS && !ab_list && !pod_list);
+            int continuous = (screen == SC_TRACKS && !ab_list && !pod_list) || screen == SC_ARTIST_PAGE;
             if (continuous) {
                 /* Spring pull toward whichever bound is exceeded, layered
                  * onto the ordinary fling velocity below -- proportional to
                  * how far out of bounds, so it eases in rather than jumping,
                  * and settles the position rather than just decaying
-                 * whatever residual velocity release happened to leave. */
+                 * whatever residual velocity release happened to leave.
+                 * R53: 0.1875, not the original 0.15 -- reported live as too
+                 * slow to snap back; +25% on the coefficient (not friction
+                 * below, which also governs ordinary fling deceleration and
+                 * is out of this request's scope) speeds up the pull without
+                 * changing its easing shape. */
                 int cur = scroll * ROW_H + scroll_px;
-                int max_px = tracks_max_px();
-                if (cur < 0) list_velocity += (0 - cur) * 0.15f;
-                else if (cur > max_px) list_velocity += (max_px - cur) * 0.15f;
+                int max_px = (screen == SC_ARTIST_PAGE) ? artist_page_max_px() : tracks_max_px();
+                if (cur < 0) list_velocity += (0 - cur) * 0.1875f;
+                else if (cur > max_px) list_velocity += (max_px - cur) * 0.1875f;
             }
             int changed = scroll_to_px((int)(scroll * ROW_H + scroll_px + list_velocity));
             /* Same continuous-redraw reasoning as the drag tick above, for
@@ -6672,7 +8491,7 @@ int music_entry(void *a0, void *a1) {
                 int still_out = 0;
                 if (continuous) {
                     int cur = scroll * ROW_H + scroll_px;
-                    int max_px = tracks_max_px();
+                    int max_px = (screen == SC_ARTIST_PAGE) ? artist_page_max_px() : tracks_max_px();
                     if (cur < 0 && cur > -2) scroll_to_px(0);
                     else if (cur > max_px && cur < max_px + 2) scroll_to_px(max_px);
                     else still_out = cur < 0 || cur > max_px;
@@ -6814,6 +8633,68 @@ int music_entry(void *a0, void *a1) {
                 if (idx >= 0 && idx < track_n) {
                     sheet_open = 1;
                     sheet_track = idx;
+                    dirty = 1; idle = 0;
+                }
+            }
+        }
+
+        /* R59: holding a skip arc repeats it instead of firing once on
+         * release, escalating the per-repeat amount the longer it's held
+         * -- see skip_hold_amount()'s own comment for the schedule. Same
+         * touch_at-relative timing idiom as the long-press sheet just
+         * above, but this one keeps firing past the first hit (that block
+         * stops itself via !hold_fired; this one doesn't gate on it, since
+         * hold_fired here is something *this* block sets, to suppress the
+         * release-tap handler once the hold's already acted -- not
+         * something it waits on). */
+        if (touch_down && !touch_moved && !edge_active && !sheet_open &&
+            screen == SC_PLAYING && (audiobook_mode || podcast_mode)) {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            long held = (now.tv_sec - touch_at.tv_sec) * 1000L +
+                        (now.tv_nsec - touch_at.tv_nsec) / 1000000L;
+            if (skip_hold_dir == 0) {
+                if (held >= HOLD_MS) {
+                    int dir = skip_zone_at(touch_x, touch_y);
+                    if (dir != 0) {
+                        skip_hold_dir = dir;
+                        audio_seek_ms(audio_pos_ms() + dir * skip_hold_amount(held));
+                        seek_toast(dir * skip_hold_amount(held));
+                        hold_fired = 1;   /* the eventual release is not a plain tap any more */
+                        skip_hold_next_ms = held + SKIP_REPEAT_MS;
+                        dirty = 1; idle = 0;
+                    }
+                }
+            } else if (held >= skip_hold_next_ms) {
+                audio_seek_ms(audio_pos_ms() + skip_hold_dir * skip_hold_amount(held));
+                seek_toast(skip_hold_dir * skip_hold_amount(held));
+                skip_hold_next_ms = held + SKIP_REPEAT_MS;
+                dirty = 1; idle = 0;
+            }
+        }
+
+        /* Holding the Wi-Fi/Bluetooth row in quick settings opens that
+         * radio's own settings screen instead of just toggling it --
+         * same touch_at-relative hold idiom as the two blocks just above,
+         * fires once via hold_fired the same way the track-list sheet's
+         * own long-press does (not a repeater like R59's skip-hold). qs_open
+         * has to close itself here: the settings screens underneath aren't
+         * drawn while the quick-settings panel is up. */
+        if (touch_down && !touch_moved && !edge_active && !hold_fired && qs_open) {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            long held = (now.tv_sec - touch_at.tv_sec) * 1000L +
+                        (now.tv_nsec - touch_at.tv_nsec) / 1000000L;
+            if (held >= HOLD_MS) {
+                screen_t target = SC_MENU;   /* sentinel: no row held */
+                if (touch_y > qs_wifi_y() && touch_y < qs_wifi_y() + QS_ROW_H)
+                    target = SC_SETTINGS_WIFI;
+                else if (touch_y > qs_bt_y() && touch_y < qs_bt_y() + QS_ROW_H)
+                    target = SC_SETTINGS_BT;
+                if (target != SC_MENU) {
+                    hold_fired = 1;
+                    qs_open = 0;
+                    screen = target; reset_scroll();
                     dirty = 1; idle = 0;
                 }
             }
@@ -7154,7 +9035,8 @@ static void music_init(void) {
     /* Manual only, on request -- an earlier auto-start here (regardless of
      * the tile hijack below succeeding) made the whole HiBy launcher UI
      * sluggish at boot, competing with everything else initialising at the
-     * same time. index_rescan_now() (Settings' "Rebuild library index" row)
+     * same time. scanner_rescan_now() (Settings' "Scan library" row, which
+     * kicks index_rescan_now() alongside it -- see scanner.c's own comment)
      * is the only way this thread starts now. */
 
     volatile uint32_t *cave = (volatile uint32_t *)CAVE_ADDR;

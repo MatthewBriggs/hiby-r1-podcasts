@@ -641,6 +641,91 @@ int audio_probe_dur_ms(const char *path, int bitrate_bps) {
     return ms;
 }
 
+/* MP3's frame header carries its own bitrate and sample rate directly (a 4-
+ * and a 2-bit table index respectively) -- the one piece of format info this
+ * container answers without the "decode it to find out" problem d.frames=0
+ * exists to avoid (see dec_open()'s own comment). Skips a leading ID3v2 tag
+ * first, same size field tags.c's id3_all() already reads, then scans for
+ * the sync word rather than assuming the tag's declared size lands exactly
+ * on it -- padding and off-by-ones in the wild are common enough that "the
+ * next 0xFFE" is the more reliable target. CBR gives an exact bitrate this
+ * way; VBR gives whatever the first frame happened to be, which is the same
+ * "close enough for a list row" this file already accepts for duration. */
+static int mp3_probe(const char *path, int *rate_out, int *bitrate_bps_out) {
+    static const int mpeg1_l3_kbps[16] = { 0,32,40,48,56,64,80,96,112,128,160,192,224,256,320,0 };
+    static const int mpeg2_l3_kbps[16] = { 0,8,16,24,32,40,48,56,64,80,96,112,128,144,160,0 };
+    static const int mpeg1_rates[4] = { 44100, 48000, 32000, 0 };
+    static const int mpeg2_rates[4] = { 22050, 24000, 16000, 0 };
+    static const int mpeg25_rates[4] = { 11025, 12000, 8000, 0 };
+
+    unsigned char buf[8192];
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    size_t n = fread(buf, 1, sizeof(buf), f);
+    fclose(f);
+    if (n < 10) return -1;
+
+    size_t start = 0;
+    if (!memcmp(buf, "ID3", 3)) {
+        uint32_t sz = ((uint32_t)(buf[6] & 0x7F) << 21) | ((uint32_t)(buf[7] & 0x7F) << 14) |
+                     ((uint32_t)(buf[8] & 0x7F) << 7) | (buf[9] & 0x7F);
+        start = 10 + sz;
+    }
+    for (size_t i = start; i + 4 <= n; i++) {
+        if (buf[i] != 0xFF || (buf[i + 1] & 0xE0) != 0xE0) continue;
+        int ver_bits = (buf[i + 1] >> 3) & 0x03;    /* 00=v2.5, 10=v2, 11=v1 */
+        int layer_bits = (buf[i + 1] >> 1) & 0x03;   /* 01=Layer III */
+        if (layer_bits != 0x01 || ver_bits == 0x01) continue;
+        int br_idx = (buf[i + 2] >> 4) & 0x0F;
+        int sr_idx = (buf[i + 2] >> 2) & 0x03;
+        if (br_idx == 0 || br_idx == 15 || sr_idx == 3) continue;
+        int kbps = (ver_bits == 0x03) ? mpeg1_l3_kbps[br_idx] : mpeg2_l3_kbps[br_idx];
+        int rate = (ver_bits == 0x03) ? mpeg1_rates[sr_idx]
+                 : (ver_bits == 0x02) ? mpeg2_rates[sr_idx] : mpeg25_rates[sr_idx];
+        if (!kbps || !rate) continue;
+        if (rate_out) *rate_out = rate;
+        if (bitrate_bps_out) *bitrate_bps_out = kbps * 1000;
+        return 0;
+    }
+    return -1;
+}
+
+/* Scanner-facing probe: what a database row needs, none of it decoded PCM.
+ * FLAC/WAV/AIFF/Vorbis/Opus/M4A all state bits and (except MP3-adjacent
+ * concerns don't apply here) an exact frame count via dec_open() alone, so
+ * duration is exact and free for them. MP3 gets its rate/bitrate from
+ * mp3_probe() above instead, and its duration is left 0 here -- the same
+ * file-size/bitrate estimate audio_probe_dur_ms() already does is repeated
+ * by whichever caller actually needs it (index.c's own scan pass, which
+ * already calls audio_probe_dur_ms() itself; duplicating that estimate here
+ * too would just be two places to keep in sync). MP3's bits is hardcoded 16 --
+ * dec_open() leaves d.bits at 0 for it deliberately (no wide MP3 exists). */
+int audio_probe_format(const char *path, int *bits, int *rate,
+                       int *bitrate_bps, int *dur_ms) {
+    dec_t d;
+    if (dec_open(&d, path) != 0) return -1;
+    dec_kind_t kind = d.kind;
+    if (rate) *rate = (int)d.rate;
+    if (bits) *bits = (kind == DEC_MP3) ? 16 : d.bits;
+    if (dur_ms) *dur_ms = (d.frames && d.rate) ? (int)(d.frames * 1000 / d.rate) : 0;
+    dec_close(&d);
+
+    if (kind == DEC_MP3) {
+        int r = 0, bps = 0;
+        if (mp3_probe(path, &r, &bps) == 0) {
+            if (rate) *rate = r;
+            if (bitrate_bps) *bitrate_bps = bps;
+        } else if (bitrate_bps) {
+            *bitrate_bps = 0;
+        }
+    } else if (bitrate_bps) {
+        struct stat st;
+        *bitrate_bps = (dur_ms && *dur_ms > 0 && stat(path, &st) == 0)
+                      ? (int)((int64_t)st.st_size * 8000 / *dur_ms) : 0;
+    }
+    return 0;
+}
+
 /* ---- ALSA, dlopen'd ------------------------------------------------------ */
 #define SND_PCM_STREAM_PLAYBACK       0
 #define SND_PCM_ACCESS_RW_INTERLEAVED 3
@@ -1297,6 +1382,33 @@ static void apply_decode_priority(void) {
         alog("[audio] decode priority nice %d (%s)\n", want, bt ? "bt" : "local");
 }
 
+/* BG67/BG79: bluealsa resets its own mixer to a default level on every new
+ * PCM connection, independent of the AVRCP-adjacent control this app
+ * already tracks in bt_mixer/g_vol -- audio_bt_volume_service() always
+ * trusts a mixer readback (correct on its own: the headset's own buttons
+ * move it without an event ever reaching this app), so without re-pushing
+ * first, the very next readback after a fresh connection silently
+ * overwrites g_vol with whatever bluealsa reset to.
+ *
+ * BG67 originally fixed this at the *first* pcm_open() a track makes --
+ * reported live as "volume reverts" on every track/album change over
+ * Bluetooth. BG79 is the same bug on a different pcm_open(): resuming a
+ * paused audiobook after PCM_IDLE_CLOSE_TICKS has released the output
+ * device (see worker()'s own comment on why it does that) opens a brand
+ * new connection too, and that call site never got the same fix -- the
+ * original inline block lived right after the one call site, easy to miss
+ * that every *other* successful pcm_open() over Bluetooth needs it just as
+ * much. Pulled out into one shared call so that stops being possible. */
+static void bt_repush_volume(void) {
+    if (g_out_kind != 2) return;
+    pthread_mutex_lock(&g_lock);
+    int cur_vol = g_vol;
+    pthread_mutex_unlock(&g_lock);
+    pthread_mutex_lock(&bt_vol_lock);
+    bt_vol_pending = 1; bt_vol_pending_abs = cur_vol;
+    pthread_mutex_unlock(&bt_vol_lock);
+}
+
 static void *worker(void *arg) {
     (void)arg;
 
@@ -1364,25 +1476,10 @@ static void *worker(void *arg) {
     eq_set_format(eff_rate, ch);
 
     /* Every track opens a brand new bluealsa PCM connection (pcm_open()
-     * above), and bluealsa resets its own mixer to a default level on each
-     * new connection -- independent of the AVRCP-adjacent control this app
-     * already tracks in bt_mixer/g_vol. audio_bt_volume_service() always
-     * reads that mixer back and trusts it (correct: the headset's own
-     * buttons move it without an event reaching this app at all), so
-     * without this, the first readback after a track change silently
-     * overwrote g_vol with bluealsa's reset default -- reported live as
-     * "volume reverts to where it was" on every track/album change while on
-     * Bluetooth. Re-pushing the last-known volume onto the fresh stream's
-     * mixer here, before that first readback can happen, keeps the level
-     * the user actually chose instead of losing it to the reconnect. */
-    if (g_out_kind == 2) {
-        pthread_mutex_lock(&g_lock);
-        int cur_vol = g_vol;
-        pthread_mutex_unlock(&g_lock);
-        pthread_mutex_lock(&bt_vol_lock);
-        bt_vol_pending = 1; bt_vol_pending_abs = cur_vol;
-        pthread_mutex_unlock(&bt_vol_lock);
-    }
+     * above) -- see bt_repush_volume()'s own comment for why that needs a
+     * re-push before bluealsa's reset default gets read back and clobbers
+     * g_vol. */
+    bt_repush_volume();
 
     /* Two buffers, because the two paths carry different sample sizes. Only
      * the lossless formats above 16 bits use the wide one; MP3 and AAC decode
@@ -1508,6 +1605,7 @@ static void *worker(void *arg) {
                         pthread_mutex_lock(&g_lock);
                         g_paused = 0;
                         pthread_mutex_unlock(&g_lock);
+                        bt_repush_volume();
                         alog("[audio] output came back; resuming\n");
                     }
                 }
@@ -1562,6 +1660,7 @@ static void *worker(void *arg) {
             eff_rate = g_out_rate;
             eq_set_format(eff_rate, ch);
             g_out_lost = 0;
+            bt_repush_volume();
             alog("[audio] resumed on a fresh device\n");
         }
 
@@ -1735,6 +1834,7 @@ static void *worker(void *arg) {
                 hires = hires && g_out_kind != 2;
                 eff_rate = g_out_rate;
                 eq_set_format(eff_rate, ch);
+                bt_repush_volume();
                 short *nb = realloc(buf, (size_t)CHUNK_FRAMES * (size_t)ch * sizeof(short));
                 int32_t *nb32 = realloc(buf32, (size_t)CHUNK_FRAMES * (size_t)ch * sizeof(int32_t));
                 if (!nb || !nb32) break;
@@ -1918,6 +2018,7 @@ void audio_toggle(void) {
 int audio_is_active(void) { pthread_mutex_lock(&g_lock); int v=g_active; pthread_mutex_unlock(&g_lock); return v; }
 int audio_is_paused(void) { pthread_mutex_lock(&g_lock); int v=g_paused; pthread_mutex_unlock(&g_lock); return v; }
 int audio_pos_ms(void)    { pthread_mutex_lock(&g_lock); int v=g_pos_ms; pthread_mutex_unlock(&g_lock); return v; }
+int audio_seek_pending_ms(void) { pthread_mutex_lock(&g_lock); int v=g_seek_to_ms; pthread_mutex_unlock(&g_lock); return v; }
 int audio_dur_ms(void)    { pthread_mutex_lock(&g_lock); int v=g_dur_ms; pthread_mutex_unlock(&g_lock); return v; }
 void audio_set_volume(int p){ if(p<0)p=0; if(p>100)p=100; pthread_mutex_lock(&g_lock); g_vol=p; pthread_mutex_unlock(&g_lock); }
 void audio_set_next(const char *path) {

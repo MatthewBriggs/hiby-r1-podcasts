@@ -12,6 +12,7 @@ podcast-app/icon/compare.png
 
 # Build artifacts
 *.so
+music-app/app/library_standalone
 
 # Device-local, contains API keys
 settings.txt

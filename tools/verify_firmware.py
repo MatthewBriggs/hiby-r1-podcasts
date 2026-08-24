@@ -339,11 +339,19 @@ def main():
             with open(script) as fh:
                 body = fh.read()
             has = "DEV_HOOK" in body
+            standalone = "BINARY=" in body and "DEV_HOOK" not in body
             healthy = "HEALTHY_RUN" in body
             print(f"\n  {SCRIPT}")
-            print(f"    loads libpodcast_hook.so   {'yes' if has else 'NO'}")
+            if standalone:
+                print(f"    RP1 standalone launcher    yes (no hiby_player)")
+            else:
+                print(f"    loads libpodcast_hook.so   {'yes' if has else 'NO'}")
             print(f"    consecutive-crash fix      {'yes' if healthy else 'NO'}")
-            ok &= has
+            # Either shape is a legitimate supervisor -- DEV_HOOK for the
+            # LD_PRELOAD-into-hiby_player build, BINARY= for --standalone's
+            # own full replacement (see build_standalone_supervisor() in
+            # patch_firmware.py). Only neither is a real problem.
+            ok &= (has or standalone)
         else:
             print(f"\n  {SCRIPT} MISSING")
             ok = False
@@ -379,6 +387,12 @@ def main():
                 expected = {SCRIPT, MOUNT_SCRIPT, CONFIG_JSON, VERSION_FILE,
                             BT_INIT}
                 expected |= set(SET_FUNCTIONS_FILES)
+                # kernel_build_id: --kernel-build-id re-stamps this file, which
+                # shows up as "changed" (not "added") whenever the base image
+                # already carried a stamp from an earlier pass -- both are
+                # legitimate, so it belongs in both sets rather than only
+                # expected_added below.
+                expected |= {"usr/resource/kernel_build_id"}
                 # Internet radio swaps each theme's Stream media layout for
                 # HiBy's own CN variant, which is the one carrying the tile.
                 expected |= {f"{d}/hiby_stream_media.view" for d in (

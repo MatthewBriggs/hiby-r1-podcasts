@@ -306,3 +306,81 @@ int spotify_fetch_cover(const char *artist, const char *album, const char *dest_
     if (rename(tmp_jpg, dest_jpg) != 0) { unlink(tmp_jpg); return -1; }
     return 0;
 }
+
+/* Artist page's photo fallback -- same shape as spotify_fetch_cover() just
+ * above (type=artist instead of type=album, matched against the artist's
+ * own name via titles_resemble() instead of an album title), since a
+ * result item's "images" array followed by "name" is the identical field
+ * order for both object types. */
+int spotify_fetch_artist_image(const char *artist, const char *dest_jpg) {
+    spotify_load_config();
+    if (!g_client_id[0] || !g_client_secret[0] || !artist[0]) return -1;
+
+    char token[512];
+    if (get_access_token(token, sizeof(token)) != 0) return -1;
+
+    char eq[900];
+    url_encode(artist, eq, sizeof(eq));
+
+    char url[1000];
+    snprintf(url, sizeof(url),
+             "https://api.spotify.com/v1/search?q=%s&type=artist&limit=5", eq);
+
+    char auth_hdr[560];
+    snprintf(auth_hdr, sizeof(auth_hdr), "Authorization: Bearer %s", token);
+
+    char meta_path[64];
+    snprintf(meta_path, sizeof(meta_path), "/tmp/.spotify_artist_%d.json", (int)getpid());
+    char *argv[] = {
+        (char *)CURL_BIN, "-fsSL", "--cacert", (char *)CURL_CA,
+        "--connect-timeout", "10", "--max-time", "15",
+        "-H", auth_hdr, "-o", meta_path, url,
+        NULL
+    };
+    if (run_curl_argv(argv, meta_path) != 0) { unlink(meta_path); return -1; }
+
+    FILE *f = fopen(meta_path, "rb");
+    unlink(meta_path);
+    if (!f) return -1;
+    char *buf = malloc(65536);
+    size_t n = buf ? fread(buf, 1, 65535, f) : 0;
+    fclose(f);
+    if (!buf) return -1;
+    buf[n] = '\0';
+
+    char img_url[600] = "";
+    const char *p = buf;
+    for (int i = 0; i < 5; i++) {
+        const char *arr = strstr(p, "\"images\"");
+        if (!arr) break;
+        arr = strchr(arr, '[');
+        if (!arr) break;
+        const char *end = strchr(arr, ']');
+        if (!end) break;
+
+        char this_url[600] = "", this_name[300] = "";
+        const char *after_url = NULL, *after_name = NULL;
+        extract_next_string(arr, "url", this_url, sizeof(this_url), &after_url);
+        extract_next_string(end, "name", this_name, sizeof(this_name), &after_name);
+        p = after_name ? after_name : end + 1;
+
+        if (this_url[0] && this_name[0] && titles_resemble(artist, this_name)) {
+            snprintf(img_url, sizeof(img_url), "%s", this_url);
+            break;
+        }
+    }
+    free(buf);
+    if (!img_url[0]) return -1;
+
+    char tmp_jpg[300];
+    snprintf(tmp_jpg, sizeof(tmp_jpg), "%s.part", dest_jpg);
+    char *dl_argv[] = {
+        (char *)CURL_BIN, "-fsSL", "--cacert", (char *)CURL_CA,
+        "--connect-timeout", "10", "--max-time", "20",
+        "-o", tmp_jpg, img_url,
+        NULL
+    };
+    if (run_curl_argv(dl_argv, tmp_jpg) != 0) { unlink(tmp_jpg); return -1; }
+    if (rename(tmp_jpg, dest_jpg) != 0) { unlink(tmp_jpg); return -1; }
+    return 0;
+}

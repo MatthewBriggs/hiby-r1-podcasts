@@ -26,4 +26,17 @@ int lastfm_has_key(void);
  * validates the saved file the next time it's read). */
 int lastfm_fetch_cover(const char *artist, const char *album, const char *dest_jpg);
 
+/* Artist page: artist.getinfo instead of album.getinfo, one call for both
+ * a photo (same "largest image" pick as lastfm_fetch_cover()) and a bio
+ * (bio.summary, HTML-unescaped and with the trailing "Read more on
+ * Last.fm" link stripped). Either half can come back empty on its own --
+ * an artist with a photo but no written bio is common -- so success/failure
+ * is reported per-half rather than as one combined result: returns 1 if
+ * dest_jpg was written, 2 if bio_out was filled, 3 if both were, 0 if the
+ * call reached Last.fm but got neither, -1 if the call itself failed (no
+ * key, no network, no match at all). Same blocking-network-call contract
+ * as lastfm_fetch_cover() -- call off the UI thread only. */
+int lastfm_fetch_artist(const char *artist, const char *dest_jpg,
+                        char *bio_out, size_t bio_n);
+
 #endif

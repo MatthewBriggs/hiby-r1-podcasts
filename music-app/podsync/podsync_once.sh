@@ -111,7 +111,20 @@ adopt_existing() {
     return 1
 }
 
-get() { "$CURL" -fsSL --cacert "$CA" --connect-timeout 20 --max-time 900 -o "$2" "$1" 2>>"$LOG"; }
+# RBR/BG92: max-time 900 (15 min) applied to every fetch through this one
+# function, feed RSS and cover images included -- reasonable for an actual
+# episode download (large file, plausibly slow connection) but means one
+# stalled/slow feed host could leave the *entire* sync looking frozen for up
+# to 15 minutes, since feeds are fetched sequentially and nothing else in
+# this script runs concurrently with a `get` call. Reported live as "the
+# podcast player crashed" -- confirmed via strace it wasn't a crash, `curl`
+# was still alive and blocked in poll() on a slow connect to one feed's
+# host, well past what a user will wait before assuming something died.
+# Split into a short timeout for feed/cover fetches (small files, should
+# fail fast) and the original generous one kept only for the actual
+# episode download, which legitimately needs the room.
+get() { "$CURL" -fsSL --cacert "$CA" --connect-timeout 10 --max-time 30 -o "$2" "$1" 2>>"$LOG"; }
+get_episode() { "$CURL" -fsSL --cacert "$CA" --connect-timeout 20 --max-time 900 -o "$2" "$1" 2>>"$LOG"; }
 
 total_new=0
 
@@ -208,7 +221,7 @@ while read -r url; do
         adopt_existing "$dir" "$base" "$ext" && continue
 
         log "  downloading $base"
-        if get "$epurl" "$out.part" && [ -s "$out.part" ]; then
+        if get_episode "$epurl" "$out.part" && [ -s "$out.part" ]; then
             mv "$out.part" "$out"
             # Stamp the publication date onto the file so the app can sort by it.
             # Download order is the reverse of publication order, so mtime would

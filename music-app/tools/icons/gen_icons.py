@@ -29,8 +29,19 @@ from PIL import Image
 # exists to prevent. Singletons (bt/usb/wifi) are families of one.
 SPECS = [
     ("bt",   "bluetooth-brands-solid-full.svg.png", "bt",   [(26, 38, "_qs"), (16, 16, "_sm")]),
-    ("usb",  "usb-brands-solid-full.svg.png",       "usb",  [(16, 16, "_sm")]),
+    ("usb",  "usb-brands-solid-full.svg.png",       "usb",  [(16, 16, "_sm"), (26, 26, "_qs")]),
     ("wifi", "wifi-solid-full.svg.png",             "wifi", [(48, 34, "_qs")]),
+    ("gear", "gear-solid-full.svg.png",             "gear", [(20, 20, "_qs")]),
+    ("disc", "compact-disc-solid-full.svg.png",     "disc", [(28, 28, "")]),
+    # Family, not three singletons: these three swap for one another at the
+    # exact same on-screen spot (Now Playing's mode-cycle button), so they
+    # need the shared-crop-box treatment the family mechanism exists for --
+    # fit independently, bars' wide/flat bbox vs shuffle's/repeat's more
+    # square ones would come out at visibly different sizes for what's
+    # supposed to read as the same button in three states.
+    ("mode", "bars-solid-full.svg.png",             "mode_off",     [(26, 26, "")]),
+    ("mode", "repeat-solid-full.svg.png",           "mode_repeat",  [(26, 26, "")]),
+    ("mode", "shuffle-solid-full.svg.png",          "mode_shuffle", [(26, 26, "")]),
     ("vol",  "volume-xmark-solid-full.svg.png",     "vol_mute", [(20, 20, "")]),
     ("vol",  "volume-low-solid-full.svg.png",       "vol_low",  [(20, 20, "")]),
     ("vol",  "volume-solid-full.svg.png",           "vol_mid",  [(20, 20, "")]),

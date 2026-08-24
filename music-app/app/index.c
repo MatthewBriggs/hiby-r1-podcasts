@@ -472,15 +472,17 @@ static void *scan_worker(void *arg) {
         g_scan_running = 0;
         ilog("[index] scan pass done: %d tracks seen, %d (re)written\n", g_scanned, g_written);
 
-        /* Near-free once the library is fully indexed -- every unchanged
-         * file is one point lookup with no tag read. Looping means a file
-         * added or edited after this pass gets picked up without a reboot.
-         * Woken early by index_rescan_now() (the Settings row) rather than
-         * one long sleep(), so a manual "check now" is actually prompt. A
+        /* Manual only: waits here indefinitely for index_rescan_now() (the
+         * Settings row), no periodic re-run. Was a 30-minute timer -- with
+         * scanner.c now the sole source of what files exist at all (RP1:
+         * hiby_player's own scanner, the only other thing that ever found
+         * new files, is gone for good), the two are now always kicked
+         * together (see scanner_rescan_now()'s own comment), so a separate
+         * timer here just meant redundant passes between manual scans. A
          * kick that arrived *during* the pass just finished is intentionally
          * still honoured here rather than treated as already satisfied --
          * it asked for the freshest possible pass, not merely "a" pass. */
-        for (int waited = 0; waited < 30 * 60 && !g_kick; waited++) sleep(1);
+        while (!g_kick) sleep(1);
         g_kick = 0;
     }
     return NULL;

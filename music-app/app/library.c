@@ -32,16 +32,46 @@
 #include "tags.h"
 #include "audio.h"
 #include "index.h"
+#include "scanner.h"
 
 #define DB_PATH "/usr/data/usrlocal_media.db"
 
 static sqlite3 *g_db;
 
+/* RP6/RP1: originally written the other way round -- prefer DB_PATH
+ * (hiby_player's own scanner) and fall back to scanner.c's database only
+ * when DB_PATH was empty. Flipped once RP1 actually shipped (2026-08-23,
+ * v0.32, the standalone no-hiby_player release): with hiby_player gone for
+ * good, DB_PATH stops being written forever but does NOT go empty -- it
+ * freezes at whatever it last knew, fully populated, so the old
+ * empty-vs-populated check never triggered the fallback at all. A device
+ * on the standalone release would have silently stopped seeing new music
+ * forever, still reading a snapshot from whenever hiby_player last ran.
+ * scanner.c's own database is the one still being kept current (see its
+ * own header comment on the 30-minute rescan loop), so it is now the
+ * default, with DB_PATH only a fallback for the gap before a device's
+ * first scan pass completes. Harmless on the still-hooked (non-standalone)
+ * build too: has_rows() still gates it, so a device that has never run the
+ * new scanner just falls through to DB_PATH exactly as before. */
+static int has_rows(sqlite3 *db) {
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(db, "select count(*) from MEDIA_TABLE limit 1", -1, &st, NULL) != SQLITE_OK)
+        return 0;
+    int n = (sqlite3_step(st) == SQLITE_ROW) ? sqlite3_column_int(st, 0) : 0;
+    sqlite3_finalize(st);
+    return n > 0;
+}
+
 int lib_open(void) {
     if (g_db) return 0;
     /* nomutex: only the UI thread touches this handle. */
-    int rc = sqlite3_open_v2(DB_PATH, &g_db,
+    int rc = sqlite3_open_v2(SCANNER_DB_PATH, &g_db,
                              SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, NULL);
+    if (rc == SQLITE_OK && has_rows(g_db)) return 0;
+    if (g_db) { sqlite3_close(g_db); g_db = NULL; }
+
+    rc = sqlite3_open_v2(DB_PATH, &g_db,
+                         SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, NULL);
     if (rc != SQLITE_OK) {
         if (g_db) { sqlite3_close(g_db); g_db = NULL; }
         return -1;
@@ -587,23 +617,44 @@ static int sweep_album_folder(lib_track_t *out, int n, int max,
  * 37. (char(0)/rtrim(x, char(0)) were tried first and don't work here --
  * this build's char(0) reports length() 0, not 1, so neither rtrim() nor
  * replace() ever had a real NUL byte to strip.) */
+/* BG91: tapping "Substance" (Joy Division) also played tracks from
+ * "Substance 1987" (New Order), interleaved -- reported live, and visible
+ * directly in music.log's own play sequence. Root cause: album was matched
+ * with the exact same trailing-wildcard LIKE pattern (`album || '%'`)
+ * artist/genre facets use deliberately, for a reason that doesn't apply to
+ * album at all -- facets use a prefix match so a compound value like
+ * "Berliner Philharmoniker, Kirill Petrenko" still matches on the shorter
+ * "Berliner Philharmoniker" (see tracks_query()'s own header comment on the
+ * album_artist half of this same function). An album title has no such
+ * legitimate shorter/longer relationship to itself; "Substance" is simply a
+ * different, unrelated album from "Substance 1987", and the wildcard
+ * matched both. Fixed with exact equality instead of a prefix match, still
+ * tolerating the stock DB's embedded-trailing-NUL quirk (this file's own
+ * header comment) by comparing against both the plain value and the value
+ * with one real NUL byte appended -- built in C with an explicit bind
+ * length rather than SQL's char(0), which the album_artist comment above
+ * already found doesn't behave as a real NUL byte in this SQLite build. */
 static int tracks_query(const char *artist, const char *album, int use_artist,
                         lib_track_t *out, int max, char *seed_path, size_t seed_len) {
     const char *sql = use_artist
         ? "select name, path, format, bit, sample_rate, bit_rate, end_time, artist "
-          "from MEDIA_TABLE where album like ? escape '\\' "
+          "from MEDIA_TABLE where (album = ? or album = ?) "
           "and (album_artist like ? escape '\\' "
           "or ? like (substr(album_artist, 1, length(album_artist) - 1) || '%')) "
           "and " PODCAST_EXCL_SQL " limit ?"
         : "select name, path, format, bit, sample_rate, bit_rate, end_time, artist "
-          "from MEDIA_TABLE where album like ? escape '\\' "
+          "from MEDIA_TABLE where (album = ? or album = ?) "
           "and " PODCAST_EXCL_SQL " limit ?";
     sqlite3_stmt *st;
     if (sqlite3_prepare_v2(g_db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
     char pa[LIB_NAME_LEN + 2], pb[LIB_NAME_LEN + 2];
-    snprintf(pa, sizeof(pa), "%s%%", album);
+    int alen = (int)strlen(album);
+    if (alen > LIB_NAME_LEN) alen = LIB_NAME_LEN;
+    memcpy(pa, album, (size_t)alen);
+    pa[alen] = '\0';
     int a = 1;
-    sqlite3_bind_text(st, a++, pa, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, a++, pa, alen, SQLITE_TRANSIENT);        /* exact */
+    sqlite3_bind_text(st, a++, pa, alen + 1, SQLITE_TRANSIENT);    /* exact + trailing NUL */
     if (use_artist) {
         snprintf(pb, sizeof(pb), "%s%%", artist);
         sqlite3_bind_text(st, a++, pb, -1, SQLITE_TRANSIENT);

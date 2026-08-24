@@ -340,6 +340,88 @@ done
 '''
 
 
+STANDALONE_SUPERVISOR_BODY = '''BINARY="{binary_path}"
+CRASH_COUNT=0
+MAX_CRASHES=5
+HEALTHY_RUN=60          # seconds up before a run counts as a success
+
+# --- Library/Podcasts additions ---------------------------------------------
+# RP1: no hiby_player at all. BINARY is a real, independent executable (not
+# an LD_PRELOAD hook, so there is nothing to inject into another process's
+# address space) living on /usr/data, which is writable and survives a
+# firmware update -- the same reason the old preloaded hook .so used to live
+# there too. A missing BINARY just means CRASH_COUNT climbs to MAX_CRASHES
+# and the device reboots rather than spinning silently, the same failure
+# shape the old hook-based supervisor already had for a missing hook.
+#
+# Mounting the SD card was never any init.d script's job or this script's
+# own -- grepped the whole stock rootfs for it and came up empty. It happens
+# inside the hiby_player *binary* itself at startup (confirmed live: without
+# it, dmesg never shows "exFAT-fs ... mounted successfully", every path
+# under /data/mnt/sd_0 stat()s as missing, and the library shows real album
+# names -- index.c's own stale cache -- with every album reporting 0 tracks,
+# since tracks_query() skips any row whose file doesn't actually exist).
+# With hiby_player gone, nothing else will ever do this, so it has to happen
+# here. -t exfat matches this card's real format exactly (confirmed via the
+# same dmesg line); mount is idempotent enough in practice that a harmless
+# "already mounted" on a crash-restart is fine to ignore.
+mount -t exfat /dev/mmcblk0p1 /data/mnt/sd_0 2>/dev/null
+
+USER_INIT="/usr/data/init.sh"
+
+[ -f "$USER_INIT" ] && sh "$USER_INIT" >/dev/null 2>&1 &
+
+# Performance tuning, applied once at startup -- same as the old hook-based
+# supervisor's own copy of this block, kept verbatim since Library benefits
+# from it regardless of what launches it.
+for q in /sys/block/mmcblk*/queue/read_ahead_kb; do
+    [ -w "$q" ] && echo 2048 > "$q"
+done
+[ -w /proc/sys/vm/vfs_cache_pressure ] && echo 50 > /proc/sys/vm/vfs_cache_pressure
+# -----------------------------------------------------------------------------
+
+while true; do
+    if [ -x "$BINARY" ]; then
+        "$BINARY" &
+    else
+        sleep 5 &   # nothing to run; still counts as a fast "crash" below
+    fi
+    B_PID=$!
+    STARTED=$(date +%s)
+    wait "$B_PID" 2>/dev/null
+
+    if [ $(( $(date +%s) - STARTED )) -ge "$HEALTHY_RUN" ]; then
+        CRASH_COUNT=0
+    else
+        CRASH_COUNT=$((CRASH_COUNT + 1))
+    fi
+    if [ "$CRASH_COUNT" -ge "$MAX_CRASHES" ]; then
+        reboot
+    fi
+    sleep 1
+done
+'''
+
+
+def build_standalone_supervisor(original_text, binary_path):
+    """RP1: full-replacement supervisor that launches `binary_path` (an
+    on-device path, e.g. /usr/data/library_standalone) directly in a
+    crash-counted loop -- no hiby_player, no DEV_HOOK/LD_PRELOAD at all.
+
+    Reuses the same batd-preamble anchor build_vanilla_supervisor() keys
+    off, since the input this is written against is the same bare vanilla
+    hiby_player.sh either way -- battery monitoring has nothing to do with
+    which player runs after it, so that preamble is kept unmodified.
+    Returns None if the anchor isn't found, same "stop rather than guess"
+    contract every other supervisor-shape function here follows.
+    """
+    if VANILLA_ANCHOR_PREAMBLE_END not in original_text:
+        return None
+    preamble = original_text.split(VANILLA_ANCHOR_PREAMBLE_END)[0] + VANILLA_ANCHOR_PREAMBLE_END
+    body = STANDALONE_SUPERVISOR_BODY.format(binary_path=binary_path)
+    return preamble + "\n" + body
+
+
 def build_vanilla_supervisor(original_text):
     """Full-replacement supervisor for a bare vanilla hiby_player.sh.
 
@@ -708,6 +790,16 @@ def main():
                          "format's manifest is a text template that has to "
                          "be patched in place, same as the rootfs entry "
                          "already is below.")
+    ap.add_argument("--standalone", metavar="DEVICE_PATH", nargs="?",
+                    const="/usr/data/library_standalone",
+                    help="RP1: replace hiby_player.sh entirely with a loop "
+                         "that launches DEVICE_PATH (an on-device path, not "
+                         "a local file -- nothing is embedded in the image) "
+                         "directly, no hiby_player and no DEV_HOOK/LD_PRELOAD "
+                         "at all. Defaults to /usr/data/library_standalone "
+                         "if given with no value. Only works against a bare "
+                         "vanilla hiby_player.sh -- see "
+                         "build_standalone_supervisor()'s own comment.")
     ap.add_argument("--kernel-build-id", metavar="ID",
                     help="stamp usr/resource/kernel_build_id with this "
                          "string (e.g. '4.4.94_r1') -- read by the app's "
@@ -792,30 +884,43 @@ def main():
         with open(target, "r") as fh:
             original = fh.read()
 
-        if "DEV_HOOK" in original:
-            die(f"{SCRIPT} already contains DEV_HOOK — this image is already patched")
-
-        # Two supervisor shapes, routed on whether this is a mod-based image
-        # (has the mod's own MAX_CRASHES supervisor to patch incrementally)
-        # or a vanilla one (bare stock script, no anchor to patch --
-        # build_vanilla_supervisor() writes the whole replacement instead).
-        # Neither function guesses silently: each returns None if the input
-        # does not match what it was written against, and that is treated as
-        # a hard stop rather than a best-effort patch, for the same reason
-        # patch_script() always has -- a half-applied patch to init would be
-        # a brick rather than a bug.
-        if "MAX_CRASHES" in original:
-            patched = patch_script(original)
-            kind = "mod-based"
+        if args.standalone:
+            # A full replacement, not an incremental patch -- DEV_HOOK/
+            # MAX_CRASHES already being present says nothing about whether
+            # this can proceed, so that check is skipped entirely here.
+            patched = build_standalone_supervisor(original, args.standalone)
+            kind = f"standalone ({args.standalone})"
+            if patched is None:
+                die(f"{SCRIPT} does not match the bare vanilla shape "
+                    f"--standalone was written against (missing the batd "
+                    f"preamble anchor) -- see build_standalone_supervisor()'s "
+                    f"own comment.")
         else:
-            patched = build_vanilla_supervisor(original)
-            kind = "vanilla"
-        if patched is None:
-            die(f"{SCRIPT} matches neither the mod's supervisor shape nor "
-                f"vanilla's bare one — this firmware's {SCRIPT} has changed "
-                f"from what this tool knows. Patch it by hand, using "
-                f"patch_script() (mod-based) or build_vanilla_supervisor() "
-                f"(vanilla) above as the reference.")
+            if "DEV_HOOK" in original:
+                die(f"{SCRIPT} already contains DEV_HOOK — this image is already patched")
+
+            # Two supervisor shapes, routed on whether this is a mod-based
+            # image (has the mod's own MAX_CRASHES supervisor to patch
+            # incrementally) or a vanilla one (bare stock script, no anchor
+            # to patch -- build_vanilla_supervisor() writes the whole
+            # replacement instead). Neither function guesses silently: each
+            # returns None if the input does not match what it was written
+            # against, and that is treated as a hard stop rather than a
+            # best-effort patch, for the same reason patch_script() always
+            # has -- a half-applied patch to init would be a brick rather
+            # than a bug.
+            if "MAX_CRASHES" in original:
+                patched = patch_script(original)
+                kind = "mod-based"
+            else:
+                patched = build_vanilla_supervisor(original)
+                kind = "vanilla"
+            if patched is None:
+                die(f"{SCRIPT} matches neither the mod's supervisor shape nor "
+                    f"vanilla's bare one — this firmware's {SCRIPT} has changed "
+                    f"from what this tool knows. Patch it by hand, using "
+                    f"patch_script() (mod-based) or build_vanilla_supervisor() "
+                    f"(vanilla) above as the reference.")
         with open(target, "w") as fh:
             fh.write(patched)
         print(f"patched {SCRIPT} ({kind} base, "
