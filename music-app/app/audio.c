@@ -982,7 +982,16 @@ static pthread_mutex_t bt_vol_lock = PTHREAD_MUTEX_INITIALIZER;
 static int bt_vol_pending;            /* 1 = a write is waiting to be applied */
 static int bt_vol_pending_abs;
 
+/* USB Transport Mode's volume lock -- see audio_set_vol_locked()'s own
+ * comment in audio.h. Deliberately doesn't gate audio_set_volume() itself:
+ * that's the low-level setter the lock's own owner uses to establish the
+ * pinned value in the first place, so gating it there would make locking
+ * unable to set the value it's supposed to hold. */
+static int g_vol_locked;
+void audio_set_vol_locked(int on) { g_vol_locked = on; }
+
 void audio_volume_set(int pct) {
+    if (g_vol_locked) return;
     if (pct < 0) pct = 0;
     if (pct > 100) pct = 100;
     if (!audio_using_bt()) { audio_set_volume(pct); return; }
@@ -993,6 +1002,7 @@ void audio_volume_set(int pct) {
 }
 
 void audio_volume_step(int delta) {
+    if (g_vol_locked) return;
     if (!audio_using_bt()) {
         int v = audio_volume() + delta;
         if (v < 0) v = 0;

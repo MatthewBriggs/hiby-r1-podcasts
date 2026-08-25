@@ -281,17 +281,25 @@ static int is_daytime(void) {
 }
 
 static int button_lock_enabled;   /* off by default: a new gesture, opt in */
-/* "Disable PEQ, MSEB and Bluetooth when playing over USB" -- off by default,
- * same reasoning as button_lock_enabled: a new behaviour, opt in. usb_bypass_
- * active tracks whether the override is *currently* engaged (distinct from
- * the setting itself: engaged only while output is actually USB), and
- * usb_bypass_bt_was_on remembers what Bluetooth was before this turned it
- * off, so leaving USB puts it back exactly as deep_suspend() already does
- * for its own Bluetooth teardown -- never silently changing a setting the
- * user chose themselves. */
+/* "USB Transport Mode" (R37, extended) -- off by default, same reasoning as
+ * button_lock_enabled: a new behaviour, opt in. Displayed name changed from
+ * "Bypass DSP on USB" to reflect that it's grown past just the DSP bypass
+ * (now also pins volume at 100%, on the reasoning that a USB DAC/amp should
+ * own its own volume rather than have this app attenuate ahead of it) --
+ * the persisted config key (usb_bypass_enabled) and internal identifiers
+ * are unchanged, since it's still fundamentally one on/off setting and
+ * renaming the key would silently drop whatever a device already has saved.
+ * usb_bypass_active tracks whether the override is *currently* engaged
+ * (distinct from the setting itself: engaged only while output is actually
+ * USB); usb_bypass_bt_was_on and usb_bypass_saved_vol remember what
+ * Bluetooth and the volume were before this turned them off/pinned them, so
+ * leaving USB puts both back exactly as deep_suspend() already does for its
+ * own Bluetooth teardown -- never silently changing a setting the user
+ * chose themselves. */
 static int usb_bypass_enabled;
 static int usb_bypass_active;
 static int usb_bypass_bt_was_on;
+static int usb_bypass_saved_vol;
 
 #define TEXT_PX_TITLE 34
 #define TEXT_PX_BODY  30
@@ -1049,7 +1057,7 @@ static void draw_line(uint16_t *fb, int x0, int y0, int x1, int y1, uint16_t c) 
 }
 
 /* Centers the switch on an explicit block height rather than always ROW_H --
- * some rows (Settings' Power button lock / Bypass DSP on USB) draw a
+ * some rows (Settings' Power button lock / USB Transport Mode) draw a
  * two-line description below the title, and the divider bounding "this
  * setting" spans that whole block, not just the top 72px title slice. The
  * old fixed y+16 also put the pill's midpoint at y+32 against a plain row's
@@ -5116,12 +5124,12 @@ static void draw_screen(uint16_t *fb) {
         ry = set_row_usbbypass_y() - off;
         int usbbypass_h = set_row_autooff_y() - set_row_usbbypass_y();
         fill_rect_clip(fb, 0, ry - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
-        draw_text_clip(fb, 24, ry + 20, "Bypass DSP on USB", COL_TEXT, TEXT_PX_BODY, FB_W - 140, CONTENT_Y, clip_bot);
+        draw_text_clip(fb, 24, ry + 20, "USB Transport Mode", COL_TEXT, TEXT_PX_BODY, FB_W - 140, CONTENT_Y, clip_bot);
         draw_toggle_switch_h_clip(fb, ry, usb_bypass_enabled, usbbypass_h, CONTENT_Y, clip_bot);
 
         int uy = set_usbbypass_desc_y() - off;
-        draw_text_clip(fb, 24, uy, "Disables PEQ, MSEB and Bluetooth while", COL_DIM, TEXT_PX_SMALL, FB_W - 48, CONTENT_Y, clip_bot);
-        draw_text_clip(fb, 24, uy + 26, "output is USB. Restored when USB stops.", COL_DIM, TEXT_PX_SMALL, FB_W - 48, CONTENT_Y, clip_bot);
+        draw_text_clip(fb, 24, uy, "Disables PEQ/MSEB/Bluetooth and locks volume", COL_DIM, TEXT_PX_SMALL, FB_W - 48, CONTENT_Y, clip_bot);
+        draw_text_clip(fb, 24, uy + 26, "at 100% while output is USB. Restored after.", COL_DIM, TEXT_PX_SMALL, FB_W - 48, CONTENT_Y, clip_bot);
 
         ry = set_row_autooff_y() - off;
         int autooff_h = set_row_lighttheme_y() - set_row_autooff_y();
@@ -7147,14 +7155,23 @@ int music_entry(void *a0, void *a1) {
                 usb_bypass_bt_was_on = st_bt_on();
                 if (usb_bypass_bt_was_on) { st_bt_set(0); qs_bt = 0; }
                 audio_set_usb_bypass(1);
+                /* Save/pin volume before engaging the lock -- audio_set_volume()
+                 * is the low-level setter the lock doesn't gate (see its own
+                 * comment in audio.c), which is exactly what's needed to
+                 * establish the pinned value itself. */
+                usb_bypass_saved_vol = audio_volume();
+                audio_set_volume(100);
+                audio_set_vol_locked(1);
                 usb_bypass_active = 1;
-                mlog("[music] usb bypass: engaged (peq/mseb off%s)\n",
+                mlog("[music] usb transport mode: engaged (peq/mseb off, vol -> 100%%%s)\n",
                      usb_bypass_bt_was_on ? ", bluetooth off" : "");
             } else if (!want_bypass && usb_bypass_active) {
                 audio_set_usb_bypass(0);
                 if (usb_bypass_bt_was_on) { st_bt_set(1); qs_bt = 1; }
+                audio_set_vol_locked(0);
+                audio_volume_set(usb_bypass_saved_vol);
                 usb_bypass_active = 0;
-                mlog("[music] usb bypass: released\n");
+                mlog("[music] usb transport mode: released (vol -> %d%%)\n", usb_bypass_saved_vol);
             }
         }
 

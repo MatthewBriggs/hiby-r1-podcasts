@@ -51,6 +51,15 @@ int  audio_using_usb(void);
  * instant USB output stops, whatever the user's actual EQ settings are. */
 void audio_set_usb_bypass(int on);
 int  audio_usb_bypass(void);
+/* Same "USB Transport Mode" feature: pins the volume at whatever it was set
+ * to right before this engaged (100, in the current caller -- a USB DAC/amp
+ * is expected to own its own volume, the same reasoning R37's DSP bypass
+ * already uses for that output). audio_volume_set()/audio_volume_step()
+ * both ignore any change while this is on, so a stray key press or slider
+ * drag can't quietly move it out from under the DAC; the caller still uses
+ * audio_set_volume() directly (which this does NOT gate) to set the pinned
+ * value itself before/after engaging. */
+void audio_set_vol_locked(int on);
 /* Background-thread only (bt_poll) -- both do blocking D-Bus round-trips via
  * amixer. audio_bt_volume_pending() is the cheap check between polls;
  * audio_bt_volume_service() applies a pending write (from a key or the
