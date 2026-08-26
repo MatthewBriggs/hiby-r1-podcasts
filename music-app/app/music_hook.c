@@ -2740,15 +2740,30 @@ static void pod_play_episode(int idx) {
     q_album[0] = '\0';
     q_artist[0] = '\0';
     q_pending_at = -1;   /* BG85: podcasts never go through queue_play_next() */
+    /* Reported live: opening an episode right after something was actively
+     * playing over Bluetooth (an audiobook, say) made it look stuck at 0:00
+     * for 10-20s before jumping to the real resumed position. Root cause
+     * wasn't the resume file itself (a few KB either way, this device's
+     * CPU chews through that instantly) -- it was that this lookup used to
+     * run *after* audio_play(), synchronously on the main thread, at the
+     * exact moment the worker thread was also hitting the SD card hard
+     * tearing down the old decoder/Bluetooth PCM connection and opening
+     * the new file. This exFAT card is already known to serialize/stall
+     * under exactly that kind of concurrent access (see index.c's own
+     * comment on it). ab_resume_book() never had this problem because it
+     * already does its own lookup *before* calling ab_play_chapter() --
+     * mirrored here rather than rediscovered: look up first, while the SD
+     * card is still idle, then hand audio_play() a target that's already
+     * known instead of racing it. */
+    int dur = 0;
+    int resume = pod_resume_lookup(pod_eps[idx].path, &dur);
+    pod_notes_avail = pod_load_notes(pod_eps[idx].path, pod_notes_text, sizeof(pod_notes_text)) > 0;
     audio_set_next(NULL);
     audio_set_speed(pod_speed_permille);
     audio_play(pod_eps[idx].path);
     art_request(pod_eps[idx].path, "", "");
     was_active = 1;
-    int dur = 0;
-    int resume = pod_resume_lookup(pod_eps[idx].path, &dur);
     if (resume > 0 && resume != POD_FINISHED) audio_seek_ms(resume);
-    pod_notes_avail = pod_load_notes(pod_eps[idx].path, pod_notes_text, sizeof(pod_notes_text)) > 0;
     pod_notes_showing = 0;
     pod_notes_scroll_px = 0;
     mlog("[music] podcast episode %s\n", pod_eps[idx].name);
