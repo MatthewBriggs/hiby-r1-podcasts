@@ -3577,16 +3577,25 @@ static void draw_mini(uint16_t *fb) {
          * (see its book/chapter bar code) -- the mini player just never
          * got it, so its glanceable bar was quietly showing book
          * progress the whole time. */
+        /* BG80 (extended, same as the full player's own Now Playing fix):
+         * prefer the still-outstanding seek target over audio_pos_ms()
+         * while the worker thread is mid-transition (a fresh decoder/
+         * Bluetooth PCM connection especially) -- otherwise this bar shows
+         * 0/stale, which reads as "reset to the start", for however long
+         * that takes. Both are file-scoped absolute ms, so the same
+         * chapter-start subtraction applies to either. */
+        int pending = audio_seek_pending_ms();
+        int raw_pos = pending >= 0 ? pending : audio_pos_ms();
         if (audiobook_mode && cur_track < ab_book.chap_n) {
             const ab_chapter_t *ch = &ab_book.chap[cur_track];
             dur = (int)ch->dur_ms;
             if (dur <= 0) dur = audio_dur_ms();   /* one-file-one-chapter book */
-            pos = (int)(audio_pos_ms() - ch->file_start_ms);
+            pos = raw_pos - (int)ch->file_start_ms;
             if (pos < 0) pos = 0;
         } else {
             dur = audio_dur_ms();
             if (dur <= 0) dur = t->dur_ms;
-            pos = audio_pos_ms();
+            pos = raw_pos;
         }
         if (dur > 0) {
             int w = FB_W * pos / dur;
@@ -4373,7 +4382,22 @@ static void draw_screen(uint16_t *fb) {
             draw_right(fb, ty + 82, buf);
         }
 
-        int pos = audio_pos_ms(), dur = audio_dur_ms();
+        /* BG80 (extended here): audio_pos_ms() reads 0/stale for however
+         * long the worker thread takes to tear down the previous decoder/
+         * output and open this one -- a fresh Bluetooth PCM connection
+         * especially, worse yet coming from something that was still
+         * actively playing (an audiobook, say) rather than paused first.
+         * Originally fixed only for the audiobook screen's own Book/Chapter
+         * bars; reported live here on a podcast (BT connected, mid-
+         * audiobook-playback switch) as "looks like it reset to the start"
+         * for 10-20s before snapping to the real resumed position -- the
+         * exact symptom BG80 already describes, just never applied to this
+         * shared music/podcast block. audio_seek_pending_ms() is the
+         * target already asked for, still outstanding until the worker
+         * applies it; -1 once caught up or if nothing is pending. */
+        int pending = audio_seek_pending_ms();
+        int pos = pending >= 0 ? pending : audio_pos_ms();
+        int dur = audio_dur_ms();
         if (dur <= 0) dur = t->dur_ms;
         /* While scrubbing the bar and the clock follow the finger rather than
          * the decoder, so you can see where you are about to land. */
