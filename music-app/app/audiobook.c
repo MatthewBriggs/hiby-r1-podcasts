@@ -203,38 +203,87 @@ int ab_open_book(const char *dir, ab_book_data_t *bk) {
     return bk->chap_n;
 }
 
-/* Not named after the book (titles collide, need escaping) or a hash of it
- * (opaque, can't be eyeballed on the card) -- the folder is already the
- * unique, human-readable key, so the position just lives inside it. */
-#define AB_POS_NAME ".position"
+/* Used to be one ".position" file per book, living inside that book's own
+ * folder on the SD card -- named that way, not a hash of the folder, so it
+ * stayed human-readable/eyeball-able there. Moved to a single shared file
+ * on internal storage instead, one line per book, same shape and the same
+ * crash-safe write-then-rename pattern podcast.c's pod_resume_store()
+ * already uses for its own (single, shared) resume file -- mirrored
+ * deliberately rather than reinvented. A personal audiobook library is
+ * small enough that a plain linear scan costs nothing, and this device's
+ * own exFAT card is documented (index.c's own comment) to stall badly
+ * under concurrent access; keeping this tiny, frequently-written file off
+ * it entirely avoids that class of problem outright rather than depending
+ * on call order staying race-free forever (see BG-podresume for exactly
+ * that bug, found and fixed on the podcast side of this same file format).
+ * The old eyeball-ability the folder-local name gave up: this is now an
+ * internal cache like cover.c's own art cache, not something a user is
+ * expected to find and read on the card directly. */
+#define AB_RESUME_FILE "/usr/data/audiobook_resume.txt"
+#define AB_RESUME_KEEP 64
 
 void ab_save_position(const ab_book_data_t *bk, int file_idx, long file_ms) {
     if (!bk->dir[0] || file_idx < 0 || file_idx >= bk->file_n || file_ms < 0) return;
-    char path[AB_PATH_LEN + 16];
-    snprintf(path, sizeof(path), "%s/%s", bk->dir, AB_POS_NAME);
+
+    char (*keep)[AB_PATH_LEN + 32] = malloc(sizeof(*keep) * AB_RESUME_KEEP);
+    if (!keep) return;
+    int n = 0;
+    FILE *f = fopen(AB_RESUME_FILE, "r");
+    if (f) {
+        char line[AB_PATH_LEN + 32];
+        while (n < AB_RESUME_KEEP - 1 && fgets(line, sizeof(line), f)) {
+            char probe[AB_PATH_LEN + 32];
+            snprintf(probe, sizeof(probe), "%s", line);
+            char *nl = strchr(probe, '\n');
+            if (nl) *nl = '\0';
+            char *t1 = strchr(probe, '\t');
+            if (t1) {
+                char *t2 = strchr(t1 + 1, '\t');
+                if (t2 && strcmp(t2 + 1, bk->dir) == 0) continue;   /* replaced below */
+            }
+            snprintf(keep[n++], AB_PATH_LEN + 32, "%s", line);
+        }
+        fclose(f);
+    }
+
+    char tmp[sizeof(AB_RESUME_FILE) + 8];
+    snprintf(tmp, sizeof(tmp), "%s.new", AB_RESUME_FILE);
+    FILE *out = fopen(tmp, "w");
+    if (!out) { free(keep); return; }
+    int ok = 1;
+    for (int i = 0; i < n && ok; i++)
+        if (fputs(keep[i], out) < 0 || fputc('\n', out) < 0) ok = 0;
+    free(keep);
+    if (ok && fprintf(out, "%d\t%ld\t%s\n", file_idx, file_ms, bk->dir) < 0) ok = 0;
     /* A partial write on power loss must not resume into garbage: write to a
      * temp name and rename over the old one, which is atomic on the same
      * filesystem, rather than truncate-then-write the file being read. */
-    char tmp[AB_PATH_LEN + 24];
-    snprintf(tmp, sizeof(tmp), "%s.new", path);
-    FILE *f = fopen(tmp, "w");
-    if (!f) return;
-    int ok = fprintf(f, "%d %ld\n", file_idx, file_ms) > 0;
-    if (fclose(f) != 0) ok = 0;
-    if (ok) rename(tmp, path);
+    if (fclose(out) != 0) ok = 0;
+    if (ok) rename(tmp, AB_RESUME_FILE);
     else unlink(tmp);
 }
 
 int ab_load_position(const char *dir, int *file_idx, long *file_ms) {
-    char path[AB_PATH_LEN + 16];
-    snprintf(path, sizeof(path), "%s/%s", dir, AB_POS_NAME);
-    FILE *f = fopen(path, "r");
+    FILE *f = fopen(AB_RESUME_FILE, "r");
     if (!f) return -1;
-    int fi = -1; long ms = -1;
-    int got = fscanf(f, "%d %ld", &fi, &ms);
+    char line[AB_PATH_LEN + 32];
+    int found = -1;
+    while (fgets(line, sizeof(line), f)) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+        char *t1 = strchr(line, '\t');
+        if (!t1) continue;
+        char *t2 = strchr(t1 + 1, '\t');
+        if (!t2) continue;
+        if (strcmp(t2 + 1, dir) != 0) continue;
+        int fi = atoi(line);
+        long ms = atol(t1 + 1);
+        if (fi < 0 || ms < 0) continue;
+        *file_idx = fi;
+        *file_ms = ms;
+        found = 0;
+        break;
+    }
     fclose(f);
-    if (got != 2 || fi < 0 || ms < 0) return -1;
-    *file_idx = fi;
-    *file_ms = ms;
-    return 0;
+    return found;
 }

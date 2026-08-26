@@ -18,7 +18,18 @@
 
 #define PODCAST_DIR "/data/mnt/sd_0/Podcasts"
 #define RESUME_DIR  "/data/mnt/sd_0/.podsync"
-#define RESUME_FILE RESUME_DIR "/resume.txt"
+/* Internal storage (UBIFS), not RESUME_DIR on the SD card -- this is only
+ * ever a few KB (pod_resume_store() caps it at 127 entries), so the space
+ * cost is negligible, and reordering pod_play_episode() (resume lookup
+ * before audio_play(), not after) already fixed the actual bug this file
+ * being on the SD card exposed: a synchronous read racing the worker
+ * thread's own concurrent SD-card work. This is belt-and-suspenders on
+ * top of that fix, not a replacement for it -- moving the file sidesteps
+ * this specific contention entirely rather than depending on call-order
+ * staying correct forever, and reads/writes a few KB file without ever
+ * touching this exFAT card's own well-documented stall-under-load quirks
+ * (see index.c's own comment) at all. */
+#define RESUME_FILE "/usr/data/podcast_resume.txt"
 #define SYNC_SCRIPT RESUME_DIR "/podsync_once.sh"
 #define PODSYNC_CURL RESUME_DIR "/curl"
 #define PODSYNC_CA   RESUME_DIR "/cacert.pem"
@@ -89,7 +100,9 @@ int pod_resume_lookup(const char *path, int *dur_out) {
 }
 
 void pod_resume_store(const char *path, int ms, int dur) {
-    mkdir(RESUME_DIR, 0755);
+    /* No mkdir here -- RESUME_FILE lives directly under /usr/data, which
+     * always exists after boot, unlike its old home inside RESUME_DIR
+     * (the SD card's .podsync/, which podsync_once.sh itself creates). */
     char (*keep)[POD_PATH_LEN + 32] = malloc(sizeof(*keep) * 128);
     if (!keep) return;
     int n = 0;
