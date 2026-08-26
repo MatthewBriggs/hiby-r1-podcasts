@@ -2712,7 +2712,20 @@ static void pod_rebuild_tracks(void) {
 static void pod_save_current_pos(void) {
     if (!podcast_mode || !audio_is_active()) return;
     if (cur_track < 0 || cur_track >= queue_n) return;
-    int pos = audio_pos_ms(), dur = audio_dur_ms();
+    /* Reported live: reopening an episode came back near 0:00 instead of
+     * the real ~38-minute resume point. Root cause: this read audio_pos_ms()
+     * directly, same mistake the display code made (see BG80's extension
+     * above) -- if the user switches away again before this episode's own
+     * resume seek has actually landed (the same 10-20s worker-thread
+     * transition window that fix addresses), audio_pos_ms() is still
+     * sitting near 0, and saving it overwrites the real position with
+     * near-nothing. audio_seek_pending_ms() is the target already asked
+     * for, still outstanding until the worker catches up; preferring it
+     * here means a save mid-transition writes back the resume point that
+     * was already correct, not the decoder's not-there-yet position. */
+    int pending = audio_seek_pending_ms();
+    int pos = pending >= 0 ? pending : audio_pos_ms();
+    int dur = audio_dur_ms();
     /* BG48/BG49's root cause reaches here too: audio_dur_ms() is always 0
      * for MP3 (see pod_probe_dur()'s comment in podcast.c), so without this
      * fallback the dur>0 check below could never see a real duration and an
@@ -3410,7 +3423,15 @@ static void ab_save_current_pos(void) {
      * the book, and it silently came back at 0:00 -- this is why. */
     if (!audiobook_mode || !audio_is_active()) return;
     if (cur_track < 0 || cur_track >= ab_book.chap_n) return;
-    ab_save_position(&ab_book, ab_book.chap[cur_track].file, audio_pos_ms());
+    /* Same latent bug pod_save_current_pos() just got fixed for (see its
+     * own comment): audio_pos_ms() alone can't tell "really at the start"
+     * apart from "hasn't caught up to its own pending resume seek yet".
+     * Never actually observed here (this guard's own history above is a
+     * different stale-value bug), but the mechanism is identical, so
+     * fixed the same way rather than waiting to catch it by hand twice. */
+    int pending = audio_seek_pending_ms();
+    ab_save_position(&ab_book, ab_book.chap[cur_track].file,
+                     pending >= 0 ? pending : audio_pos_ms());
 }
 
 /* The chapter a saved (file, ms) position falls inside -- same shape as
