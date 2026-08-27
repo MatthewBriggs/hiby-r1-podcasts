@@ -62,6 +62,25 @@ static int has_rows(sqlite3 *db) {
     return n > 0;
 }
 
+/* BG-revolver follow-up: audio_probe_format() reaches dec_open(), and for
+ * an .m4a that primes the first access unit through the AAC/ALAC decoder
+ * into audio.c's single shared g_aacpcm buffer -- the same buffer the
+ * playback worker writes into for a track playing right now. audio.c's own
+ * audio_probe_dur_ms() documents that as "a real data race, not a
+ * hypothetical one, since this can run from the UI thread while a track is
+ * playing", and sniffs for ftyp to route M4A away from dec_open() entirely.
+ * These two call sites are on the UI thread (album open, single-track
+ * lookup), so they need the same care. The miss being repaired here is
+ * MP3-only by construction -- it came from mp3_probe() not seeing past a
+ * large ID3v2 tag -- so restricting the probe to .mp3 both fixes what it
+ * was meant to fix and keeps the decoder-priming path off the UI thread.
+ * Deliberately an extension test, not the database's own format column:
+ * the column is what a stale row might have got wrong in the first place. */
+static int is_mp3_path(const char *path) {
+    const char *dot = strrchr(path, '.');
+    return dot && strcasecmp(dot, ".mp3") == 0;
+}
+
 int lib_open(void) {
     if (g_db) return 0;
     /* nomutex: only the UI thread touches this handle. */
@@ -714,7 +733,7 @@ static int tracks_query(const char *artist, const char *album, int use_artist,
          * reason: cheap per file (a header parse, not a decode), so paying
          * it only for the rows that actually need it costs nothing for a
          * library that's already fine. */
-        if (t->bitrate <= 0) {
+        if (t->bitrate <= 0 && is_mp3_path(t->path)) {
             int pbits, prate, pbitrate, pdur;
             if (audio_probe_format(t->path, &pbits, &prate, &pbitrate, &pdur) == 0 && pbitrate > 0)
                 t->bitrate = pbitrate;
@@ -936,7 +955,7 @@ int lib_track_by_path(const char *real, lib_track_t *out) {
         if (out->dur_ms <= 0 && cached && idx_dur > 0) out->dur_ms = idx_dur;
         /* Same live-probe-on-miss fallback as the sibling query above --
          * see its own comment (BG-revolver). */
-        if (out->bitrate <= 0) {
+        if (out->bitrate <= 0 && is_mp3_path(out->path)) {
             int pbits, prate, pbitrate, pdur;
             if (audio_probe_format(out->path, &pbits, &prate, &pbitrate, &pdur) == 0 && pbitrate > 0)
                 out->bitrate = pbitrate;

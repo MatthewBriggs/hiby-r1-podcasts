@@ -44,6 +44,27 @@
 #include "wsola.h"
 #include "eq.h"
 
+/* Bound the log. Four writers (alog here, mlog in music_hook.c, ilog in index.c,
+ * slog in scanner.c) all append to this one file and nothing ever trimmed
+ * it: found at 2.76 MB during an audit, on the /usr/data partition that has
+ * ~23 MB free -- the tightest storage on the device. One generation is kept
+ * (music.log.1) so a crash still leaves recent history to read, which caps
+ * total use at roughly 2x LOG_MAX rather than unbounded. stat()ed once every
+ * 256 lines rather than per line: this runs on the UI thread, and the point
+ * is to catch runaway growth, not to enforce the byte exactly. Any of the
+ * four writers rolling the file is enough, since they all share the path. */
+#define LOG_MAX (1024 * 1024)
+static void log_roll_if_big(const char *path) {
+    static unsigned calls;
+    if ((calls++ & 0xFF) != 0) return;
+    struct stat st;
+    if (stat(path, &st) == 0 && st.st_size > LOG_MAX) {
+        char old[128];
+        snprintf(old, sizeof(old), "%s.1", path);
+        rename(path, old);
+    }
+}
+
 static void alog(const char *fmt, ...) {
     char b[200];
     va_list ap; va_start(ap, fmt);
@@ -63,6 +84,7 @@ static void alog(const char *fmt, ...) {
          * a reboot before anyone can read the log. mlog() was moved for this
          * same reason; alog() was missed at the time, which is why the BG12
          * incident left no audio diagnostics at all. */
+        log_roll_if_big("/usr/data/music.log");
         int fd = open("/usr/data/music.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
         if (fd >= 0) { write(fd, line, (size_t)(m < (int)sizeof(line) ? m : (int)sizeof(line))); close(fd); }
     }
@@ -920,6 +942,11 @@ int audio_using_usb(void) { return g_out_kind == 1; }
  * re-looked whenever it stops answering — a different headset since last
  * time would otherwise leave the volume keys apparently dead. */
 static char bt_mixer[64];
+/* Backoff state for find_bt_mixer(), reset whenever Bluetooth stops being
+ * the output so a different headset next time is probed promptly. See
+ * audio_bt_volume_service() for why this is needed at all. */
+static int    bt_mixer_misses;
+static time_t bt_mixer_next_try;
 
 static void find_bt_mixer(void) {
     bt_mixer[0] = '\0';
@@ -1054,7 +1081,7 @@ int audio_bt_volume_pending(void) {
  * --a2dp-volume directly), and because a step or set may have landed between
  * a notch, and g_vol should show what actually took, not the request. */
 void audio_bt_volume_service(void) {
-    if (!audio_using_bt()) return;
+    if (!audio_using_bt()) { bt_mixer_misses = 0; bt_mixer_next_try = 0; return; }
 
     int pending, abs_val;
     pthread_mutex_lock(&bt_vol_lock);
@@ -1062,7 +1089,33 @@ void audio_bt_volume_service(void) {
     bt_vol_pending = 0;
     pthread_mutex_unlock(&bt_vol_lock);
 
-    if (!bt_mixer[0]) find_bt_mixer();
+    /* Back off when there's nothing to find. find_bt_mixer() is a popen()
+     * of `amixer -D bluealsa scontrols` -- a fork+exec plus ALSA/D-Bus work
+     * -- and this service runs about every 5s for as long as Bluetooth is
+     * connected. A headset that simply doesn't do AVRCP absolute volume
+     * leaves bt_mixer empty permanently, so the "only runs when bt_mixer is
+     * empty" guard the original relied on to prevent spam never fires: it
+     * prevents re-probing after *success*, not after persistent failure.
+     * Confirmed live -- music.log carried this probe and its "no AVRCP
+     * mixer control found" line every 5.1s, indefinitely, competing with
+     * decode and (downstream, on the same single core) bluealsa's own
+     * encoder. Retry quickly a few times, since a mixer can appear a moment
+     * after connect, then settle to once a minute. The backoff state
+     * resets whenever Bluetooth isn't the output, so a different headset
+     * still gets probed promptly -- which is the case the original comment
+     * about re-looking actually cared about. */
+    if (!bt_mixer[0]) {
+        time_t now = time(NULL);
+        if (now >= bt_mixer_next_try) {
+            find_bt_mixer();
+            if (!bt_mixer[0]) {
+                if (bt_mixer_misses < 1000) bt_mixer_misses++;
+                bt_mixer_next_try = now + (bt_mixer_misses < 3 ? 5 : 60);
+            } else {
+                bt_mixer_misses = 0; bt_mixer_next_try = 0;
+            }
+        }
+    }
     if (!bt_mixer[0]) return;
 
     if (pending) {
@@ -1770,8 +1823,24 @@ static void *worker(void *arg) {
          * the destination is a lossy Bluetooth codec throwing away far more
          * than that regardless, and acoustic recordings carry little real
          * energy above 24 kHz to alias from in the first place. */
-        if (got > 0 && eff_rate != rate) {
-            unsigned decim = rate / eff_rate;
+        /* `eff_rate < rate` specifically, not merely `!=`: this is plain
+         * integer decimation, so it only means anything when the negotiated
+         * rate divides the source rate. bt_target_rate() is built to hand
+         * pcm_open() an exact 2x/4x divisor, but it only maps 88.2/176.4 and
+         * 96/192 -- every other rate passes through untouched, and pcm_open()
+         * skips its own `r != rate` sanity check on the Bluetooth path
+         * (see the `!use_bt` in that test), so snd_pcm_hw_params_set_rate_near
+         * is free to round *up*. A 44.1 kHz source on a link that negotiates
+         * 48 kHz lands here with eff_rate > rate, `rate / eff_rate` is 0, and
+         * `got / decim` divides by zero -- SIGFPE, process gone, no log.
+         * Guarding the ratio instead of just reordering the test: a
+         * non-integer ratio (say 48k negotiated against a 44.1k source)
+         * can't be box-car decimated correctly either, and silently
+         * mangling it would be worse than leaving the sample rate alone and
+         * letting the layer below resample. */
+        unsigned decim = (eff_rate > 0 && eff_rate < rate && rate % eff_rate == 0)
+                       ? rate / eff_rate : 1;
+        if (got > 0 && decim > 1) {
             uint64_t got_d = got / decim;
             if (src_wide) {
                 for (uint64_t f = 0; f < got_d; f++)

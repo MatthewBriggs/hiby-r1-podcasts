@@ -347,6 +347,27 @@ static uint32_t orig_cb;
 static volatile const char *g_phase = "idle";
 static volatile unsigned    g_tick;
 
+/* Bound the log. Four writers (mlog here, alog in audio.c, ilog in index.c,
+ * slog in scanner.c) all append to this one file and nothing ever trimmed
+ * it: found at 2.76 MB during an audit, on the /usr/data partition that has
+ * ~23 MB free -- the tightest storage on the device. One generation is kept
+ * (music.log.1) so a crash still leaves recent history to read, which caps
+ * total use at roughly 2x LOG_MAX rather than unbounded. stat()ed once every
+ * 256 lines rather than per line: this runs on the UI thread, and the point
+ * is to catch runaway growth, not to enforce the byte exactly. Any of the
+ * four writers rolling the file is enough, since they all share the path. */
+#define LOG_MAX (1024 * 1024)
+static void log_roll_if_big(const char *path) {
+    static unsigned calls;
+    if ((calls++ & 0xFF) != 0) return;
+    struct stat st;
+    if (stat(path, &st) == 0 && st.st_size > LOG_MAX) {
+        char old[128];
+        snprintf(old, sizeof(old), "%s.1", path);
+        rename(path, old);
+    }
+}
+
 static void mlog(const char *fmt, ...) {
     char b[256];
     va_list ap; va_start(ap, fmt);
@@ -362,6 +383,7 @@ static void mlog(const char *fmt, ...) {
                      (long)ts.tv_sec, ts.tv_nsec / 1000000L, b);
     if (m <= 0) return;
     if (m > (int)sizeof(line)) m = (int)sizeof(line);
+    log_roll_if_big(LOG_PATH);
     int fd = open(LOG_PATH, O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (fd >= 0) { write(fd, line, (size_t)m); close(fd); }
 }

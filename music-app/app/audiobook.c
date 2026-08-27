@@ -251,8 +251,16 @@ void ab_save_position(const ab_book_data_t *bk, int file_idx, long file_ms) {
     FILE *out = fopen(tmp, "w");
     if (!out) { free(keep); return; }
     int ok = 1;
+    /* fputs alone, no fputc('\n') -- fgets above keeps the trailing newline
+     * on every line it reads, so keep[i] already ends in one. Adding a
+     * second wrote a blank line after every retained entry, and since a
+     * blank line is itself read back and retained on the next save (it has
+     * no tab, so the skip-this-book test never fires on it), the blanks
+     * doubled on every autosave until they filled the AB_RESUME_KEEP budget
+     * and started evicting real books. pod_resume_store() -- which this was
+     * copied from -- gets this right; the extra fputc was mine. */
     for (int i = 0; i < n && ok; i++)
-        if (fputs(keep[i], out) < 0 || fputc('\n', out) < 0) ok = 0;
+        if (fputs(keep[i], out) < 0) ok = 0;
     free(keep);
     if (ok && fprintf(out, "%d\t%ld\t%s\n", file_idx, file_ms, bk->dir) < 0) ok = 0;
     /* A partial write on power loss must not resume into garbage: write to a
