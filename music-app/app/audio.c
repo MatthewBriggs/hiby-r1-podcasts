@@ -1091,6 +1091,16 @@ static char bt_mixer[64];
  * audio_bt_volume_service() for why this is needed at all. */
 static int    bt_mixer_misses;
 static time_t bt_mixer_next_try;
+/* BG93: a single failed bt_read_pct() used to clear bt_mixer immediately,
+ * indistinguishable from the headset actually being gone -- and once
+ * bt_mixer_misses/next_try above existed, that meant one transient amixer
+ * hiccup (a momentary D-Bus timeout, a race with a write that just landed)
+ * could throw volume control into the same up-to-60s backoff a real
+ * disconnect gets, reading as "stopped working" for however long that
+ * lasted. Counted instead of acted on immediately -- see its use below. */
+static int    bt_read_fail_count;
+#define BT_READ_FAIL_LIMIT 2   /* consecutive failures before treating the
+                                 * mixer as actually gone, not just a blip */
 
 static void find_bt_mixer(void) {
     bt_mixer[0] = '\0';
@@ -1225,7 +1235,10 @@ int audio_bt_volume_pending(void) {
  * --a2dp-volume directly), and because a step or set may have landed between
  * a notch, and g_vol should show what actually took, not the request. */
 void audio_bt_volume_service(void) {
-    if (!audio_using_bt()) { bt_mixer_misses = 0; bt_mixer_next_try = 0; return; }
+    if (!audio_using_bt()) {
+        bt_mixer_misses = 0; bt_mixer_next_try = 0; bt_read_fail_count = 0;
+        return;
+    }
 
     int pending, abs_val;
     pthread_mutex_lock(&bt_vol_lock);
@@ -1257,6 +1270,7 @@ void audio_bt_volume_service(void) {
                 bt_mixer_next_try = now + (bt_mixer_misses < 3 ? 5 : 60);
             } else {
                 bt_mixer_misses = 0; bt_mixer_next_try = 0;
+                bt_read_fail_count = 0;
             }
         }
     }
@@ -1274,7 +1288,17 @@ void audio_bt_volume_service(void) {
     }
 
     int pct = bt_read_pct();
-    if (pct < 0) { bt_mixer[0] = '\0'; return; }   /* gone: re-look next time */
+    if (pct < 0) {
+        /* BG93: one failed read no longer means "gone" -- only
+         * BT_READ_FAIL_LIMIT in a row does, so a lone transient hiccup
+         * costs nothing beyond skipping this poll's g_vol readback. */
+        if (++bt_read_fail_count >= BT_READ_FAIL_LIMIT) {
+            bt_mixer[0] = '\0';
+            bt_read_fail_count = 0;
+        }
+        return;
+    }
+    bt_read_fail_count = 0;
     pthread_mutex_lock(&g_lock);
     g_vol = pct;
     pthread_mutex_unlock(&g_lock);
@@ -1301,14 +1325,21 @@ static void *pcm_open(unsigned rate, int channels, int deep, int want_fmt) {
     void *pcm = NULL;
     char exact[24], plug[24];
 
-    /* Priority: whatever is plugged into the jack wins, then USB, then
-     * Bluetooth. Bluetooth used to win simply by being connected, which meant
-     * plugging headphones in did nothing while a headset was paired in the
-     * next room. */
-    int jack   = st_headset();
-    int ucard  = jack ? -1 : usb_card();
-    int use_bt = (!jack && ucard <= 0) ? bt_sink_connected() : 0;
-    g_out_kind = use_bt ? 2 : (ucard > 0 ? 1 : 0);
+    /* BG90: priority is USB > Bluetooth > 3.5mm jack -- an external DAC/amp
+     * on USB takes precedence over everything, Bluetooth next, the built-in
+     * jack (or speaker, if nothing's plugged into it) last as the always-
+     * available fallback. Previously the jack outranked both, on the
+     * reasoning that a paired headset in the next room shouldn't win over
+     * headphones physically plugged in just now -- true as far as it went,
+     * but it also meant Bluetooth headphones put on right now lost to a jack
+     * nothing was using, which is backwards from what a user reaching for
+     * Bluetooth actually wants. No jack check gates USB/Bluetooth anymore;
+     * the jack no longer needs asking about at all here, since it never
+     * outranks either and it's still exactly what "wired" (kind 0) plays out
+     * of whenever neither of the other two applies. */
+    int ucard  = usb_card();
+    int use_bt = (ucard <= 0) ? bt_sink_connected() : 0;
+    g_out_kind = ucard > 0 ? 1 : (use_bt ? 2 : 0);
     g_out_card = ucard;
     if (use_bt) rate = bt_target_rate(rate);   /* BG41 -- see bt_target_rate() */
 
@@ -1407,6 +1438,12 @@ static void *pcm_open(unsigned rate, int channels, int deep, int want_fmt) {
  * pause to say something, does not audibly cycle the DAC; short enough that a
  * device put down and forgotten stops drawing through the amp. */
 #define PCM_IDLE_CLOSE_TICKS 83
+/* BG90: bt_sink_connected() forks a `bluealsa-cli` subprocess, unlike the
+ * plain readlink usb_card() does -- checked once every this-many passes of
+ * the ~1s-cadence poll below, not every pass, so putting Bluetooth
+ * headphones on mid-playback still switches over within a few seconds
+ * without that cost every second. */
+#define BT_POLL_EVERY 5
 
 static int    g_seek_to_ms = -1;   /* set by audio_seek_ms, consumed by the worker */
 
@@ -1717,6 +1754,7 @@ static void *worker(void *arg) {
     size_t frame_bytes = hires ? (size_t)ch * 4 : (size_t)ch * sizeof(short);
     uint64_t done = 0;
     int poll_tick = 0, resume_tick = 0, idle_close_tick = 0;
+    int bt_poll_tick = 0;
     /* Self-measurement, because "decode is close to realtime" was an
      * assumption and the stock player disproves it: it plays the same
      * 192/24 files over USB without drain, so decode and USB output are
@@ -1885,19 +1923,29 @@ static void *worker(void *arg) {
         }
 
         /* Plugging the amp in halfway through an album should not mean waiting
-         * for the next track. Only the USB check is cheap enough to poll — it
-         * is a readlink — so Bluetooth is still picked up at track start.
-         *
-         * Counted in chunks-per-second rather than a flat chunk count: a chunk
-         * is CHUNK_FRAMES regardless of rate, so a flat count polled a 96 kHz
-         * file 2.2x as often as a 44.1 kHz one (and 192 kHz 4.4x) — most often
-         * exactly where there is least CPU to spare, since usb_card() is up to
-         * nine readlink plus nine access syscalls each time. Once a second at
-         * any rate is as responsive and costs a fixed amount. */
+         * for the next track. Only the USB check ran here at all before BG90 --
+         * it's a readlink, cheap enough for once a second -- while Bluetooth
+         * connecting mid-playback waited for the next track regardless, since
+         * bt_sink_connected() forks a whole `bluealsa-cli` subprocess and
+         * doing that every second from this thread would be a real, ongoing
+         * cost competing with decode for the one core. bt_poll_tick instead
+         * checks it only once every BT_POLL_EVERY passes of this block (~5s at
+         * that cadence) -- still switches over within a few seconds of putting
+         * headphones on rather than needing a manual nudge, at a fraction of
+         * the subprocess-spawn cost polling every second would have. Skipped
+         * entirely once already on Bluetooth or USB (BG90's own priority --
+         * USB > Bluetooth > jack -- means Bluetooth connecting can never
+         * preempt either, so there's nothing for this check to do then). */
         if (++poll_tick >= (int)(rate / CHUNK_FRAMES) + 1) {
             poll_tick = 0;
             int now = usb_card();
-            if (g_out_kind != 2 && now != g_out_card) {
+            int bt_now = 0;
+            if (g_out_kind == 0 && ++bt_poll_tick >= BT_POLL_EVERY) {
+                bt_poll_tick = 0;
+                bt_now = bt_sink_connected();
+            }
+            if ((g_out_kind != 2 && now != g_out_card) ||
+                (g_out_kind == 0 && bt_now)) {
                 alog("[audio] output changed, reopening\n");
                 x_drop(pcm); x_close(pcm);
                 pcm = pcm_open(rate, ch, d->is_stream, want_fmt);

@@ -6646,6 +6646,19 @@ static void load_conf(void) {
         } else if (sscanf(line, "brightness = %d", &v) == 1 ||
                    sscanf(line, "brightness=%d", &v) == 1) {
             if (v > 0) brightness_saved = v;
+        } else if (sscanf(line, "ab_speed_permille = %d", &v) == 1 ||
+                   sscanf(line, "ab_speed_permille=%d", &v) == 1) {
+            /* BG91: reported as "audiobook speed doesn't survive reboots,
+             * podcasts handle this correctly" -- direct inspection found
+             * pod_speed_permille has never actually been saved anywhere
+             * either; it only *looks* persistent because it's a plain
+             * static that outlives a track change within one running
+             * session, same as ab_speed_permille already does. Both get the
+             * real fix here, not just the one named in the report. */
+            if (v >= 800 && v <= 2000) ab_speed_permille = v;
+        } else if (sscanf(line, "pod_speed_permille = %d", &v) == 1 ||
+                   sscanf(line, "pod_speed_permille=%d", &v) == 1) {
+            if (v >= 800 && v <= 2000) pod_speed_permille = v;
         }
     }
     fclose(f);
@@ -6722,7 +6735,9 @@ static void save_conf(void) {
                 !conf_line_is(lines[n], "eq_profile_path") &&
                 !conf_line_is(lines[n], "wifi_enabled") &&
                 !conf_line_is(lines[n], "bt_enabled") &&
-                !conf_line_is(lines[n], "brightness"))
+                !conf_line_is(lines[n], "brightness") &&
+                !conf_line_is(lines[n], "ab_speed_permille") &&
+                !conf_line_is(lines[n], "pod_speed_permille"))
                 n++;
         }
         fclose(f);
@@ -6751,6 +6766,8 @@ static void save_conf(void) {
     fprintf(f, "wifi_enabled = %d\n", wifi_pref);
     fprintf(f, "bt_enabled = %d\n", bt_pref);
     if (saved_brightness > 0) fprintf(f, "brightness = %d\n", saved_brightness);
+    fprintf(f, "ab_speed_permille = %d\n", ab_speed_permille);   /* BG91 */
+    fprintf(f, "pod_speed_permille = %d\n", pod_speed_permille); /* BG91 */
     fclose(f);
 }
 
@@ -7676,6 +7693,7 @@ int music_entry(void *a0, void *a1) {
                             ab_speed_permille += 100;
                             if (ab_speed_permille > 2000) ab_speed_permille = 1000;
                             audio_set_speed(ab_speed_permille);
+                            save_conf();          /* BG91 */
                         } else if (x < FB_W / 3) {
                             audio_seek_ms(audio_pos_ms() - 10000);
                         } else if (x > 2 * FB_W / 3) {
@@ -7744,6 +7762,7 @@ int music_entry(void *a0, void *a1) {
                             pod_speed_permille += 100;
                             if (pod_speed_permille > 2000) pod_speed_permille = 1000;
                             audio_set_speed(pod_speed_permille);
+                            save_conf();          /* BG91 */
                         } else if (x < (x10 + mid) / 2) {
                             audio_seek_ms(audio_pos_ms() - 10000);
                         } else if (x < (mid + xp30) / 2) {
@@ -8870,8 +8889,12 @@ int music_entry(void *a0, void *a1) {
          * tap at the final position and is handled with the other taps. */
         {
             int was = scrub_active;
+            /* BG92: missing !qs_open let a touch in the progress-bar's y-range
+             * start a scrub even with the quick-settings panel open over top
+             * of it -- every other gesture check here (edge-swipe-back,
+             * title long-press) already guards on this, this one just didn't. */
             scrub_active = touch_down && screen == SC_PLAYING && !radio_mode &&
-                           queue_n > 0 &&
+                           !qs_open && queue_n > 0 &&
                            touch_y > bar_y() - 26 && touch_y < bar_y() + 26;
             if (scrub_active || was) { dirty = 1; idle = 0; }
         }
