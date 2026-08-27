@@ -240,8 +240,18 @@ void st_bt_name(char *out, unsigned n) {
  * there is no PIN prompt anywhere in this app to satisfy one with, and
  * building one is future work, not silently pretended to exist now. */
 void bt_scan_start(void) {
-    if (system("printf 'agent NoInputNoOutput\\ndefault-agent\\nscan on\\n' | "
-               "timeout 8 bluetoothctl >/dev/null 2>&1 &") == -1) return;
+    /* Same missing-`timeout`-applet bug as bt_pair() -- see its own comment.
+     * Different fix here, though: bt_pair()'s session is meant to end the
+     * instant its few commands are sent (stdin hitting EOF once printf is
+     * done writing does that on its own), but this one needs "scan on" to
+     * keep running for a real 8 seconds before ending, which EOF alone
+     * would cut short immediately. `sleep 8` (present -- unlike timeout,
+     * not something this device's busybox lacks) between "scan on" and
+     * "quit" keeps the pipe's write end open for that whole window instead,
+     * holding bluetoothctl's own stdin off EOF (and its scan running) for
+     * as long as timeout 8 was meant to. */
+    if (system("(printf 'agent NoInputNoOutput\\ndefault-agent\\nscan on\\n'; "
+               "sleep 8; printf 'quit\\n') | bluetoothctl >/dev/null 2>&1 &") == -1) return;
 }
 
 /* Every device bluetoothd currently knows about -- already-paired and
@@ -277,12 +287,31 @@ int bt_scan_devices(bt_found_dev_t *out, int max) {
  * Backgrounded: pairing a real device takes a few seconds of radio
  * handshake, which would otherwise freeze the UI thread for that whole
  * time -- same reasoning st_wifi_set() already gives for its own
- * backgrounded restart. */
+ * backgrounded restart.
+ *
+ * Reported live and confirmed directly: this device's busybox has no
+ * `timeout` applet at all ("applet not found"), and there's no standalone
+ * /bin/timeout or /usr/bin/timeout either -- so the old `timeout 15
+ * bluetoothctl ...` command never ran bluetoothctl at all, it failed at
+ * the shell with "timeout: not found" before bluetoothctl was even
+ * invoked. Silent, since this is backgrounded and its own output is
+ * thrown away -- tapping a device in the UI looked like it did nothing,
+ * because nothing is exactly what ran. `trust` never landing is also the
+ * likely reason auto-reconnect never worked either: `bluetoothctl info`
+ * on a device paired through this path confirmed "Paired: yes, Trusted:
+ * no" -- BlueZ generally won't auto-accept a reconnection from a device
+ * it doesn't trust without prompting, which nothing here is set up to
+ * answer. Dropped the timeout wrapper entirely rather than hunt for a
+ * substitute: bluetoothctl's own piped stdin hits EOF once printf's
+ * output is exhausted (confirmed live -- st_bt_name()'s simpler "info"/
+ * "quit" pipe already relies on exactly this and works), which is what
+ * actually ends the session; explicit "quit" added for clarity, but the
+ * EOF is what was really doing the job all along. */
 void bt_pair(const char *mac) {
     char cmd[256];
     snprintf(cmd, sizeof(cmd),
-        "printf 'agent NoInputNoOutput\\ndefault-agent\\npair %s\\ntrust %s\\nconnect %s\\n' | "
-        "timeout 15 bluetoothctl >/dev/null 2>&1 &",
+        "printf 'agent NoInputNoOutput\\ndefault-agent\\npair %s\\ntrust %s\\nconnect %s\\nquit\\n' | "
+        "bluetoothctl >/dev/null 2>&1 &",
         mac, mac, mac);
     if (system(cmd) == -1) return;
 }
