@@ -116,15 +116,6 @@ typedef struct {
     dec_kind_t kind;
     drflac    *flac;
     drmp3      mp3;
-    FILE      *mp3_approx_file;   /* set only after mp3_seek_approx() re-inits
-                                    * d->mp3 on a manually fseek'd FILE* of its
-                                    * own -- drmp3_uninit() only auto-closes the
-                                    * FILE* it opened itself (checked by
-                                    * comparing onRead against its own internal
-                                    * stdio callback), so this one needs its
-                                    * own fclose() in dec_close(). NULL the rest
-                                    * of the time, when d->mp3 owns its FILE*
-                                    * the normal way via drmp3_init_file(). */
     drwav      wav;
     int        channels;
     unsigned   rate;
@@ -624,41 +615,46 @@ static int mp3_probe(const char *path, int *rate_out, int *bitrate_bps_out);
  * audio_stop()'s pthread_join() froze the whole UI thread for the same
  * span, since nothing inside that single blocking call checks g_running.
  *
- * This sidesteps both by seeking approximately instead of exactly, the same
- * technique every mainstream MP3 player uses for an unindexed seek: scale
- * the target time by the file's average byte rate to land close in the
- * file, then let a fresh decoder resync from there. mp3_probe() already
- * reads the bitrate from the first real frame header for exactly this kind
- * of "close enough" estimate elsewhere in this file; for CBR (the common
- * case for a fixed-quality podcast export) it's exact, and for VBR it's
- * still within a fraction of a second per hour of drift, nowhere near
- * enough to be audible against spoken content. Landing a few frames short
- * or long of the mathematical target is an accepted, universal trade-off of
- * this technique -- not a bug -- because the alternative is the multi-minute
- * stall above.
+ * First attempt at fixing this re-initialized d->mp3 on a manually fseek'd
+ * FILE* via a custom drmp3_init() call, expecting decode to just resume from
+ * wherever the file pointer already was. Reported live: the resume position
+ * showed correctly (this app's own g_pos_ms is set from the *target*, not
+ * from anything dr_mp3 reports), but the audio itself started from the
+ * beginning every time. Root cause, found reading drmp3_init_internal()
+ * itself: it unconditionally seeks to the end, then back to byte 0, to hunt
+ * for ID3v1/APE/ID3v2 tags before it ever looks at real frame data --
+ * completely undoing the pre-seek regardless of where the FILE* was
+ * positioned on entry. drmp3_init() is simply not designed to resume
+ * mid-stream; nothing publicly exposed makes it skip that dance.
  *
- * Only used when no table is bound yet -- once mp3_seektable_kickoff()'s
- * background build finishes, later seeks go through the exact table lookup
- * as before, unaffected. */
-static drmp3_bool32 mp3_approx_read(void *ud, void *out, size_t n) {
-    return fread(out, 1, n, (FILE *)ud);
-}
-static drmp3_bool32 mp3_approx_seek(void *ud, int offset, drmp3_seek_origin origin) {
-    int whence = (origin == DRMP3_SEEK_CUR) ? SEEK_CUR
-               : (origin == DRMP3_SEEK_END) ? SEEK_END : SEEK_SET;
-    return fseek((FILE *)ud, offset, whence) == 0;
-}
-static drmp3_bool32 mp3_approx_tell(void *ud, drmp3_int64 *out) {
-    long p = ftell((FILE *)ud);
-    if (p < 0) return DRMP3_FALSE;
-    *out = p;
-    return DRMP3_TRUE;
-}
-
-/* Returns 1 if it replaced d->mp3 with an approximately-seeked decoder, 0 if
- * it left d untouched (caller falls back to the exact brute-force seek). */
-static int mp3_seek_approx(dec_t *d, const char *path, uint64_t targetFrame) {
-    if (d->mp3.pSeekPoints != NULL && d->mp3.seekPointCount > 0) return 0;   /* table already bound: exact path stays fast */
+ * This instead reuses the seek-*table* mechanism dr_mp3 already has, which
+ * bypasses drmp3_init() entirely: drmp3_seek_to_pcm_frame__seek_table()
+ * raw-seeks the byte position from a bound drmp3_seek_point via the same
+ * onSeek callback d->mp3 was opened with, drops any buffered read-ahead
+ * (drmp3_reset()), discards a couple of leading MP3 frames to let the bit
+ * reservoir settle, and is done -- no tag scan, no reset to the start.
+ * Building a single synthetic point -- byte offset estimated from the
+ * file's average byte rate, claimed PCM frame index equal to the seek
+ * target itself -- makes the table-seek land in one step with nothing left
+ * over to brute-force: drmp3_seek_to_pcm_frame__seek_table() computes
+ * `leftoverFrames = frameIndex - currentPCMFrame`, and since currentPCMFrame
+ * is set straight from this point's own claimed index, that difference is
+ * zero. mp3_probe() already reads bitrate from the first real frame header
+ * elsewhere in this file for exactly this kind of "close enough" estimate;
+ * for CBR (the common case for a fixed-quality podcast export) it's exact,
+ * and for VBR it's still within a fraction of a second per hour of drift --
+ * nowhere near enough to be audible against spoken content. Landing a few
+ * frames short or long of the mathematical target is an accepted, universal
+ * trade-off of this technique, not a bug, because the alternative is the
+ * multi-minute stall above.
+ *
+ * Only refreshed while seekPointCount <= 1 (nothing bound yet, or still just
+ * a previous approximation of ours) -- once mp3_seektable_kickoff()'s
+ * background build finishes and binds its real, many-point table, this
+ * leaves it alone and every seek after that is both fast and exact. */
+static int mp3_seek_approx(dec_t *d, const char *path, uint64_t targetFrame,
+                            drmp3_seek_point **bound_points) {
+    if (d->mp3.seekPointCount > 1) return 0;   /* a real table is already bound */
     if (!d->rate) return 0;
     struct stat st;
     if (stat(path, &st) != 0 || st.st_size <= 0) return 0;
@@ -674,23 +670,31 @@ static int mp3_seek_approx(dec_t *d, const char *path, uint64_t targetFrame) {
     int64_t data_start = (int64_t)d->mp3.streamStartOffset;
     int64_t byte_off = data_start + (int64_t)(target_ms / 1000.0 * ((double)bitrate_bps / 8.0));
     if (byte_off < data_start) byte_off = data_start;
-    if (byte_off > st.st_size - 4096) byte_off = st.st_size > 4096 ? st.st_size - 4096 : 0;
-    FILE *f = fopen(path, "rb");
-    if (!f) return 0;
-    if (fseek(f, (long)byte_off, SEEK_SET) != 0) { fclose(f); return 0; }
-    drmp3 nd;
-    if (!drmp3_init(&nd, mp3_approx_read, mp3_approx_seek, mp3_approx_tell, NULL, f, NULL)) {
-        fclose(f);
-        return 0;
-    }
-    drmp3_uninit(&d->mp3);
-    if (d->mp3_approx_file) fclose(d->mp3_approx_file);
-    d->mp3 = nd;
-    d->mp3_approx_file = f;
+    if (byte_off > st.st_size - 4096) byte_off = st.st_size > 4096 ? st.st_size - 4096 : data_start;
+
+    drmp3_seek_point *pt = malloc(sizeof(*pt));
+    if (!pt) return 0;
+    pt->seekPosInBytes = (drmp3_uint64)byte_off;
+    pt->pcmFrameIndex = targetFrame;
+    pt->mp3FramesToDiscard = 2;   /* DRMP3_SEEK_LEADING_MP3_FRAMES -- same margin
+                                    * dr_mp3's own real seek points always carry,
+                                    * to let the bit reservoir settle after
+                                    * landing somewhere arbitrary */
+    pt->pcmFramesToDiscard = 0;
+    if (!drmp3_bind_seek_table(&d->mp3, 1, pt)) { free(pt); return 0; }
+    /* drmp3_bind_seek_table() never frees the previous table itself (its own
+     * doc: "Memory is owned by the client") -- this is the same ownership
+     * worker() already tracks via bound_points for the background-built
+     * table, reused here so whichever last replaced it is the one that gets
+     * freed, by whichever call (this one, the real bind, or worker()'s own
+     * final cleanup) replaces or releases it next. */
+    free(*bound_points);
+    *bound_points = pt;
     return 1;
 }
 
-static void dec_seek(dec_t *d, uint64_t frame, const char *path) {
+static void dec_seek(dec_t *d, uint64_t frame, const char *path,
+                      drmp3_seek_point **bound_points) {
     if (d->kind == DEC_M4A) {
         /* Access units are a fixed number of frames, so the index is just a
          * division; seeking is to the start of the unit containing it. */
@@ -704,8 +708,11 @@ static void dec_seek(dec_t *d, uint64_t frame, const char *path) {
         case DEC_OPUS:   opus_dec_seek(&d->opus, frame);     break;
         case DEC_FLAC: drflac_seek_to_pcm_frame(d->flac, frame); break;
         case DEC_MP3:
-            if (!mp3_seek_approx(d, path, frame))
-                drmp3_seek_to_pcm_frame(&d->mp3, frame);
+            /* Binds an approximate table when nothing better is bound yet;
+             * a no-op once the real background-built one is. Either way,
+             * the actual seek is always this same one call. */
+            mp3_seek_approx(d, path, frame, bound_points);
+            drmp3_seek_to_pcm_frame(&d->mp3, frame);
             break;
         case DEC_WAV:  drwav_seek_to_pcm_frame(&d->wav, frame);  break;
         default: break;
@@ -732,13 +739,7 @@ static void dec_close(dec_t *d) {
     }
     switch (d->kind) {
         case DEC_FLAC:   drflac_close(d->flac); break;
-        case DEC_MP3:
-            drmp3_uninit(&d->mp3);
-            /* drmp3_uninit() only closes the FILE* itself when d->mp3 still
-             * owns it via the internal stdio callback -- mp3_seek_approx()'s
-             * custom callbacks mean it never recognizes this one as its own. */
-            if (d->mp3_approx_file) { fclose(d->mp3_approx_file); d->mp3_approx_file = NULL; }
-            break;
+        case DEC_MP3:    drmp3_uninit(&d->mp3); break;
         case DEC_WAV:    drwav_uninit(&d->wav); break;
         case DEC_VORBIS: vorbis_dec_close(&d->vorbis); break;
         case DEC_OPUS:   opus_dec_close(&d->opus); break;
@@ -1795,7 +1796,7 @@ static void *worker(void *arg) {
 
         if (seek >= 0) {
             uint64_t f = (uint64_t)seek * rate / 1000;
-            dec_seek(d, f, g_path);
+            dec_seek(d, f, g_path, &bound_points);
             done = f;
             pthread_mutex_lock(&g_lock);
             g_pos_ms = seek;                  /* move the clock even while paused */

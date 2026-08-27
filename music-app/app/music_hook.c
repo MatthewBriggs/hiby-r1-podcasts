@@ -6539,6 +6539,23 @@ static void draw_ui(uint16_t *fb) {
 #define IDLE_DEFAULT_S 0
 static int idle_ticks = IDLE_DEFAULT_S * 30;    /* loop runs at ~30/s while awake */
 
+/* R64: moved up from its previous spot just after save_conf() -- load_conf()
+ * needs to set this directly (the loaded brightness is the same "user's last
+ * chosen level" this already tracks for the lock/unlock restore, see BG78),
+ * and C won't let it reference a static declared later in the file. */
+static int saved_brightness = -1;
+
+/* R64: the *intended* radio state, updated at the same moment st_wifi_set()/
+ * st_bt_set() are, not re-derived from st_wifi_on()/st_bt_on() at save time.
+ * Both scripts background themselves and take real seconds (wifi_on.sh waits
+ * on DHCP) -- a save_conf() running right after firing one would almost
+ * always read the *pre-toggle* live state back, persisting the opposite of
+ * what was just asked for. Seeded from live state once at startup (see
+ * load_conf()) so an unrelated save_conf() call, before either radio has
+ * ever been toggled this session, still writes something meaningful instead
+ * of a sentinel. */
+static int wifi_pref = 1, bt_pref = 1;
+
 static void load_conf(void) {
     FILE *f = fopen(CONF_PATH, "r");
     if (!f) return;
@@ -6551,6 +6568,10 @@ static void load_conf(void) {
      * at its compiled-in default rather than forced off. */
     char eq_path_buf[EP_PATH_LEN] = "";
     int eq_on_saved = -1;
+    /* R64: -1 means not present in the file (a config from before this
+     * existed, or a fresh /usr/data) -- left alone rather than forced off,
+     * same reasoning as eq_on_saved just above. */
+    int wifi_saved = -1, bt_saved = -1, brightness_saved = -1;
     while (fgets(line, sizeof(line), f)) {
         int v;
         if (sscanf(line, "idle_lock_seconds = %d", &v) == 1 ||
@@ -6616,6 +6637,15 @@ static void load_conf(void) {
                    sscanf(line, "eq_profile_path=%383[^\r\n]", eq_path_buf) == 1) {
             /* Paths can carry spaces (SD-card folder names do), hence %[^\r\n]
              * rather than %s, which would stop at the first one. */
+        } else if (sscanf(line, "wifi_enabled = %d", &v) == 1 ||
+                   sscanf(line, "wifi_enabled=%d", &v) == 1) {
+            wifi_saved = v != 0;
+        } else if (sscanf(line, "bt_enabled = %d", &v) == 1 ||
+                   sscanf(line, "bt_enabled=%d", &v) == 1) {
+            bt_saved = v != 0;
+        } else if (sscanf(line, "brightness = %d", &v) == 1 ||
+                   sscanf(line, "brightness=%d", &v) == 1) {
+            if (v > 0) brightness_saved = v;
         }
     }
     fclose(f);
@@ -6632,6 +6662,28 @@ static void load_conf(void) {
     eq_set_mseb(mseb_on, mseb_gain);
     recent_heard_load();   /* R30 -- its own file, not a music.conf key either */
     apply_theme();         /* R41/R43: theme_mode just loaded above, if present */
+    /* R64: restore whichever of these differs from whatever this boot's own
+     * init scripts already left the radios in -- st_wifi_set()/st_bt_set()
+     * both background a real shell command, so skipping the call when the
+     * live state already matches avoids spawning one for nothing on every
+     * single app start. wifi_pref/bt_pref then track the *intended* state
+     * from here on (see their own comment) -- seeded from whatever's actually
+     * live post-restore, not from wifi_saved/bt_saved directly, so a config
+     * with no saved value yet (wifi_saved == -1) still starts these agreeing
+     * with reality instead of defaulting to their compiled-in initializer
+     * regardless of what this boot's init scripts actually did. */
+    if (wifi_saved >= 0 && wifi_saved != st_wifi_on()) st_wifi_set(wifi_saved);
+    if (bt_saved >= 0 && bt_saved != st_bt_on()) st_bt_set(bt_saved);
+    wifi_pref = wifi_saved >= 0 ? wifi_saved : st_wifi_on();
+    bt_pref = bt_saved >= 0 ? bt_saved : st_bt_on();
+    /* Brightness has no live/saved distinction to check -- always apply it,
+     * through st_brightness_set() (not a direct write) so its own max-1
+     * PWM-wraparound clamp still applies, same reasoning as every other
+     * brightness restore in this file. */
+    if (brightness_saved > 0) {
+        saved_brightness = brightness_saved;
+        st_brightness_set(brightness_saved);
+    }
 }
 
 /* Does this line set `key`? Length taken from the key itself rather than
@@ -6667,7 +6719,10 @@ static void save_conf(void) {
                 !conf_line_is(lines[n], "sleep_minutes") &&
                 !conf_line_is(lines[n], "auto_off_minutes") &&
                 !conf_line_is(lines[n], "eq_on") &&
-                !conf_line_is(lines[n], "eq_profile_path"))
+                !conf_line_is(lines[n], "eq_profile_path") &&
+                !conf_line_is(lines[n], "wifi_enabled") &&
+                !conf_line_is(lines[n], "bt_enabled") &&
+                !conf_line_is(lines[n], "brightness"))
                 n++;
         }
         fclose(f);
@@ -6688,11 +6743,18 @@ static void save_conf(void) {
     /* BG38 */
     fprintf(f, "eq_on = %d\n", eq_enabled());
     if (eq_cur_path[0]) fprintf(f, "eq_profile_path = %s\n", eq_cur_path);
+    /* R64: the tracked *intended* state (see wifi_pref/bt_pref's own
+     * comment), not a fresh st_wifi_on()/st_bt_on() query -- both toggle
+     * scripts background themselves and take real seconds, so a query made
+     * here, right after firing one, would almost always still read the
+     * state from *before* the toggle. */
+    fprintf(f, "wifi_enabled = %d\n", wifi_pref);
+    fprintf(f, "bt_enabled = %d\n", bt_pref);
+    if (saved_brightness > 0) fprintf(f, "brightness = %d\n", saved_brightness);
     fclose(f);
 }
 
 static int locked;
-static int saved_brightness = -1;
 static int g_fbfd = -1;
 
 /* R20: a stronger lock than the plain screen lock above -- opt-in via
@@ -7433,12 +7495,17 @@ int music_entry(void *a0, void *a1) {
                     qs_bright = v < 1 ? 1 : (v > qs_bright_max ? qs_bright_max : v);
                     st_brightness_set(qs_bright);
                     saved_brightness = qs_bright;
+                    save_conf();          /* R64 */
                 } else if (y > qs_wifi_y() && y < qs_wifi_y() + QS_ROW_H) {
                     qs_wifi = !qs_wifi;
                     st_wifi_set(qs_wifi);
+                    wifi_pref = qs_wifi;
+                    save_conf();          /* R64 */
                 } else if (y > qs_bt_y() && y < qs_bt_y() + QS_ROW_H) {
                     qs_bt = !qs_bt;
                     st_bt_set(qs_bt);
+                    bt_pref = qs_bt;
+                    save_conf();          /* R64 */
                 } else if (y > qs_usb_y() && y < qs_usb_y() + QS_ROW_H) {
                     qs_open = 0;
                     screen = SC_SETTINGS_USB; reset_scroll();
@@ -7949,14 +8016,20 @@ int music_entry(void *a0, void *a1) {
             } else if (screen == SC_SETTINGS_WIFI) {
                 int row = (y - CONTENT_Y) / ROW_H;
                 if (row == 0) {
-                    st_wifi_set(!st_wifi_on());
+                    int on = !st_wifi_on();
+                    st_wifi_set(on);
+                    wifi_pref = on;
+                    save_conf();          /* R64 */
                 } else if (row == 2) {
                     kb_open("Network name (SSID)", KB_PURPOSE_WIFI_SSID_MANUAL, "");
                 }
             } else if (screen == SC_SETTINGS_BT) {
                 int row = (y - CONTENT_Y) / ROW_H;
                 if (row == 0) {
-                    st_bt_set(!st_bt_on());
+                    int on = !st_bt_on();
+                    st_bt_set(on);
+                    bt_pref = on;
+                    save_conf();          /* R64 */
                 } else if (row == 2) {
                     bt_scan_start();
                 } else if (row >= 3) {
@@ -8492,6 +8565,11 @@ int music_entry(void *a0, void *a1) {
             idle = 0;
         } else if (qs_dragging && !touch_down) {
             qs_dragging = 0;
+            /* R64: once per drag, on release -- the live block above already
+             * applies every intermediate value as the finger moves, but
+             * calling save_conf() that often would mean a fopen/fclose pair
+             * per frame of the drag, for a value only the final one needs. */
+            save_conf();
         }
 
         /* Running down the A-Z strip. The test is on where the finger went

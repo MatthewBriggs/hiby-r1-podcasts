@@ -369,9 +369,35 @@ void st_wifi_set(int on) {
                   : "/usr/bin/wifi_off.sh >/dev/null 2>&1 &") == -1) return;
 }
 
+/* R64: /etc/init.d/S80_bt_init backgrounds /usr/bin/bt_init and returns
+ * immediately, so this app's own startup (S92, right after S80 in the boot
+ * sequence) runs *in parallel* with bt_init's ~15+ second sequence, not
+ * after it -- and that sequence's very last command is an explicit
+ * `bt-adapter --set Powered Off`, added upstream so stock firmware starts
+ * with Bluetooth off until its own UI turns it on. A plain "on" call made
+ * during that window (R64's boot-time restore, when it wants Bluetooth back
+ * on) would very likely land *before* that trailing Off and then get
+ * silently overwritten by it moments later -- reported live as the restore
+ * never taking, every time, on a real reboot.
+ *
+ * bt_init itself touches /tmp/bt_init_ok as its last line, after that Off,
+ * so waiting for that file first and then re-asserting "on" always comes
+ * after, not before. Capped at 20s (bt_init's own sleeps alone add up to
+ * about 10s) so a firmware or init failure that never creates the file
+ * can't hang this forever -- it just falls through to enabling immediately,
+ * the same behavior as before this existed. A no-op wait on every call
+ * after boot, once the file already exists, so this is safe to leave in
+ * st_bt_set() itself rather than only in the boot-restore path: busybox has
+ * no `timeout` applet (see bt_pair()'s own history with that), hence the
+ * hand-rolled bounded loop rather than wrapping this in one. */
 void st_bt_set(int on) {
-    if (system(on ? "/usr/bin/bt_enable >/dev/null 2>&1 &"
-                  : "/usr/bin/bt_disable >/dev/null 2>&1 &") == -1) return;
+    if (!on) {
+        if (system("/usr/bin/bt_disable >/dev/null 2>&1 &") == -1) return;
+        return;
+    }
+    if (system("(i=0; while [ ! -f /tmp/bt_init_ok ] && [ $i -lt 40 ]; do "
+               "sleep 0.5; i=$((i+1)); done; /usr/bin/bt_enable) "
+               ">/dev/null 2>&1 &") == -1) return;
 }
 
 /* USB working mode, take 2. The first version wrote a byte into
