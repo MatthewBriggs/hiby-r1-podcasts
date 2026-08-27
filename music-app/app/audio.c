@@ -1180,6 +1180,8 @@ void audio_volume_set(int pct) {
     bt_vol_pending = 1; bt_vol_pending_abs = pct;
     pthread_mutex_unlock(&bt_vol_lock);
     pthread_mutex_lock(&g_lock); g_vol = pct; pthread_mutex_unlock(&g_lock);
+    /* BG94: see audio_volume_step()'s matching comment. */
+    if (!bt_mixer[0]) bt_mixer_next_try = 0;
 }
 
 void audio_volume_step(int delta) {
@@ -1218,6 +1220,22 @@ void audio_volume_step(int delta) {
     pthread_mutex_lock(&bt_vol_lock);
     bt_vol_pending = 1; bt_vol_pending_abs = v;
     pthread_mutex_unlock(&bt_vol_lock);
+    /* BG94: reported as hardware volume buttons lagging several seconds
+     * behind a press, sometimes matching the on-screen slider and sometimes
+     * not. audio_bt_volume_service() only re-runs find_bt_mixer() on its own
+     * schedule (bt_mixer_next_try, BG93's backoff) -- a pending request that
+     * arrives while bt_mixer is still empty (freshly connected, or between
+     * scheduled retries) just sits there doing nothing until that timer
+     * comes back around on its own, up to the full 5s early-retry interval
+     * or 60s once settled. A real button press is exactly the signal worth
+     * retrying *now* for, rather than waiting out a schedule that was only
+     * ever meant to bound how often an unattended, no-one's-pressing-
+     * anything probe repeats. Racing this against audio_bt_volume_service()
+     * itself (which only ever runs on the bt_poll thread) is the same
+     * class of benign single-word race bt_mixer[0]'s own read elsewhere in
+     * this file already accepts -- worst case this write loses a race and
+     * next tick's own check catches it anyway. */
+    if (!bt_mixer[0]) bt_mixer_next_try = 0;
 }
 
 /* True if a write is waiting, so the background thread can check cheaply

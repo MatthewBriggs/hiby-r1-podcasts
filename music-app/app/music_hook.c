@@ -1674,11 +1674,16 @@ static int set_row_usb_y(void)  { return set_row_bt_y() + ROW_H; }
  * see its own comment in scanner.c) but a user tapping "check for new
  * music" has one question, not two, and only ever needs the one number. */
 static int set_row_scan_y(void) { return set_row_usb_y() + ROW_H; }
+/* R66 follow-up: a user-triggered equivalent of what auto-shutdown already
+ * does, minus the resume save -- for whenever a genuinely cold next boot is
+ * wanted (about to put the device away, or just wanting a clean start)
+ * rather than picking back up where this session left off. */
+static int set_row_shutdown_y(void) { return set_row_scan_y() + ROW_H; }
 /* R44: total content height, for the Settings screen's own scroll clamp --
  * ceil() so a last row that doesn't fill a whole ROW_H still gets fully
  * scrollable rather than clipped short. */
 static int settings_content_rows(void) {
-    int content_px = set_row_scan_y() + ROW_H - CONTENT_Y;
+    int content_px = set_row_shutdown_y() + ROW_H - CONTENT_Y;
     return (content_px + ROW_H - 1) / ROW_H;
 }
 
@@ -3524,7 +3529,19 @@ static int ab_follow(void) {
     if (!audiobook_mode || ab_book.chap_n <= 0) return 0;
     int c = cur_track;
     if (c < 0 || c >= ab_book.chap_n) return 0;
-    int64_t pos = audio_pos_ms();
+    /* BG80 pattern, same as everywhere else in this file that reads a
+     * position: a resume seek deep into a book (R66's cold-start restore is
+     * the newest way to trigger this, but ab_resume_book() has always done
+     * this on a plain "open the book" too) leaves audio_pos_ms() reading
+     * near 0 for however long the worker thread takes to land the seek --
+     * the same 10-20s-worst-case transition window this pattern exists for
+     * elsewhere. Reading that raw here walked the second loop below all the
+     * way back to chapter 0 every time, since 0 is "before" every chapter's
+     * own start -- reported live as "Opening Credits" flashing on screen
+     * for a moment right after a resume, before the seek actually landed
+     * and this corrected itself back to the real chapter. */
+    int pending = audio_seek_pending_ms();
+    int64_t pos = pending >= 0 ? pending : audio_pos_ms();
     int f = ab_book.chap[c].file;
     while (c + 1 < ab_book.chap_n && ab_book.chap[c + 1].file == f &&
            pos >= ab_book.chap[c + 1].file_start_ms) c++;
@@ -5325,6 +5342,11 @@ static void draw_screen(uint16_t *fb) {
         }
         fill_rect_clip(fb, 0, ry + ROW_H - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
 
+        ry = set_row_shutdown_y() - off;
+        draw_text_clip(fb, 24, ry + 20, "Full shutdown", COL_TEXT, TEXT_PX_BODY, FB_W - 48, CONTENT_Y, clip_bot);
+        draw_text_clip(fb, 24, ry + 46, "with no saved state", COL_DIM, TEXT_PX_SMALL, FB_W - 48, CONTENT_Y, clip_bot);
+        fill_rect_clip(fb, 0, ry + ROW_H - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
+
         if (mini_visible()) draw_mini(fb);
         return;
     }
@@ -6539,11 +6561,30 @@ static void draw_ui(uint16_t *fb) {
 #define IDLE_DEFAULT_S 0
 static int idle_ticks = IDLE_DEFAULT_S * 30;    /* loop runs at ~30/s while awake */
 
-/* R64: moved up from its previous spot just after save_conf() -- load_conf()
- * needs to set this directly (the loaded brightness is the same "user's last
- * chosen level" this already tracks for the lock/unlock restore, see BG78),
- * and C won't let it reference a static declared later in the file. */
+/* Moved up from its previous spot just after save_conf() -- load_conf()
+ * needs to set this directly, and C won't let it reference a static declared
+ * later in the file. */
 static int saved_brightness = -1;
+
+/* BG95: file-scope rather than a local inside music_entry()'s own loop --
+ * see handle_keys()'s own comment on the single-power-press "wake from dark
+ * for any reason" path for why it needs to read this too, not just the BG6
+ * watchdog that originally tracked it. */
+static int last_lit_bright;
+
+/* R64: the persisted *preference*, separate from saved_brightness above --
+ * set_locked() also writes saved_brightness, at every lock, with whatever
+ * the backlight happens to read right then (see its own comment: that's
+ * exactly right for "what to restore to on unlock," which is all it was
+ * ever for). Reusing that same variable as R64's reboot-persisted value at
+ * first meant a lock landing at an unexpected level -- 0, if the backlight
+ * was already down for any reason at that instant -- silently overwrote the
+ * user's real preference with it, and the very next unrelated save_conf()
+ * call (any toggle, any screen) wrote that corrupted value to music.conf.
+ * Reported live: brightness stopped surviving reboots again despite R64
+ * appearing to work at first. This is updated only at the two places the
+ * user actually moves the slider, never by lock/unlock. */
+static int brightness_pref = -1;
 
 /* R64: the *intended* radio state, updated at the same moment st_wifi_set()/
  * st_bt_set() are, not re-derived from st_wifi_on()/st_bt_on() at save time.
@@ -6695,6 +6736,7 @@ static void load_conf(void) {
      * brightness restore in this file. */
     if (brightness_saved > 0) {
         saved_brightness = brightness_saved;
+        brightness_pref = brightness_saved;
         st_brightness_set(brightness_saved);
     }
 }
@@ -6765,10 +6807,283 @@ static void save_conf(void) {
      * state from *before* the toggle. */
     fprintf(f, "wifi_enabled = %d\n", wifi_pref);
     fprintf(f, "bt_enabled = %d\n", bt_pref);
-    if (saved_brightness > 0) fprintf(f, "brightness = %d\n", saved_brightness);
+    if (brightness_pref > 0) fprintf(f, "brightness = %d\n", brightness_pref);
     fprintf(f, "ab_speed_permille = %d\n", ab_speed_permille);   /* BG91 */
     fprintf(f, "pod_speed_permille = %d\n", pod_speed_permille); /* BG91 */
     fclose(f);
+}
+
+/* ---- R66: resume after auto-shutdown -------------------------------------
+ *
+ * The auto-shutdown timer powers the device off after a set idle period, and
+ * before this the way back in was a cold start: main menu, nothing loaded,
+ * and the stock boot logo in between. Everything needed to do better is
+ * already on hand at the moment the timer fires -- what was loaded, where
+ * the user was, and the exact pixels they last saw -- so it is written out
+ * then and picked back up on the next start.
+ *
+ * Deliberately one-shot and auto-shutdown-only: both files are written from
+ * that one call site and unlinked as soon as they are consumed, so a manual
+ * power-off, a crash-restart or an ordinary reboot all still cold-start.
+ * Restoring a user's screen after a *crash* would be actively wrong -- it
+ * would hide the restart it is meant to be honest about.
+ *
+ * The thumbnail is stored downscaled by RS_SHIFT rather than as a full
+ * framebuffer: 47 KB instead of 750 KB on a partition with ~22 MB free, and
+ * the blur R66 asks for falls out of the bilinear upscale on the way back
+ * in for free rather than needing a separate pass over 384000 pixels. The
+ * downscale is a plain box average, which is itself the first half of that
+ * blur. */
+#define RESUME_STATE "/usr/data/resume.state"
+#define RESUME_THUMB "/usr/data/resume.thumb"
+#define RS_SHIFT 2                        /* 4x each axis */
+#define RS_W (FB_W >> RS_SHIFT)           /* 120 */
+#define RS_H (FB_H >> RS_SHIFT)           /* 200 */
+#define RS_BOX (1 << RS_SHIFT)
+#define RM_MUSIC     0
+#define RM_AUDIOBOOK 1
+#define RM_PODCAST   2
+
+/* Static rather than on the stack: 48 KB, and both users are called exactly
+ * once per process, so there is nothing to gain from it being automatic. */
+static uint16_t rs_thumb[RS_W * RS_H];
+
+static void resume_save(const uint16_t *front) {
+    if (front) {
+        for (int ty = 0; ty < RS_H; ty++) {
+            for (int tx = 0; tx < RS_W; tx++) {
+                unsigned r = 0, g = 0, b = 0;
+                for (int dy = 0; dy < RS_BOX; dy++) {
+                    const uint16_t *row = front
+                                        + (size_t)((ty << RS_SHIFT) + dy) * FB_W
+                                        + (tx << RS_SHIFT);
+                    for (int dx = 0; dx < RS_BOX; dx++) {
+                        uint16_t p = row[dx];
+                        r += (p >> 11) & 0x1F;
+                        g += (p >> 5) & 0x3F;
+                        b += p & 0x1F;
+                    }
+                }
+                rs_thumb[ty * RS_W + tx] =
+                    (uint16_t)(((r / (RS_BOX * RS_BOX)) << 11) |
+                               ((g / (RS_BOX * RS_BOX)) << 5) |
+                                (b / (RS_BOX * RS_BOX)));
+            }
+        }
+        FILE *tf = fopen(RESUME_THUMB ".tmp", "wb");
+        if (tf) {
+            int ok = fwrite(rs_thumb, sizeof(rs_thumb), 1, tf) == 1 && fflush(tf) == 0;
+            fclose(tf);
+            if (!ok || rename(RESUME_THUMB ".tmp", RESUME_THUMB) != 0)
+                unlink(RESUME_THUMB ".tmp");
+        }
+    }
+
+    /* Radio is a live stream, not a position in a file -- there is nothing
+     * to come back to, so it saves no playback at all and resumes as a plain
+     * navigation restore. */
+    int mode = audiobook_mode ? RM_AUDIOBOOK : podcast_mode ? RM_PODCAST : RM_MUSIC;
+    const char *path = (!radio_mode && cur_track >= 0 && cur_track < queue_n)
+                     ? queue[cur_track].path : "";
+    /* Same pending-seek preference the resume files themselves use (BG80):
+     * a position saved while a seek is still outstanding must be the target
+     * asked for, not the decoder's not-there-yet reading of it. */
+    int pending = audio_seek_pending_ms();
+    int pos = pending >= 0 ? pending : audio_pos_ms();
+
+    char tmp[sizeof(RESUME_STATE) + 8];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", RESUME_STATE);
+    FILE *f = fopen(tmp, "w");
+    if (!f) return;
+    fprintf(f, "mode=%d\n", mode);
+    fprintf(f, "screen=%d\n", (int)screen);
+    fprintf(f, "pos=%d\n", pos);
+    fprintf(f, "path=%s\n", path);
+    fprintf(f, "album=%s\n", q_album);
+    fprintf(f, "artist=%s\n", q_artist);
+    fprintf(f, "feed=%s\n", cur_feed);
+    fprintf(f, "abdir=%s\n", ab_book.dir);
+    int ok = (fflush(f) == 0);
+    fclose(f);
+    if (!ok || rename(tmp, RESUME_STATE) != 0) unlink(tmp);
+    else mlog("[music] resume state saved (mode %d, screen %d, %dms)\n", mode, (int)screen, pos);
+}
+
+static int resume_pending(void) { return access(RESUME_STATE, F_OK) == 0; }
+
+/* 0..256 blend of two RGB565s, per channel in their own widths. */
+static uint16_t rs_lerp(uint16_t a, uint16_t b, int t) {
+    int ar = (a >> 11) & 0x1F, ag = (a >> 5) & 0x3F, ab = a & 0x1F;
+    int br = (b >> 11) & 0x1F, bg = (b >> 5) & 0x3F, bb = b & 0x1F;
+    return (uint16_t)(((ar + (((br - ar) * t) >> 8)) << 11) |
+                      ((ag + (((bg - ag) * t) >> 8)) << 5)  |
+                       (ab + (((bb - ab) * t) >> 8)));
+}
+
+/* The saved screen, blurred and dimmed. Painted before lib_open() so it is
+ * on the panel for the whole of the library open and the restore below
+ * rather than after them.
+ *
+ * Dimmed as well as blurred: it has to be unmistakably not a live screen,
+ * which is the whole point -- a sharp copy of the last frame is exactly
+ * what a frozen device looks like. */
+static void resume_splash(uint16_t *fb) {
+    FILE *f = fopen(RESUME_THUMB, "rb");
+    if (!f) return;
+    size_t got = fread(rs_thumb, 1, sizeof(rs_thumb), f);
+    fclose(f);
+    unlink(RESUME_THUMB);
+    if (got != sizeof(rs_thumb)) return;
+
+    for (int y = 0; y < FB_H; y++) {
+        int syq = (y << (8 - RS_SHIFT));
+        int sy = syq >> 8, fy = syq & 0xFF;
+        if (sy > RS_H - 2) { sy = RS_H - 2; fy = 255; }
+        const uint16_t *r0 = rs_thumb + sy * RS_W;
+        const uint16_t *r1 = r0 + RS_W;
+        uint16_t *out = fb + (size_t)y * FB_W;
+        for (int x = 0; x < FB_W; x++) {
+            int sxq = (x << (8 - RS_SHIFT));
+            int sx = sxq >> 8, fx = sxq & 0xFF;
+            if (sx > RS_W - 2) { sx = RS_W - 2; fx = 255; }
+            uint16_t p = rs_lerp(rs_lerp(r0[sx], r0[sx + 1], fx),
+                                 rs_lerp(r1[sx], r1[sx + 1], fx), fy);
+            /* Halve every channel in place -- one shift each, no second
+             * pass over the frame. */
+            out[x] = (uint16_t)(((((p >> 11) & 0x1F) >> 1) << 11) |
+                                ((((p >> 5) & 0x3F) >> 1) << 5)  |
+                                 ((p & 0x1F) >> 1));
+        }
+    }
+}
+
+/* Rebuild what was loaded, then land on the screen it was being viewed
+ * from. Playback is restored *paused* whatever it was doing before: the
+ * device only auto-shuts-down while idle and locked, so nothing was
+ * playing at the time anyway, and starting audio by itself on a device the
+ * user has just picked up would be a surprise, not a convenience. */
+static void resume_try_restore(void) {
+    FILE *f = fopen(RESUME_STATE, "r");
+    if (!f) return;
+    int mode = -1, scr = -1, pos = 0;
+    char path[LIB_PATH_LEN] = "", album[LIB_NAME_LEN] = "", artist[LIB_NAME_LEN] = "";
+    char feed[POD_NAME_LEN] = "", abdir[AB_PATH_LEN] = "";
+    char line[LIB_PATH_LEN + 32];
+    while (fgets(line, sizeof(line), f)) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+        int v;
+        /* %[^\r\n] rather than %s throughout: every one of these can carry
+         * spaces (album titles, feed names, SD-card folder paths). */
+        if (sscanf(line, "mode=%d", &v) == 1) mode = v;
+        else if (sscanf(line, "screen=%d", &v) == 1) scr = v;
+        else if (sscanf(line, "pos=%d", &v) == 1) pos = v;
+        else if (!strncmp(line, "path=", 5))   snprintf(path, sizeof(path), "%s", line + 5);
+        else if (!strncmp(line, "album=", 6))  snprintf(album, sizeof(album), "%s", line + 6);
+        else if (!strncmp(line, "artist=", 7)) snprintf(artist, sizeof(artist), "%s", line + 7);
+        else if (!strncmp(line, "feed=", 5))   snprintf(feed, sizeof(feed), "%s", line + 5);
+        else if (!strncmp(line, "abdir=", 6))  snprintf(abdir, sizeof(abdir), "%s", line + 6);
+    }
+    fclose(f);
+    unlink(RESUME_STATE);        /* one-shot, whatever happens below */
+
+    int restored = 0;
+    if (mode == RM_AUDIOBOOK && abdir[0]) {
+        /* Exactly the sequence tapping the book in the list runs -- the
+         * position itself comes from audiobook_resume.txt via
+         * ab_resume_book(), which is authoritative and already correct, so
+         * `pos` is deliberately not applied here. */
+        ab_book_n = ab_scan_books(ab_books, AB_MAX_BOOKS);
+        ab_rebuild_rows();
+        for (int i = 0; i < ab_book_n; i++) {
+            if (strcmp(ab_books[i].dir, abdir) != 0) continue;
+            ab_load_book(&ab_books[i]);
+            audiobook_mode = 1;
+            audio_set_speed(ab_speed_permille);
+            ab_playing[0] = '\0';
+            queue_n = 0;
+            ab_resume_book();
+            restored = 1;
+            break;
+        }
+    } else if (mode == RM_PODCAST && feed[0] && path[0]) {
+        pod_feed_n = pod_scan_feeds(pod_feeds, POD_MAX_FEEDS);
+        pod_rebuild_rows();
+        snprintf(cur_feed, sizeof(cur_feed), "%s", feed);
+        pod_ep_n = pod_load_episodes(cur_feed, pod_eps, POD_MAX_ITEMS);
+        pod_rebuild_tracks();
+        snprintf(cur_album, sizeof(cur_album), "%s", cur_feed);
+        cur_artist[0] = '\0';
+        browsing_is_playlist = 0;
+        ab_list = 0; pod_list = 1;
+        audio_set_speed(pod_speed_permille);
+        for (int i = 0; i < pod_ep_n; i++) {
+            if (strcmp(pod_eps[i].path, path) != 0) continue;
+            pod_play_episode(i);      /* looks its own position up, same as a tap */
+            restored = 1;
+            break;
+        }
+    } else if (mode == RM_MUSIC && path[0] && album[0]) {
+        /* Music has no resume file of its own the way books and episodes
+         * do, so this is the one branch that carries its own position. */
+        snprintf(cur_album, sizeof(cur_album), "%s", album);
+        snprintf(cur_artist, sizeof(cur_artist), "%s", artist);
+        browsing_is_playlist = 0;
+        ab_list = 0; pod_list = 0;
+        track_n = lib_tracks_for_album(cur_artist, cur_album, tracks,
+                                       (int)(sizeof(tracks) / sizeof(tracks[0])), 0);
+        for (int i = 0; i < track_n; i++) {
+            if (strcmp(tracks[i].path, path) != 0) continue;
+            play_from_list(i);
+            if (pos > 0) audio_seek_ms(pos);
+            restored = 1;
+            break;
+        }
+    }
+
+    /* Paused, not playing -- see this function's own comment. audio_toggle()
+     * rather than a stop: the decoder stays open at the restored position,
+     * so the first press of play is instant and the progress bar is already
+     * showing the right place. */
+    if (restored && audio_is_active() && !audio_is_paused()) audio_toggle();
+
+    /* Navigation, as an explicit whitelist. Most screens are backed by state
+     * only their own entry path builds (a facet query, a scanned row list, a
+     * loaded EQ profile); landing on one whose backing state was never built
+     * would show an empty or wrong list rather than where the user was. These
+     * are the ones the restore above has already set up, plus the two row
+     * lists and one menu that are cheap to rebuild from nothing. */
+    screen_t want = restored ? SC_PLAYING : SC_MENU;
+    switch (scr) {
+        case SC_PLAYING:
+        case SC_QUEUE:
+            if (restored) want = (screen_t)scr;
+            break;
+        case SC_TRACKS:
+            if (restored && track_n > 0) want = SC_TRACKS;
+            break;
+        case SC_AUDIOBOOKS:
+            ab_book_n = ab_scan_books(ab_books, AB_MAX_BOOKS);
+            ab_rebuild_rows();
+            total = ab_book_n;
+            want = SC_AUDIOBOOKS;
+            break;
+        case SC_PODCASTS:
+            pod_feed_n = pod_scan_feeds(pod_feeds, POD_MAX_FEEDS);
+            pod_rebuild_rows();
+            total = pod_feed_n;
+            want = SC_PODCASTS;
+            break;
+        case SC_MUSIC_MENU:
+            want = SC_MUSIC_MENU;
+            break;
+        default:
+            break;
+    }
+    screen = want;
+    reset_scroll();
+    mlog("[music] resumed: mode %d, restored %d, screen %d -> %d\n",
+         mode, restored, scr, (int)want);
 }
 
 static int locked;
@@ -7060,7 +7375,24 @@ static int handle_keys(int fd, key_src_t src) {
              * dark for any reason wakes it, in one press, regardless of
              * what locked currently believes. */
             int dark = read_int_file(BACKLIGHT) <= 0;
-            if (dark) { locked = 1; set_locked(0); }
+            if (dark) {
+                /* BG95: set_locked(0) restores from saved_brightness, which
+                 * is only ever written by set_locked(1) itself -- exactly
+                 * the mechanism this comment's own "dark for any reason"
+                 * case says not to assume. If the stock player's own timer
+                 * did the blanking, saved_brightness was never touched and
+                 * still holds whatever it was from this app's own *last*
+                 * lock cycle (or its music.conf default, if there hasn't
+                 * been one yet this session) -- reported live as brightness
+                 * "resetting" on wake, to a level from before, not the one
+                 * actually in use when the screen went dark. last_lit_bright
+                 * is the BG6 watchdog's own continuously-sampled value,
+                 * updated every ~0.5s any time the panel is actually lit
+                 * regardless of which mechanism eventually blanks it, so
+                 * it's still correct here no matter which one did. */
+                if (last_lit_bright > 0) saved_brightness = last_lit_bright;
+                locked = 1; set_locked(0);
+            }
             else set_locked(1);
             acted = 1; continue;
         }
@@ -7264,8 +7596,13 @@ int music_entry(void *a0, void *a1) {
     mlog("[music] entering app\n");
     load_conf();
     screen = SC_MENU; reset_scroll();
-    if (lib_open() != 0) mlog("[music] library open failed\n");
 
+    /* R66: the framebuffer is set up before lib_open() rather than after so
+     * the resume splash can be on the panel *during* the library open and
+     * the restore that follows, which is the slow part and exactly the
+     * stretch the user would otherwise spend looking at a boot logo. The
+     * two are independent -- lib_open() only opens SQLite -- so nothing
+     * else cares about the order. */
     int fbfd = open("/dev/fb0", O_RDWR);
     if (fbfd < 0) { mlog("[music] no fb: %s\n", strerror(errno)); return 0; }
     g_fbfd = fbfd;                    /* set_locked needs it to unblank */
@@ -7286,6 +7623,22 @@ int music_entry(void *a0, void *a1) {
     /* Keep what the launcher had so it can be put back on the way out. */
     uint16_t *snapshot = malloc(page_px * 2);
     if (snapshot) memcpy(snapshot, base + (size_t)v.yoffset * FB_W, page_px * 2);
+
+    /* Both pages, then pan to a known one: whichever the boot logo left
+     * displayed is not something to assume, and the first real frame flips
+     * to page 0 anyway (`page` starts at 0), so leaving page 1 unpainted
+     * would show a torn half-splash for one frame at that flip. */
+    int resuming = resume_pending();
+    if (resuming) {
+        resume_splash(base);
+        memcpy(base + page_px, base, page_px * 2);
+        v.yoffset = 0;
+        if (ioctl(fbfd, FBIOPAN_DISPLAY, &v) < 0)
+            mlog("[music] resume splash pan failed: %s\n", strerror(errno));
+    }
+
+    if (lib_open() != 0) mlog("[music] library open failed\n");
+    if (resuming) resume_try_restore();
 
     int tfd = open("/dev/input/event1", O_RDONLY | O_NONBLOCK);
     if (tfd >= 0 && ioctl(tfd, EVIOCGRAB, 1) < 0)
@@ -7315,7 +7668,7 @@ int music_entry(void *a0, void *a1) {
     int last_sec = -1, art_seen = 0, view_art_seen = 0, status_tick = 0, idle = 0, rescan_tick = 0;
     int sleep_idle = 0, auto_off_idle = 0;
     int ab_pos_tick = 0;
-    int blank_tick = 0, last_lit_bright = 0;    /* BG6 watchdog, see below */
+    int blank_tick = 0;    /* BG6 watchdog, see below -- last_lit_bright is file-scope now (BG95) */
     while (running) {
         g_tick++;
         int x, y;
@@ -7512,6 +7865,7 @@ int music_entry(void *a0, void *a1) {
                     qs_bright = v < 1 ? 1 : (v > qs_bright_max ? qs_bright_max : v);
                     st_brightness_set(qs_bright);
                     saved_brightness = qs_bright;
+                    brightness_pref = qs_bright;
                     save_conf();          /* R64 */
                 } else if (y > qs_wifi_y() && y < qs_wifi_y() + QS_ROW_H) {
                     qs_wifi = !qs_wifi;
@@ -7989,6 +8343,7 @@ int music_entry(void *a0, void *a1) {
                 int ry_wifi = set_row_wifi_y() - off, ry_bt = set_row_bt_y() - off;
                 int ry_usb = set_row_usb_y() - off;
                 int ry_scan = set_row_scan_y() - off;
+                int ry_shutdown = set_row_shutdown_y() - off;
                 /* RBR: these first three rows are taller than ROW_H -- each
                  * carries a two-line description underneath the label (see
                  * the draw side's own lock_h/usbbypass_h/autooff_h), and
@@ -8031,6 +8386,17 @@ int music_entry(void *a0, void *a1) {
                 } else if (y >= ry_scan && y < ry_scan + ROW_H) {
                     scanner_rescan_now();
                     dirty = 1;
+                } else if (y >= ry_shutdown && y < ry_shutdown + ROW_H) {
+                    /* R66 follow-up: same position-save auto-shutdown always
+                     * did (a book/episode's own progress is never "state" in
+                     * R66's sense, just its ordinary resume file, and losing
+                     * that on a deliberate shutdown would be a regression
+                     * users would notice immediately) but deliberately no
+                     * resume_save() call -- that's the entire difference
+                     * from auto-shutdown, and the one this row exists for. */
+                    ab_save_current_pos();
+                    pod_save_current_pos();
+                    if (system("/sbin/poweroff") == -1) { }
                 }
             } else if (screen == SC_SETTINGS_WIFI) {
                 int row = (y - CONTENT_Y) / ROW_H;
@@ -8579,6 +8945,7 @@ int music_entry(void *a0, void *a1) {
                 qs_bright = v < 1 ? 1 : (v > qs_bright_max ? qs_bright_max : v);
                 st_brightness_set(qs_bright);
                 saved_brightness = qs_bright;   /* so unlocking restores this */
+                brightness_pref = qs_bright;    /* R64: so a reboot restores this */
                 dirty = 1;
             }
             idle = 0;
@@ -9119,6 +9486,16 @@ int music_entry(void *a0, void *a1) {
                  * the position a resumed-from-suspend book needs to still be
                  * right, and it is nearly free to just save it fresh. */
                 ab_save_current_pos();
+                /* Same reasoning as the line above, for the other half of
+                 * the pair -- an episode's own resume file is just as stale
+                 * as a book's by up to the same 15s here, and R66's restore
+                 * reads exactly that file back to place the episode. */
+                pod_save_current_pos();
+                /* R66. Either page holds the last drawn frame: nothing has
+                 * been drawn since the screen locked (`if (locked) dirty = 0`),
+                 * and the mirror below the draw block keeps both identical
+                 * whenever a drag isn't in progress, which locked guarantees. */
+                resume_save(base + (size_t)(page ^ 1) * page_px);
                 if (system("/sbin/poweroff") == -1) { }
                 /* poweroff is not instant; keep the loop from re-firing this
                  * every tick while the shutdown sequence runs. */
