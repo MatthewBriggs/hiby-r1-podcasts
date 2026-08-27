@@ -116,6 +116,15 @@ typedef struct {
     dec_kind_t kind;
     drflac    *flac;
     drmp3      mp3;
+    FILE      *mp3_approx_file;   /* set only after mp3_seek_approx() re-inits
+                                    * d->mp3 on a manually fseek'd FILE* of its
+                                    * own -- drmp3_uninit() only auto-closes the
+                                    * FILE* it opened itself (checked by
+                                    * comparing onRead against its own internal
+                                    * stdio callback), so this one needs its
+                                    * own fclose() in dec_close(). NULL the rest
+                                    * of the time, when d->mp3 owns its FILE*
+                                    * the normal way via drmp3_init_file(). */
     drwav      wav;
     int        channels;
     unsigned   rate;
@@ -419,6 +428,40 @@ static int dec_open_m4a(dec_t *d, const char *path) {
     return 0;
 }
 
+/* Format-only M4A probe for callers that must not touch g_aacpcm -- notably
+ * audio_probe_format() below, which scanner.c calls from its own background
+ * scan thread and which can therefore run concurrently with the playback
+ * worker thread's own M4A decode. dec_open_m4a() calls m4a_prime(), which
+ * decodes into the single shared g_aacpcm buffer; doing that from any thread
+ * but the worker races a real in-progress decode. Sample rate and channel
+ * count come straight off alac_open()/aac_open()'s own parse of the ASC/
+ * magic cookie though, so they're available without ever priming a frame --
+ * this stops right there. Bits is always 16 (both decoders hand back s16). */
+static int dec_open_m4a_probe(dec_t *d, const char *path) {
+    if (mp4_open(&d->mp4, path) != 0) return -1;
+    if (d->mp4.codec == MP4_CODEC_ALAC) {
+        d->alac = alac_open(d->mp4.asc, d->mp4.asc_len);
+        if (!d->alac) { mp4_close(&d->mp4); return -1; }
+        d->channels = alac_channels(d->alac);
+        d->rate     = (unsigned)alac_rate(d->alac);
+        alac_close(d->alac);
+        d->alac = NULL;
+    } else {
+        d->aac = aac_open(d->mp4.asc, d->mp4.asc_len);
+        if (!d->aac) { mp4_close(&d->mp4); return -1; }
+        d->channels = aac_channels(d->aac);
+        d->rate     = (unsigned)aac_rate(d->aac);
+        aac_close(d->aac);
+        d->aac = NULL;
+    }
+    d->kind = DEC_M4A;
+    d->bits = 16;
+    d->frames = (d->mp4.timescale && d->rate)
+              ? (uint64_t)d->mp4.duration * d->rate / d->mp4.timescale : 0;
+    mp4_close(&d->mp4);
+    return 0;
+}
+
 static int dec_open(dec_t *d, const char *path) {
     memset(d, 0, sizeof(*d));
     switch (sniff(path)) {
@@ -563,7 +606,91 @@ static uint64_t dec_read(dec_t *d, short *out, uint64_t want) {
     }
 }
 
-static void dec_seek(dec_t *d, uint64_t frame) {
+/* Forward declaration -- defined below, reused here for its cheap CBR bitrate
+ * read (first valid frame header only, no decode) to support the approximate
+ * seek just below. */
+static int mp3_probe(const char *path, int *rate_out, int *bitrate_bps_out);
+
+/* dr_mp3 has exactly two ways to seek: an O(1) lookup against a bound seek
+ * table, or -- with none bound -- drmp3_seek_to_pcm_frame__brute_force(),
+ * which is a "dumb read-and-discard" full decode of every frame from the
+ * start of the file up to the target (dr_mp3's own comment, not this app's).
+ * mp3_seektable_kickoff() only starts building that table once a track is
+ * already open, on its own background thread, and building it costs exactly
+ * the same full-file decode pass -- so a resume seek landing anywhere close
+ * to the end of a long episode, on the very first open, had no fast option
+ * either way: minutes of silent 100%-of-one-core decode before anything was
+ * audible, and if the user switched tracks while that was running,
+ * audio_stop()'s pthread_join() froze the whole UI thread for the same
+ * span, since nothing inside that single blocking call checks g_running.
+ *
+ * This sidesteps both by seeking approximately instead of exactly, the same
+ * technique every mainstream MP3 player uses for an unindexed seek: scale
+ * the target time by the file's average byte rate to land close in the
+ * file, then let a fresh decoder resync from there. mp3_probe() already
+ * reads the bitrate from the first real frame header for exactly this kind
+ * of "close enough" estimate elsewhere in this file; for CBR (the common
+ * case for a fixed-quality podcast export) it's exact, and for VBR it's
+ * still within a fraction of a second per hour of drift, nowhere near
+ * enough to be audible against spoken content. Landing a few frames short
+ * or long of the mathematical target is an accepted, universal trade-off of
+ * this technique -- not a bug -- because the alternative is the multi-minute
+ * stall above.
+ *
+ * Only used when no table is bound yet -- once mp3_seektable_kickoff()'s
+ * background build finishes, later seeks go through the exact table lookup
+ * as before, unaffected. */
+static drmp3_bool32 mp3_approx_read(void *ud, void *out, size_t n) {
+    return fread(out, 1, n, (FILE *)ud);
+}
+static drmp3_bool32 mp3_approx_seek(void *ud, int offset, drmp3_seek_origin origin) {
+    int whence = (origin == DRMP3_SEEK_CUR) ? SEEK_CUR
+               : (origin == DRMP3_SEEK_END) ? SEEK_END : SEEK_SET;
+    return fseek((FILE *)ud, offset, whence) == 0;
+}
+static drmp3_bool32 mp3_approx_tell(void *ud, drmp3_int64 *out) {
+    long p = ftell((FILE *)ud);
+    if (p < 0) return DRMP3_FALSE;
+    *out = p;
+    return DRMP3_TRUE;
+}
+
+/* Returns 1 if it replaced d->mp3 with an approximately-seeked decoder, 0 if
+ * it left d untouched (caller falls back to the exact brute-force seek). */
+static int mp3_seek_approx(dec_t *d, const char *path, uint64_t targetFrame) {
+    if (d->mp3.pSeekPoints != NULL && d->mp3.seekPointCount > 0) return 0;   /* table already bound: exact path stays fast */
+    if (!d->rate) return 0;
+    struct stat st;
+    if (stat(path, &st) != 0 || st.st_size <= 0) return 0;
+    int bitrate_bps = 0, probe_rate = 0;
+    if (mp3_probe(path, &probe_rate, &bitrate_bps) != 0 || bitrate_bps <= 0) return 0;
+    /* Scale from streamStartOffset, not byte 0 -- a well-tagged rip's embedded
+     * cover art can push the real audio data well into the file (the exact
+     * mechanism behind the "Revolver" 0-kbps bug elsewhere in this file), and
+     * scaling from the very start would land short by however big that tag
+     * is, worse the larger the file. drmp3_init_file() already found this
+     * exactly once, on d->mp3, before this function ever runs. */
+    double target_ms = (double)targetFrame * 1000.0 / (double)d->rate;
+    int64_t data_start = (int64_t)d->mp3.streamStartOffset;
+    int64_t byte_off = data_start + (int64_t)(target_ms / 1000.0 * ((double)bitrate_bps / 8.0));
+    if (byte_off < data_start) byte_off = data_start;
+    if (byte_off > st.st_size - 4096) byte_off = st.st_size > 4096 ? st.st_size - 4096 : 0;
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    if (fseek(f, (long)byte_off, SEEK_SET) != 0) { fclose(f); return 0; }
+    drmp3 nd;
+    if (!drmp3_init(&nd, mp3_approx_read, mp3_approx_seek, mp3_approx_tell, NULL, f, NULL)) {
+        fclose(f);
+        return 0;
+    }
+    drmp3_uninit(&d->mp3);
+    if (d->mp3_approx_file) fclose(d->mp3_approx_file);
+    d->mp3 = nd;
+    d->mp3_approx_file = f;
+    return 1;
+}
+
+static void dec_seek(dec_t *d, uint64_t frame, const char *path) {
     if (d->kind == DEC_M4A) {
         /* Access units are a fixed number of frames, so the index is just a
          * division; seeking is to the start of the unit containing it. */
@@ -576,7 +703,10 @@ static void dec_seek(dec_t *d, uint64_t frame) {
         case DEC_VORBIS: vorbis_dec_seek(&d->vorbis, frame); break;
         case DEC_OPUS:   opus_dec_seek(&d->opus, frame);     break;
         case DEC_FLAC: drflac_seek_to_pcm_frame(d->flac, frame); break;
-        case DEC_MP3:  drmp3_seek_to_pcm_frame(&d->mp3, frame);  break;
+        case DEC_MP3:
+            if (!mp3_seek_approx(d, path, frame))
+                drmp3_seek_to_pcm_frame(&d->mp3, frame);
+            break;
         case DEC_WAV:  drwav_seek_to_pcm_frame(&d->wav, frame);  break;
         default: break;
     }
@@ -602,7 +732,13 @@ static void dec_close(dec_t *d) {
     }
     switch (d->kind) {
         case DEC_FLAC:   drflac_close(d->flac); break;
-        case DEC_MP3:    drmp3_uninit(&d->mp3); break;
+        case DEC_MP3:
+            drmp3_uninit(&d->mp3);
+            /* drmp3_uninit() only closes the FILE* itself when d->mp3 still
+             * owns it via the internal stdio callback -- mp3_seek_approx()'s
+             * custom callbacks mean it never recognizes this one as its own. */
+            if (d->mp3_approx_file) { fclose(d->mp3_approx_file); d->mp3_approx_file = NULL; }
+            break;
         case DEC_WAV:    drwav_uninit(&d->wav); break;
         case DEC_VORBIS: vorbis_dec_close(&d->vorbis); break;
         case DEC_OPUS:   opus_dec_close(&d->opus); break;
@@ -738,12 +874,19 @@ static int mp3_probe(const char *path, int *rate_out, int *bitrate_bps_out) {
 int audio_probe_format(const char *path, int *bits, int *rate,
                        int *bitrate_bps, int *dur_ms) {
     dec_t d;
-    if (dec_open(&d, path) != 0) return -1;
+    memset(&d, 0, sizeof(d));
+    /* M4A goes through dec_open_m4a_probe() instead of dec_open(), which for
+     * M4A would call dec_open_m4a() -> m4a_prime() and touch the shared
+     * g_aacpcm buffer -- unsafe here since this runs on scanner.c's
+     * background scan thread, possibly concurrent with real M4A playback on
+     * the worker thread. See dec_open_m4a_probe()'s own comment. */
+    int rc = (sniff(path) == DEC_M4A) ? dec_open_m4a_probe(&d, path) : dec_open(&d, path);
+    if (rc != 0) return -1;
     dec_kind_t kind = d.kind;
     if (rate) *rate = (int)d.rate;
     if (bits) *bits = (kind == DEC_MP3) ? 16 : d.bits;
     if (dur_ms) *dur_ms = (d.frames && d.rate) ? (int)(d.frames * 1000 / d.rate) : 0;
-    dec_close(&d);
+    if (kind != DEC_M4A) dec_close(&d);
 
     if (kind == DEC_MP3) {
         int r = 0, bps = 0;
@@ -1652,7 +1795,7 @@ static void *worker(void *arg) {
 
         if (seek >= 0) {
             uint64_t f = (uint64_t)seek * rate / 1000;
-            dec_seek(d, f);
+            dec_seek(d, f, g_path);
             done = f;
             pthread_mutex_lock(&g_lock);
             g_pos_ms = seek;                  /* move the clock even while paused */

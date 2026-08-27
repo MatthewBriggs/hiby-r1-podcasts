@@ -679,6 +679,23 @@ static int view_art_gone(void) {
     return gone;
 }
 
+/* R63 audit: tracks_hdr_title_y() (and everything chained off it below --
+ * artist_y, info_y, hdr_h, tracks_max_px(), the cover-box draw) used to call
+ * view_art_gone() itself, which takes view_art_lock. A single frame chains
+ * through 4-5 of those calls, and the touch handler's hit-testing does the
+ * same on every tap -- all taking and releasing a mutex that's also being
+ * fought over by view_art_worker(), for a value that only ever changes once
+ * per album view (the moment the worker gives up). Worse, since each call
+ * re-locks independently, the worker could flip the answer between two of
+ * them inside one draw pass -- e.g. the cover box at line ~4680 drawn "not
+ * gone" while tracks_hdr_title_y() moments later reads "gone" and places the
+ * title where the still-drawn cover box already is. Snapshotting once per
+ * drawn frame (draw_ui(), before draw_screen()) fixes both: one lock/unlock
+ * instead of several, and every reader in that frame -- and every touch
+ * event before the next frame redraws -- sees the exact value the screen
+ * currently shows. */
+static int g_view_art_gone_frame;
+
 static void *view_art_worker(void *arg) {
     (void)arg;
     char track[512], artist[LIB_NAME_LEN], album[LIB_NAME_LEN];
@@ -1383,7 +1400,7 @@ static int title_y(void) { return ART_PX + 20; }
  * tracks_max_px()'s scroll bound, the cover draw itself below) derives from
  * this one function, so nothing else needs its own check. */
 #define NO_ART_TOP_PAD 24
-static int tracks_hdr_title_y(void)  { return view_art_gone() ? NO_ART_TOP_PAD : ART_PX + 20; }
+static int tracks_hdr_title_y(void)  { return g_view_art_gone_frame ? NO_ART_TOP_PAD : ART_PX + 20; }
 static int tracks_hdr_artist_y(void) { return tracks_hdr_title_y() + 44; }
 static int tracks_hdr_info_y(void)   { return tracks_hdr_artist_y() + 38; }
 static int tracks_hdr_h(void)        { return tracks_hdr_info_y() + 40; }
@@ -4677,7 +4694,7 @@ static void draw_screen(uint16_t *fb) {
          * derived from it) has already collapsed the reserved space to
          * match, so drawing an ART_PX COL_ROW placeholder here would just
          * paint a big blank square nothing above it left room to explain. */
-        if (!view_art_gone()) {
+        if (!g_view_art_gone_frame) {
             int cover_y = 0 - off;
             fill_rect_clip(fb, 0, cover_y, ART_PX, ART_PX, COL_ROW, 0, clip_bot);
             view_blit_art_clip(fb, 0, cover_y, 0, clip_bot);
@@ -6436,6 +6453,9 @@ static void draw_ui(uint16_t *fb) {
     uint64_t t0 = us_now();
     uint64_t clear0 = g_prof_clear_us, text0 = g_prof_text_us;
 
+    /* One lock/unlock for the whole frame -- see g_view_art_gone_frame's own
+     * comment above view_art_gone(). */
+    g_view_art_gone_frame = view_art_gone();
     draw_screen(fb);
     if (index_visible()) draw_index(fb);
     if (mini_visible()) draw_mini(fb);
