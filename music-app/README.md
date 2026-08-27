@@ -1,4 +1,4 @@
-# HiBy R1 — Library
+# HiBy R1 — Libra
 
 A music, radio and podcast app for the HiBy R1, replacing the stock **About**
 tile. It exists because the stock browser lists an album artist's *tracks*

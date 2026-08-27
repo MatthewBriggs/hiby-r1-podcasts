@@ -1,6 +1,6 @@
 /* podcast.c — see podcast.h. Ported from the standalone Podcasts app's
  * podcast_hook.c; drawing, input, volume/lock and the tile-hijack machinery
- * all dropped, since Library already owns all of that. */
+ * all dropped, since Libra already owns all of that. */
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>

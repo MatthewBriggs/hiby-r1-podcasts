@@ -1,13 +1,13 @@
-# Library & Podcasts for the HiBy R1
+# Libra & Podcasts for the HiBy R1
 
 One app that turns a stock HiBy R1 into a real platform: music, audiobooks,
 parametric EQ, internet radio and podcasts, replacing the stock **About**
 tile. It doesn't patch the stock binary — it `LD_PRELOAD`s into `hiby_player`
 and re-points a launcher tile's callback at itself.
 
-This used to be two separate apps sharing the device (Library on Stream
+This used to be two separate apps sharing the device (Libra on Stream
 media, a standalone Podcasts app chain-loaded onto About). Podcasts is built
-into Library directly now, so that second app was retired; Library moved
+into Libra directly now, so that second app was retired; Libra moved
 onto the About tile in its place, and Stream media is untouched, back to its
 stock behaviour.
 
@@ -147,12 +147,12 @@ adb push music-app/podsync/feeds.txt.example /data/mnt/sd_0/.podsync/feeds.txt
 adb shell sync && adb shell reboot
 ```
 
-**About** comes back as **Library** (music note icon, same position as
+**About** comes back as **Libra** (music note icon, same position as
 stock); **Stream media** is untouched, back to its stock behaviour.
 
 ## Using it
 
-Library needs no configuration to start — point it at your existing music
+Libra needs no configuration to start — point it at your existing music
 library and it uses the stock media index. Two plain-text config files are
 created on first run:
 

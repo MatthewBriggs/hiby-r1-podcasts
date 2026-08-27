@@ -1,7 +1,7 @@
 /* podcast.h — feeds, episodes, resume and on-demand download.
  *
  * Ported from the standalone Podcasts app's podcast_hook.c as the data layer
- * for L5 (folding Podcasts into Library): everything here is business logic
+ * for L5 (folding Podcasts into Libra): everything here is business logic
  * and file I/O, no drawing -- music_hook.c owns every screen the same way it
  * already does for audiobook.c's data.
  *

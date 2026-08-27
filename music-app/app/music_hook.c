@@ -1693,7 +1693,7 @@ static int settings_content_rows(void) {
  * pushed by hand, not by CI against a tagged commit), so this stays a
  * literal that a human edits; the discipline is remembering to, not the
  * mechanism. */
-#define LIBRARY_VERSION "0.43"
+#define LIBRARY_VERSION "0.44"
 
 /* A custom-built kernel keeps uname()'s own release string exactly
  * "4.4.94+" on purpose -- that string is also the vermagic every one of the
@@ -5360,7 +5360,7 @@ static void draw_screen(uint16_t *fb) {
         about_ram_free(ram_free, sizeof(ram_free));
 
         int ry = CONTENT_Y;
-        draw_text(fb, 24, ry + 20, "Library version", COL_TEXT, TEXT_PX_BODY, FB_W - 200);
+        draw_text(fb, 24, ry + 20, "Libra version", COL_TEXT, TEXT_PX_BODY, FB_W - 200);
         draw_right(fb, ry + 20, LIBRARY_VERSION);
         fill_rect(fb, 0, ry + ROW_H - 1, FB_W, 1, COL_LINE);
 
@@ -9638,7 +9638,7 @@ int music_entry(void *a0, void *a1) {
  */
 #define RES_DIR    "/usr/data/music_res"
 #define LABEL_INI  "/tmp/.music_settings.ini"
-#define TILE_LABEL "Library"
+#define TILE_LABEL "Libra"
 
 /* The ini is UTF-16LE, so tags have to be matched widened. */
 static size_t widen(const char *s, uint8_t *out) {

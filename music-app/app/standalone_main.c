@@ -1,4 +1,4 @@
-/* standalone_main.c — RP1 follow-on: run Library as the only process, no
+/* standalone_main.c — RP1 follow-on: run Libra as the only process, no
  * hiby_player at all. Calls music_entry() directly, bypassing the tile-hijack
  * trampoline entirely (there is no launcher to hijack a tile from).
  *
