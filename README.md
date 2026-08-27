@@ -1,4 +1,4 @@
-# Libra & Podcasts for the HiBy R1
+# Libra for the HiBy R1
 
 One app that turns a stock HiBy R1 into a real platform: music, audiobooks,
 parametric EQ, internet radio and podcasts, replacing the stock **About**
