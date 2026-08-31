@@ -7114,6 +7114,13 @@ static int have_last_power_press;
  * folded into a number that looks like it's all contention. 0 = nothing
  * pending. */
 static uint64_t g_wake_t0;
+/* BG98 follow-up: the total (g_wake_t0 to first frame) turned out to be a
+ * very consistent ~300ms with no measurable correlation to BG90's own
+ * bt_sink_connected() timing -- these three break that total down further,
+ * to find out where inside it the time actually goes. All relative to
+ * g_wake_t0; logged alongside it, once, at the same point the total is. */
+static uint64_t g_wake_setlocked_us;   /* just the set_locked(0) call itself */
+static uint64_t g_wake_predraw_us;     /* set_locked(0) returning to the draw_ui() call site */
 
 static int read_int_file(const char *path) {
     FILE *f = fopen(path, "r");
@@ -7285,16 +7292,23 @@ static void set_locked(int on) {
          * it will not fight this. */
         if (g_fbfd >= 0) ioctl(g_fbfd, FBIOBLANK, FB_BLANK_POWERDOWN);
     } else {
+        /* BG98 follow-up: set_locked(0) accounts for essentially the whole
+         * ~300ms measured wake latency -- splitting its own two operations
+         * to find out which one it actually is. */
+        uint64_t tb0 = us_now();
         /* Unblank unconditionally. The player can power the framebuffer down
          * underneath us on its own display timeout, and restoring brightness
          * to a blanked panel leaves a black screen that no amount of pressing
          * will bring back. It costs nothing if it was never blanked. */
         if (g_fbfd >= 0) ioctl(g_fbfd, FBIOBLANK, FB_BLANK_UNBLANK);
+        uint64_t tb1 = us_now();
         /* Through st_brightness_set(), not a direct write: saved_brightness
          * can be the literal max (the slider clamps to qs_bright_max, 101),
          * and writing that value directly goes dark instead of brightest --
          * st_brightness_set() is the one place that caps it to max-1. */
         st_brightness_set(saved_brightness > 0 ? saved_brightness : DEFAULT_BRIGHTNESS);
+        mlog("[music] unblank %lu us, brightness-restore %lu us\n",
+             (unsigned long)(tb1 - tb0), (unsigned long)(us_now() - tb1));
     }
     mlog("[music] %s\n", on ? "locked" : "unlocked");
 }
@@ -7366,6 +7380,7 @@ static int handle_keys(int fd, key_src_t src) {
                 locked = !button_locked;     /* so set_locked() below isn't a same-state no-op */
                 if (!button_locked) g_wake_t0 = us_now();   /* BG98: this call is the wake */
                 set_locked(button_locked);
+                if (!button_locked) g_wake_setlocked_us = us_now() - g_wake_t0;
                 if (button_locked) {
                     led_tick = 0;            /* start each pulse cycle fresh, on blue */
                 } else {
@@ -7406,6 +7421,7 @@ static int handle_keys(int fd, key_src_t src) {
                 if (last_lit_bright > 0) saved_brightness = last_lit_bright;
                 g_wake_t0 = us_now();   /* BG98: this call is the wake */
                 locked = 1; set_locked(0);
+                g_wake_setlocked_us = us_now() - g_wake_t0;
             }
             else set_locked(1);
             acted = 1; continue;
@@ -9568,6 +9584,11 @@ int music_entry(void *a0, void *a1) {
         }
 
         if (dirty) {
+            /* BG98 follow-up: how long between set_locked(0) returning (in
+             * handle_keys(), possibly several hundred lines and one loop
+             * lap's worth of other per-tick work ago) and actually reaching
+             * the draw call -- the middle third of the breakdown. */
+            if (g_wake_t0) g_wake_predraw_us = us_now() - g_wake_t0;
             /* Draw into the page that is not on screen, then flip to it.
              * Painting the visible page instead — briefly tried, to make the
              * panel and a screenshot agree — clears the whole frame before
@@ -9584,10 +9605,18 @@ int music_entry(void *a0, void *a1) {
              * another lap). Logged unconditionally rather than only past a
              * threshold: infrequent enough (one press at a time, human-
              * paced) that seeing the normal case costs nothing and is worth
-             * having for comparison against a slow one. */
+             * having for comparison against a slow one. Broken into three:
+             * set_locked(0) itself (FBIOBLANK unblank + brightness restore),
+             * everything from there to the draw_ui() call (other per-tick
+             * work this same lap), and draw_ui()+pan (the remainder) --
+             * whichever of the three actually accounts for the total is the
+             * one worth chasing further. */
             if (g_wake_t0) {
-                mlog("[music] wake latency %lu us\n",
-                     (unsigned long)(us_now() - g_wake_t0));
+                uint64_t total = us_now() - g_wake_t0;
+                mlog("[music] wake latency %lu us (set_locked %lu, predraw %lu, draw+pan %lu)\n",
+                     (unsigned long)total, (unsigned long)g_wake_setlocked_us,
+                     (unsigned long)(g_wake_predraw_us - g_wake_setlocked_us),
+                     (unsigned long)(total - g_wake_predraw_us));
                 g_wake_t0 = 0;
             }
             /* Copy the finished frame to the other page as well. /dev/fb0
