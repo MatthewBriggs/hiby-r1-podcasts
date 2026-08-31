@@ -7104,6 +7104,17 @@ static int button_locked;
 static r1_input_event_t last_power_press;   /* only .tv_sec/.tv_usec read */
 static int have_last_power_press;
 
+/* BG98: measures rather than guesses whether a wake is slow, and by how
+ * much. Set the moment a power press is recognised as "wake this up" (both
+ * branches below), read and logged once the next real frame actually
+ * reaches the panel -- this thread's own us_now() (CLOCK_MONOTONIC) on both
+ * ends, not the input event's own kernel timestamp, so the fixed ~0-100ms
+ * the 10Hz locked poll itself costs (present in every build, unrelated to
+ * BG90/BG98) contributes equally to every measurement rather than being
+ * folded into a number that looks like it's all contention. 0 = nothing
+ * pending. */
+static uint64_t g_wake_t0;
+
 static int read_int_file(const char *path) {
     FILE *f = fopen(path, "r");
     if (!f) return -1;
@@ -7353,6 +7364,7 @@ static int handle_keys(int fd, key_src_t src) {
                 have_last_power_press = 0;   /* don't chain into a third press */
                 button_locked = !button_locked;
                 locked = !button_locked;     /* so set_locked() below isn't a same-state no-op */
+                if (!button_locked) g_wake_t0 = us_now();   /* BG98: this call is the wake */
                 set_locked(button_locked);
                 if (button_locked) {
                     led_tick = 0;            /* start each pulse cycle fresh, on blue */
@@ -7392,6 +7404,7 @@ static int handle_keys(int fd, key_src_t src) {
                  * regardless of which mechanism eventually blanks it, so
                  * it's still correct here no matter which one did. */
                 if (last_lit_bright > 0) saved_brightness = last_lit_bright;
+                g_wake_t0 = us_now();   /* BG98: this call is the wake */
                 locked = 1; set_locked(0);
             }
             else set_locked(1);
@@ -9564,6 +9577,19 @@ int music_entry(void *a0, void *a1) {
             v.yoffset = (uint32_t)(page * FB_H);
             if (ioctl(fbfd, FBIOPAN_DISPLAY, &v) < 0 && frames < 3)
                 mlog("[music] pan failed: %s\n", strerror(errno));
+            /* BG98: this is the first real frame reaching the panel since
+             * g_wake_t0 was set (this pass through the loop is the same one
+             * that read the wake key -- see handle_keys()'s own comment for
+             * why `dirty` survives from there to here without needing
+             * another lap). Logged unconditionally rather than only past a
+             * threshold: infrequent enough (one press at a time, human-
+             * paced) that seeing the normal case costs nothing and is worth
+             * having for comparison against a slow one. */
+            if (g_wake_t0) {
+                mlog("[music] wake latency %lu us\n",
+                     (unsigned long)(us_now() - g_wake_t0));
+                g_wake_t0 = 0;
+            }
             /* Copy the finished frame to the other page as well. /dev/fb0
              * reports a single page to read(), so anything screenshotting the
              * device silently gets whichever page is not on screen; keeping

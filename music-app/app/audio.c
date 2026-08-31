@@ -1977,7 +1977,16 @@ static void *worker(void *arg) {
             if (g_out_kind == 0 && !g_screen_locked &&
                 ++bt_poll_tick >= BT_POLL_EVERY) {
                 bt_poll_tick = 0;
+                /* BG98: how expensive this subprocess spawn actually is on
+                 * this hardware -- the concrete number behind the "wake
+                 * feels slower" theory, not just the reasoning for it. */
+                struct timespec t0, t1;
+                clock_gettime(CLOCK_MONOTONIC, &t0);
                 bt_now = bt_sink_connected();
+                clock_gettime(CLOCK_MONOTONIC, &t1);
+                alog("[audio] bt_sink_connected() took %ld ms\n",
+                     (t1.tv_sec - t0.tv_sec) * 1000L +
+                     (t1.tv_nsec - t0.tv_nsec) / 1000000L);
             }
             if ((g_out_kind != 2 && now != g_out_card) ||
                 (g_out_kind == 0 && bt_now)) {
