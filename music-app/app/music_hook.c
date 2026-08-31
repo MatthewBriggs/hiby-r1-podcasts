@@ -7256,6 +7256,7 @@ static void deep_suspend(void) {
 static void set_locked(int on) {
     if (on == locked) return;
     locked = on;
+    audio_set_screen_locked(on);   /* BG90 follow-up -- see its own comment in audio.h */
     if (on) {
         saved_brightness = read_int_file(BACKLIGHT);
         write_int_file(BACKLIGHT, 0);

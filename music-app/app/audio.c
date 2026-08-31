@@ -1171,6 +1171,15 @@ static int bt_vol_pending_abs;
 static int g_vol_locked;
 void audio_set_vol_locked(int on) { g_vol_locked = on; }
 
+/* BG90 follow-up -- see audio_set_screen_locked()'s own comment in audio.h.
+ * Plain unguarded int: set from the UI thread (set_locked()), read from the
+ * worker thread, both single-word accesses -- the same benign-race class
+ * already accepted elsewhere in this file (bt_mixer[0], g_out_kind), where
+ * a stale read for one tick just means the skip (or the check) catches up
+ * next tick, not a real race. */
+static int g_screen_locked;
+void audio_set_screen_locked(int on) { g_screen_locked = on; }
+
 void audio_volume_set(int pct) {
     if (g_vol_locked) return;
     if (pct < 0) pct = 0;
@@ -1958,7 +1967,15 @@ static void *worker(void *arg) {
             poll_tick = 0;
             int now = usb_card();
             int bt_now = 0;
-            if (g_out_kind == 0 && ++bt_poll_tick >= BT_POLL_EVERY) {
+            /* BG90 regression, reported live as "wake from sleep feels
+             * fractionally slower": this thread has no other way to know
+             * the screen is locked, and forking bluealsa-cli right as the
+             * user presses power competes for the one core against the
+             * wake-up redraw. Nothing to gain from finding a Bluetooth
+             * reconnect while the screen's dark anyway -- see
+             * audio_set_screen_locked()'s own comment. */
+            if (g_out_kind == 0 && !g_screen_locked &&
+                ++bt_poll_tick >= BT_POLL_EVERY) {
                 bt_poll_tick = 0;
                 bt_now = bt_sink_connected();
             }

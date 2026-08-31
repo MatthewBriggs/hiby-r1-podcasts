@@ -60,6 +60,17 @@ int  audio_usb_bypass(void);
  * audio_set_volume() directly (which this does NOT gate) to set the pinned
  * value itself before/after engaging. */
 void audio_set_vol_locked(int on);
+/* BG90 follow-up: the worker thread's own Bluetooth-reconnect poll (see its
+ * comment in audio.c) forks a `bluealsa-cli` subprocess every ~5s while
+ * playing over wired output -- real, if brief, contention for the one core
+ * against whatever the UI thread is doing right then. The worker has no
+ * other way to know the screen is locked (set_locked() calls this so it
+ * does), and there is nothing to gain from discovering a Bluetooth
+ * reconnect while the user cannot see the screen change anyway -- skipped
+ * entirely while locked, resuming from wherever its own tick count left
+ * off once unlocked, rather than risk this exact subprocess landing right
+ * on top of the wake-up redraw and reading as a slower wake. */
+void audio_set_screen_locked(int on);
 /* Background-thread only (bt_poll) -- both do blocking D-Bus round-trips via
  * amixer. audio_bt_volume_pending() is the cheap check between polls;
  * audio_bt_volume_service() applies a pending write (from a key or the
