@@ -26,7 +26,17 @@
 #ifndef PODCAST_H
 #define PODCAST_H
 
-#define POD_NAME_LEN  64
+/* R65 fix: was 64 -- a real subscribed feed's folder name ("Transmissions -
+ * The Definitive Story of Joy Division & New Order") landed at exactly 64
+ * characters, silently truncated to 63 by every snprintf(...POD_NAME_LEN...)
+ * copying it in. cur_feed then held a name one character short of the real
+ * on-disk folder, opendir() in pod_load_episodes() failed to find it, and
+ * the episode list came back empty with no error -- reported live via the
+ * new in-app search (R65) surfacing a longer real-world title than any feed
+ * added by hand so far happened to have, but the limit itself predates that
+ * feature. Doubled, not nudged, so this isn't just moving the same wall a
+ * few characters further out for the next long title. */
+#define POD_NAME_LEN  128
 #define POD_PATH_LEN  384
 #define POD_MAX_ITEMS 220   /* matches the standalone app's own MAX_ITEMS */
 

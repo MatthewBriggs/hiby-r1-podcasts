@@ -1238,14 +1238,24 @@ static void draw_toggle_switch_h_clip(uint16_t *fb, int y, int on, int block_h,
  * plus a little either side, is ever in memory. */
 #define PAGE_MAX 32
 
+/* R65: SC_POD_SEARCH_RESULTS deliberately appended LAST, not slotted in near
+ * SC_PODCASTS/SC_POD_SYNC where it reads better -- R66's resume.state
+ * persists `screen` as a raw int across a real process restart (auto-
+ * shutdown, or a crash-restart with a resume file still on disk from an
+ * earlier one), so inserting a new value anywhere but the end silently
+ * renumbers every constant after it and misreads whatever a binary built
+ * before this change already wrote to that file. Caught live: adding this
+ * in the middle once (since reverted) sent a resume straight to the wrong
+ * screen the first time the rebuilt binary restarted with an old resume.state
+ * still on disk. */
 typedef enum { SC_MENU = 0, SC_MUSIC_MENU, SC_ARTISTS, SC_ALBUMS, SC_TRACKS, SC_PLAYING,
                SC_RADIO, SC_PLAYLISTS, SC_AUDIOBOOKS, SC_PODCASTS, SC_POD_SYNC,
-               SC_POD_SEARCH_RESULTS,
                SC_EQ, SC_EQ_BANDS, SC_EQ_BAND, SC_MSEB,
                SC_SETTINGS, SC_SETTINGS_THEME, SC_SETTINGS_ABOUT,
                SC_SETTINGS_TIMEZONE, SC_SETTINGS_THEMEMODE, SC_QUEUE,
                SC_ARTIST_PAGE,
-               SC_SETTINGS_WIFI, SC_SETTINGS_BT, SC_SETTINGS_USB, SC_KEYBOARD } screen_t;
+               SC_SETTINGS_WIFI, SC_SETTINGS_BT, SC_SETTINGS_USB, SC_KEYBOARD,
+               SC_POD_SEARCH_RESULTS } screen_t;
 
 /* L2: the top-level menu ("Main Menu", EXIT on the right) stays small on
  * purpose rather than listing every library-browsing facet alongside
@@ -1553,11 +1563,19 @@ static int pod_sync_x(void) {
     return header_back_x() - 20 - sync_w;
 }
 
-/* R65: SC_PODCASTS's second header action, "Search" -- sits left of Sync,
- * same 20px gap pattern as Sync itself sits left of BACK. */
+/* R65: SC_PODCASTS's second header action, labelled "Add" -- discovers and
+ * subscribes to a NEW show via iTunes Search, distinct from R68's planned
+ * "Search" (finding something inside shows already subscribed to, by title/
+ * notes). Internal names (pod_search_x/pod_search_start/
+ * KB_PURPOSE_PODCAST_SEARCH/SC_POD_SEARCH_RESULTS) still say "search"
+ * throughout, since that's genuinely what the iTunes lookup itself is --
+ * only the on-screen label changed, matching what the button actually does
+ * from the user's side (add a show you don't have yet) now that "Search"
+ * means something else in this app. Sits left of Sync, same 20px gap
+ * pattern as Sync itself sits left of BACK. */
 static int pod_search_x(void) {
     int sync_w = text_width("Sync", TEXT_PX_SMALL);
-    int search_w = text_width("Search", TEXT_PX_SMALL);
+    int search_w = text_width("Add", TEXT_PX_SMALL);
     return header_back_x() - 20 - sync_w - 20 - search_w;
 }
 
@@ -4119,12 +4137,14 @@ static void draw_screen(uint16_t *fb) {
             draw_text(fb, pod_sync_x(), STATUS_H + 20,
                       pod_update_running() ? "Syncing" : "Sync",
                       pod_update_running() ? COL_DIM : COL_ACCENT, TEXT_PX_SMALL, FB_W);
-            /* R65: opens the T9 keyboard for a podcast-title/keyword search,
-             * same always-tappable state as Sync -- unlike Sync there is no
-             * "already running" state to dim against here, since typing on
-             * the keyboard doesn't overlap with anything a second tap could
-             * step on. */
-            draw_text(fb, pod_search_x(), STATUS_H + 20, "Search", COL_ACCENT, TEXT_PX_SMALL, FB_W);
+            /* R65: opens the T9 keyboard for a podcast-title/keyword lookup
+             * against iTunes Search, to subscribe to a show not on the
+             * device yet -- labelled "Add", not "Search" (see pod_search_x()'s
+             * own comment for why). Same always-tappable state as Sync --
+             * unlike Sync there is no "already running" state to dim
+             * against here, since typing on the keyboard doesn't overlap
+             * with anything a second tap could step on. */
+            draw_text(fb, pod_search_x(), STATUS_H + 20, "Add", COL_ACCENT, TEXT_PX_SMALL, FB_W);
         }
         /* R52: Queue's one extra header action -- drop everything queued
          * after the currently-playing track. Dimmed when there's nothing
@@ -8264,7 +8284,22 @@ int music_entry(void *a0, void *a1) {
                     }
                 }
                 }
-            } else if (y < CONTENT_Y) {
+            } else if (screen != SC_KEYBOARD && y < CONTENT_Y) {
+                /* R65 fix: SC_KEYBOARD's own Cancel/Done sit at y=20/56 (see
+                 * draw_keyboard()), which is < CONTENT_Y like every other
+                 * screen's header row -- so without this exclusion, tapping
+                 * either one was swallowed right here instead of ever
+                 * reaching the dedicated "else if (screen == SC_KEYBOARD)"
+                 * case further down this same chain. The generic fallback at
+                 * the bottom of this block (screen != SC_MENU && x > FB_W -
+                 * 120) then fired go_back() for a Done tap (Done sits well
+                 * right of that line) -- which has no SC_KEYBOARD case of its
+                 * own, so it fell into the default: case built for SC_TRACKS/
+                 * queue-shaped screens and landed on Albums, kb_commit()
+                 * never called at all. Reported live via R65's own podcast
+                 * search (type a query, tap Done, land on Albums) but this
+                 * predates that feature -- it's the keyboard's Done button
+                 * in general, not anything specific to search. */
                 /* mseb_reset_x()/pod_sync_x()'s own on-screen position sits
                  * well left of the old fixed "FB_W - 120" boundary these
                  * zones used to end at, which left a dead strip between the
@@ -8281,7 +8316,7 @@ int music_entry(void *a0, void *a1) {
                     if (!pod_update_running()) { pod_update_start(); pod_sync_log_n = 0; }
                     screen = SC_POD_SYNC; reset_scroll();
                 } else if (screen == SC_PODCASTS && x >= pod_search_x() - 16 && x < pod_sync_x() - 16) {
-                    kb_open("Search podcasts", KB_PURPOSE_PODCAST_SEARCH, "");
+                    kb_open("Add a podcast", KB_PURPOSE_PODCAST_SEARCH, "");
                 } else if (screen == SC_QUEUE && x >= queue_clear_x() - 16 && x < header_back_x() - 16) {
                     /* R52: drop everything queued after the currently-
                      * playing track -- that one keeps playing undisturbed
