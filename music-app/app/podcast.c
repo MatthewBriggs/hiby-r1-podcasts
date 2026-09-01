@@ -582,6 +582,209 @@ void pod_update_reap(void) {
     }
 }
 
+/* ---- search (R65) ---------------------------------------------------- */
+
+/* Same shape as pod_update_start()'s whole-feed sync: all network work and
+ * JSON parsing happens in a subprocess (podsearch_once.sh, bundled curl,
+ * parse_itunes.awk), so this side just polls a plain-text result file.
+ * iTunes Search over Podcast Index/gpodder/fyyd (the other three AntennaPod
+ * itself searches) because it needs no API key or request signing. */
+#define SEARCH_SCRIPT RESUME_DIR "/podsearch_once.sh"
+#define SEARCH_LOG     "/tmp/.podsearch_run.log"
+#define SEARCH_RESULTS "/tmp/.podsearch_results.tsv"
+#define POD_SEARCH_MAX 20
+
+static pid_t search_pid = -1;
+static int   search_running_flag;
+static char  search_status[POD_NAME_LEN];   /* "no results", "NO NETWORK", etc. */
+
+static pod_search_result_t search_results[POD_SEARCH_MAX];
+static int search_result_n;
+
+void pod_search_start(const char *query) {
+    if (search_running_flag || !query || !query[0]) return;
+    unlink(SEARCH_LOG);
+    unlink(SEARCH_RESULTS);
+    search_result_n = 0;
+    search_status[0] = '\0';
+    pid_t pid = fork();
+    if (pid == 0) {
+        /* execl, not system()/popen() -- query reaches the script as a single
+         * argv element, never parsed by a shell, so anything the T9 keyboard
+         * can type (including '&', '?', quotes) is inert here regardless of
+         * content. */
+        execl("/bin/sh", "sh", SEARCH_SCRIPT, query, (char *)NULL);
+        _exit(127);
+    }
+    if (pid > 0) {
+        search_pid = pid;
+        search_running_flag = 1;
+    }
+}
+
+int pod_search_running(void) { return search_running_flag; }
+
+/* Parses the finished result file exactly once, the moment "__DONE__" shows
+ * up in the log -- same completion-marker convention pod_update_tail() uses,
+ * so a result file still being written by the script is never read half-done. */
+static void search_load_results(void) {
+    search_result_n = 0;
+    FILE *f = fopen(SEARCH_RESULTS, "r");
+    if (!f) return;
+    char line[600];
+    while (search_result_n < POD_SEARCH_MAX && fgets(line, sizeof(line), f)) {
+        char *nl = strchr(line, '\n'); if (nl) *nl = '\0';
+        char *p = line;
+        char *tab1 = strchr(p, '\t'); if (!tab1) continue;
+        *tab1 = '\0'; char *name = p; p = tab1 + 1;
+        if (strcmp(name, "result") != 0) continue;
+        char *tab2 = strchr(p, '\t'); if (!tab2) continue;
+        *tab2 = '\0'; char *title = p; p = tab2 + 1;
+        char *tab3 = strchr(p, '\t'); if (!tab3) continue;
+        *tab3 = '\0'; char *artist = p; char *url = tab3 + 1;
+        pod_search_result_t *r = &search_results[search_result_n];
+        snprintf(r->name, sizeof(r->name), "%s", title);
+        snprintf(r->artist, sizeof(r->artist), "%s", artist);
+        snprintf(r->url, sizeof(r->url), "%s", url);
+        search_result_n++;
+    }
+    fclose(f);
+}
+
+/* Last non-"__DONE__" log line, for the empty/error case ("no results",
+ * "NO NETWORK", "FAILED to reach iTunes Search") -- same log file the script
+ * writes progress to, just read for its final line instead of a tail. */
+static void search_load_status(void) {
+    search_status[0] = '\0';
+    FILE *f = fopen(SEARCH_LOG, "r");
+    if (!f) return;
+    char line[POD_NAME_LEN];
+    while (fgets(line, sizeof(line), f)) {
+        char *nl = strchr(line, '\n'); if (nl) *nl = '\0';
+        if (!line[0] || strcmp(line, "__DONE__") == 0) continue;
+        snprintf(search_status, sizeof(search_status), "%s", line);
+    }
+    fclose(f);
+}
+
+static int search_done_seen;
+
+/* Polls the running search. Returns 1 once it's finished and results are
+ * loaded, 0 while still running or nothing was ever started. Safe to call
+ * every frame, same as pod_download_poll(). */
+int pod_search_poll(void) {
+    if (!search_running_flag) return search_done_seen;
+    FILE *f = fopen(SEARCH_LOG, "r");
+    int done = 0;
+    if (f) {
+        char line[POD_NAME_LEN];
+        while (fgets(line, sizeof(line), f)) {
+            char *nl = strchr(line, '\n'); if (nl) *nl = '\0';
+            if (strcmp(line, "__DONE__") == 0) { done = 1; break; }
+        }
+        fclose(f);
+    }
+    if (!done) return 0;
+    search_running_flag = 0;
+    search_done_seen = 1;
+    if (search_pid > 0) { int st; waitpid(search_pid, &st, 0); search_pid = -1; }
+    search_load_results();
+    search_load_status();
+    return 1;
+}
+
+int pod_search_result_n(void) { return search_result_n; }
+
+const pod_search_result_t *pod_search_result(int i) {
+    if (i < 0 || i >= search_result_n) return NULL;
+    return &search_results[i];
+}
+
+const char *pod_search_status(void) { return search_status; }
+
+/* True if this feed URL is already present in settings.txt's Podcasts
+ * section -- checked before subscribing so tapping the same search result
+ * twice (or a feed the user already added by hand) doesn't duplicate the
+ * line pod_sync_feeds_from_settings() will read on the next sync. */
+static int podcasts_section_has_url(const char *url) {
+    FILE *f = fopen(SETTINGS_PATH, "r");
+    if (!f) return 0;
+    char line[512];
+    int in_section = 0, found = 0;
+    while (fgets(line, sizeof(line), f)) {
+        char *nl = strchr(line, '\n'); if (nl) *nl = '\0';
+        char *cr = strchr(line, '\r'); if (cr) *cr = '\0';
+        char *s = line;
+        while (*s == ' ' || *s == '\t') s++;
+        if (!in_section) {
+            if (!strcmp(s, "Podcasts")) in_section = 1;
+            continue;
+        }
+        if (s[0] == '\0') break;
+        if (s[0] == '#') continue;
+        if (!strcmp(s, url)) { found = 1; break; }
+    }
+    fclose(f);
+    return found;
+}
+
+/* Appends a feed URL to settings.txt's Podcasts section -- the real source
+ * of truth per R64, so this is the only file a subscribe needs to touch;
+ * pod_sync_feeds_from_settings() (already called by pod_update_start(), via
+ * the same code path a manual Sync uses) regenerates feeds.txt from it.
+ * Returns 1 on a genuinely new subscription, 0 if it was already there
+ * (not an error -- just nothing to do). */
+int pod_subscribe(const char *url) {
+    if (!url || !url[0]) return 0;
+    if (podcasts_section_has_url(url)) return 0;
+
+    FILE *in = fopen(SETTINGS_PATH, "r");
+    char tmp_path[300];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.new", SETTINGS_PATH);
+    FILE *out = fopen(tmp_path, "w");
+    if (!out) { if (in) fclose(in); return 0; }
+
+    int in_section = 0, header_seen = 0, inserted = 0;
+    char line[512];
+    if (in) {
+        while (fgets(line, sizeof(line), in)) {
+            char *nl = strchr(line, '\n'); if (nl) *nl = '\0';
+            char *s = line;
+            while (*s == ' ' || *s == '\t') s++;
+            if (!in_section) {
+                if (!strcmp(s, "Podcasts")) { in_section = 1; header_seen = 1; }
+                fprintf(out, "%s\n", line);
+                continue;
+            }
+            /* Blank line ends the section (same convention every other
+             * section already uses) -- insert just before it. */
+            if (s[0] == '\0' && !inserted) {
+                fprintf(out, "%s\n", url);
+                inserted = 1;
+            }
+            fprintf(out, "%s\n", line);
+            if (s[0] == '\0') in_section = 0;
+        }
+        fclose(in);
+    }
+    /* The section ran to EOF with no trailing blank line (it was the last
+     * section in the file, e.g. settings.txt.example's own layout). */
+    if (in_section && !inserted) { fprintf(out, "%s\n", url); inserted = 1; }
+    /* No Podcasts section existed at all -- add one, same three-line shape
+     * settings.txt.example ships (header, one comment, then URLs). */
+    if (!header_seen) {
+        fprintf(out, "\nPodcasts\n"
+                     "# One RSS feed URL per line. Regenerated into .podsync/feeds.txt every time\n"
+                     "# Update feeds is pressed -- edit here, not feeds.txt directly.\n"
+                     "%s\n", url);
+    }
+    fclose(out);
+    rename(tmp_path, SETTINGS_PATH);
+
+    pod_sync_feeds_from_settings();
+    return 1;
+}
+
 /* ---- show notes ---------------------------------------------------------- */
 
 int pod_load_notes(const char *audio_path, char *out, int max_len) {
