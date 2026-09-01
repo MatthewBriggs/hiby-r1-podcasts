@@ -367,6 +367,65 @@ HEALTHY_RUN=60          # seconds up before a run counts as a success
 # "already mounted" on a crash-restart is fine to ignore.
 mount -t exfat /dev/mmcblk0p1 /data/mnt/sd_0 2>/dev/null
 
+# USB role, switchable from the SD card.
+#
+# The Type-C controller's role is set by /sys/devices/platform/tcs1421/
+# tcs1421_cfg (Sink / Source / StrongDRP / NormalDRP). "Source" makes this
+# board a USB HOST, which is what an OTG peripheral needs -- but it also
+# stops the board being a USB *device*, so adb disappears entirely.
+#
+# That is a trap when the only way in is adb: a bad value on internal
+# storage locks you out, and a firmware flash does NOT clear it because
+# /usr/data is deliberately preserved. So the control lives on the SD
+# CARD, which can always be read in any card reader.
+#
+# Write one word into /data/mnt/sd_0/usb-mode.txt:
+#     device  (or missing/anything else) -> NormalDRP, adb works [DEFAULT]
+#     otg     (or host)                  -> Source, USB host for peripherals
+#
+# Defaulting to device-mode on an absent/unreadable file is deliberate:
+# the failure mode of a lost card or a typo must be "adb still works".
+USB_MODE_FILE="/data/mnt/sd_0/usb-mode.txt"
+TCS_CFG="/sys/devices/platform/tcs1421/tcs1421_cfg"
+if [ -w "$TCS_CFG" ]; then
+    USB_MODE="device"
+    [ -f "$USB_MODE_FILE" ] && USB_MODE=$(cat "$USB_MODE_FILE" 2>/dev/null | tr -d " \t\r\n")
+    case "$USB_MODE" in
+        otg|host|OTG|HOST) USB_WANT="Source" ;;
+        *)                 USB_WANT="NormalDRP" ;;
+    esac
+    # ONLY write when the value actually differs. Writing this attribute
+    # re-drives the Type-C strap GPIOs and forces a USB re-attach even when
+    # writing the value already held -- doing that unconditionally at boot
+    # races adbd binding its gadget and can leave USB dead. Stock default is
+    # already NormalDRP, so the common path must be a no-op, not a rewrite.
+    USB_HAVE=$(cat "$TCS_CFG" 2>/dev/null)
+    if [ "$USB_HAVE" != "$USB_WANT" ]; then
+        echo "$USB_WANT" > "$TCS_CFG" 2>/dev/null
+    fi
+fi
+
+# Stale user-init guard. /usr/data survives firmware flashes, so a script
+# left there can persist across every recovery attempt. If the SD card
+# carries the file below, remove it -- the only lever that reaches internal
+# storage when adb is unavailable.
+[ -f /data/mnt/sd_0/reset-init-sh ] && rm -f /usr/data/init.sh
+
+# Boot breadcrumb to the SD card. USB is the only channel in, so when it
+# fails there is otherwise no way to see how far boot got. Overwritten each
+# boot; costs one small write.
+{{
+    echo "boot $(date)"
+    echo "  tcs1421_cfg = $(cat /sys/devices/platform/tcs1421/tcs1421_cfg 2>/dev/null)"
+    echo "  usb-mode.txt = $(cat /data/mnt/sd_0/usb-mode.txt 2>/dev/null)"
+    echo "  udc         = $(ls /sys/class/udc/ 2>/dev/null)"
+    echo "  adb gadget  = [$(cat /sys/kernel/config/usb_gadget/adb_demo/UDC 2>/dev/null)]"
+    echo "  mass gadget = [$(cat /sys/kernel/config/usb_gadget/android0/UDC 2>/dev/null)]"
+    echo "  adbd running= $(ps 2>/dev/null | grep -c "[a]dbd")"
+    echo "  init.sh     = $([ -f /usr/data/init.sh ] && echo present || echo absent)"
+    echo "  kernel      = $(cat /usr/resource/kernel_build_id 2>/dev/null) / $(uname -r)"
+}} > /data/mnt/sd_0/boot-state.txt 2>&1
+
 USER_INIT="/usr/data/init.sh"
 
 [ -f "$USER_INIT" ] && sh "$USER_INIT" >/dev/null 2>&1 &
