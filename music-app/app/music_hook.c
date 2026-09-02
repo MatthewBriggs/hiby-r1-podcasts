@@ -4364,9 +4364,18 @@ static void draw_screen(uint16_t *fb) {
             /* R70 step 1: FB_W - 150, not the usual FB_W - 110 every other
              * duration-bearing row uses -- 40px carved out on the right for
              * the grip below (12px icon + margin either side), so a long
-             * title doesn't draw underneath it before eliding. */
+             * title doesn't draw underneath it before eliding.
+             *
+             * BUG fix: the right_edge clip bound has to shift by dx0 right
+             * alongside x, or it doesn't -- x moves but the window it's
+             * being clipped against stays put, so the available width
+             * shrinks as the row slides and the title vanishes well before
+             * reaching the delete threshold (reported live as "goes
+             * completely accent colour"). Shifting both keeps the same
+             * window, just moved, so the row's own text reads exactly as it
+             * always did throughout the swipe -- only its position changes. */
             draw_text_clip(fb, 24 + dx0, y + 20, t->name, playing ? COL_ACCENT : COL_TEXT,
-                          TEXT_PX_BODY, FB_W - 150, CONTENT_Y, clip_bot);
+                          TEXT_PX_BODY, FB_W - 150 + dx0, CONTENT_Y, clip_bot);
             if (t->dur_ms > 0) {
                 char b[16];
                 fmt_dur(b, sizeof(b), t->dur_ms);
@@ -4375,7 +4384,7 @@ static void draw_screen(uint16_t *fb) {
                  * uses, just shifted left by the grip's own reserved column. */
                 int right = FB_W - 24 - (index_visible() ? INDEX_W : 0) - 40;
                 draw_text_clip(fb, right - bw + dx0, y + 22, b, COL_DIM, TEXT_PX_SMALL,
-                               FB_W, CONTENT_Y, clip_bot);
+                               FB_W + dx0, CONTENT_Y, clip_bot);
             }
             /* R70: the drag handle -- accent while this exact row is the one
              * being dragged, same as the rest of dragging_this's highlight. */
@@ -6169,6 +6178,18 @@ static int go_back(void) {
                 scroll = 0;
                 scroll_px = 0;
                 load_page();
+            } else if (queue_n == 0) {
+                /* R70 fix: reported live as a blank white-looking screen --
+                 * SC_PLAYING's own draw code already bails out cleanly on an
+                 * empty queue (`if (!t) return;`), but draw_screen()'s
+                 * unconditional top-of-frame fill_rect(..., COL_BG) still
+                 * runs first, so "bails out cleanly" looked like "nothing
+                 * but a blank background, no way back". Swiping away every
+                 * track leaves genuinely nothing to play (queue_remove_
+                 * display() already called audio_stop() on the way here),
+                 * so there's no "now playing" to show regardless -- land on
+                 * the main menu instead of a screen with nothing on it. */
+                screen = SC_MENU; reset_scroll();
             } else {
                 screen = SC_PLAYING; reset_scroll();
             }
