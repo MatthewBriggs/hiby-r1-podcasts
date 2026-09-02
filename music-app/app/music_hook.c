@@ -2404,6 +2404,17 @@ static int  queue_via_back;
 static int  queue_drag_active;
 static int  queue_drag_display_i;   /* current slot of the row being dragged */
 static int  queue_drag_grab_dy;     /* touch_y minus the row's own top, at grab time */
+
+/* R70: swipe-to-remove, on the row body rather than the grip -- a touch
+ * starting anywhere on a row except the grip zone is a swipe candidate
+ * until movement commits it one way or the other (mirrors
+ * edge_zone_ambiguous's own "still could become either" reasoning). Once
+ * horizontal travel is clearly leading, it can never become a reorder-drag
+ * (grip-only) or a list scroll (vertical-only) -- it already isn't either,
+ * having started off the grip. */
+static int  queue_swipe_active;
+static int  queue_swipe_display_i;
+static int  queue_swipe_dx;         /* live_x - touch_x while active, signed */
 static char cur_artist[LIB_NAME_LEN];
 static char cur_album[LIB_NAME_LEN];
 /* BG73: whether cur_artist/cur_album (whatever's currently loaded into
@@ -3375,6 +3386,53 @@ static void queue_follower(void) {
     audio_set_next((!radio_mode && nxt >= 0) ? queue[nxt].path : NULL);
 }
 
+static void play_index(int i);
+
+/* R70: swipe-to-remove. Physically deletes from queue[] regardless of
+ * shuffle -- shuffle_order[] only ever holds *display* order for a queue[]
+ * that still exists, so a real removal has to shrink queue[] itself either
+ * way. That alone leaves shuffle_n one behind the new (smaller) queue_n,
+ * which queue_display_index()'s existing lazy check already treats as
+ * "regenerate" -- the same mechanism next_track_index() relies on, not a
+ * separate fix needed here.
+ *
+ * Removing the row that's actually playing needed a decision (see R70's own
+ * open question in BACKLOG.md): picked auto-advance, closing the gap and
+ * continuing with whatever now sits in that same display slot -- the
+ * convention every mainstream player already uses, and the one place a
+ * repeat-one edge case gets simplified deliberately: this is "the current
+ * entry is gone", not "the current entry finished", so it always moves on
+ * by one slot rather than consulting repeat_mode/next_track_index() (which
+ * would hand back the very index just removed under repeat-one). */
+static void queue_remove_display(int display_i) {
+    if (display_i < 0 || display_i >= queue_n) return;
+    int idx = queue_display_index(display_i);
+    if (idx < 0) return;
+    int removing_playing = audio_is_active() && idx == cur_track;
+    char keep_path[LIB_PATH_LEN];
+    keep_path[0] = '\0';
+    if (!removing_playing && cur_track >= 0 && cur_track < queue_n)
+        snprintf(keep_path, sizeof(keep_path), "%s", queue[cur_track].path);
+
+    for (int i = idx; i < queue_n - 1; i++) queue[i] = queue[i + 1];
+    queue_n--;
+
+    if (removing_playing) {
+        if (queue_n == 0) {
+            audio_stop();
+            cur_track = -1;
+        } else {
+            int new_display_i = display_i < queue_n ? display_i : queue_n - 1;
+            int new_idx = queue_display_index(new_display_i);
+            if (new_idx < 0 || new_idx >= queue_n) new_idx = 0;
+            play_index(new_idx);
+        }
+    } else if (keep_path[0]) {
+        for (int i = 0; i < queue_n; i++)
+            if (!strcmp(queue[i].path, keep_path)) { cur_track = i; break; }
+    }
+}
+
 static void play_index(int i) {
     radio_mode = 0;
     audiobook_mode = 0;
@@ -4282,7 +4340,19 @@ static void draw_screen(uint16_t *fb) {
              * full-width accent edge rather than playing's 4px one, so the
              * two never look identical if a track happens to be both. */
             int dragging_this = queue_drag_active && display_i == queue_drag_display_i;
-            if (playing) {
+            /* R70: the row currently being swiped -- dx0 shifts every piece
+             * of its own content horizontally as the finger moves, revealing
+             * COL_ACCENT (drawn first, full row, unshifted) in the space the
+             * content used to cover. Mutually exclusive with dragging_this
+             * by construction (grip-only vs. body-only starts), but not with
+             * playing -- suppressed there deliberately: mid-swipe is a more
+             * urgent state than "this is playing", and showing both accent
+             * treatments overlapping would just look like a rendering bug. */
+            int swiping_this = queue_swipe_active && display_i == queue_swipe_display_i;
+            int dx0 = swiping_this ? queue_swipe_dx : 0;
+            if (swiping_this)
+                fill_rect_clip(fb, 0, y, FB_W, ROW_H, COL_ACCENT, CONTENT_Y, clip_bot);
+            if (playing && !swiping_this) {
                 fill_rect_clip(fb, 0, y, FB_W, ROW_H, COL_ROW, CONTENT_Y, clip_bot);
                 fill_rect_clip(fb, 0, y, 4, ROW_H, COL_ACCENT, CONTENT_Y, clip_bot);
             }
@@ -4295,7 +4365,7 @@ static void draw_screen(uint16_t *fb) {
              * duration-bearing row uses -- 40px carved out on the right for
              * the grip below (12px icon + margin either side), so a long
              * title doesn't draw underneath it before eliding. */
-            draw_text_clip(fb, 24, y + 20, t->name, playing ? COL_ACCENT : COL_TEXT,
+            draw_text_clip(fb, 24 + dx0, y + 20, t->name, playing ? COL_ACCENT : COL_TEXT,
                           TEXT_PX_BODY, FB_W - 150, CONTENT_Y, clip_bot);
             if (t->dur_ms > 0) {
                 char b[16];
@@ -4304,12 +4374,12 @@ static void draw_screen(uint16_t *fb) {
                 /* Same right margin (24px, minus the index strip) draw_right_clip()
                  * uses, just shifted left by the grip's own reserved column. */
                 int right = FB_W - 24 - (index_visible() ? INDEX_W : 0) - 40;
-                draw_text_clip(fb, right - bw, y + 22, b, COL_DIM, TEXT_PX_SMALL,
+                draw_text_clip(fb, right - bw + dx0, y + 22, b, COL_DIM, TEXT_PX_SMALL,
                                FB_W, CONTENT_Y, clip_bot);
             }
             /* R70: the drag handle -- accent while this exact row is the one
              * being dragged, same as the rest of dragging_this's highlight. */
-            draw_grip_icon_clip(fb, FB_W - 24 - (index_visible() ? INDEX_W : 0) - 16,
+            draw_grip_icon_clip(fb, FB_W - 24 - (index_visible() ? INDEX_W : 0) - 16 + dx0,
                                  y + (ROW_H - 24) / 2,
                                  (playing || dragging_this) ? COL_ACCENT : COL_DIM, CONTENT_Y, clip_bot);
             /* BUG fix: this 1px COL_LINE separator used to draw unconditionally,
@@ -4318,8 +4388,10 @@ static void draw_screen(uint16_t *fb) {
              * a clean 2px while the bottom read as 1px of accent plus 1px of
              * grey, visibly thinner. The accent border already marks this row's
              * bottom edge, so the plain separator is redundant here, not just
-             * harmless to skip. */
-            if (!dragging_this)
+             * harmless to skip. Same reasoning extends to swiping_this: a
+             * grey line cutting across a full-row accent reveal would read
+             * as a rendering glitch, not a deliberate row boundary. */
+            if (!dragging_this && !swiping_this)
                 fill_rect_clip(fb, 0, y + ROW_H - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
             y += ROW_H;
         }
@@ -8847,15 +8919,19 @@ int music_entry(void *a0, void *a1) {
                     if (audio_is_active()) screen = SC_PLAYING;
                     else if (!radio_msg[0])
                         snprintf(radio_msg, sizeof(radio_msg), "Could not reach that station");
-                } else if (screen == SC_QUEUE && idx >= 0 && scroll + idx < queue_n && !queue_drag_active) {
-                    /* R70: queue_drag_active is still true here on the exact
-                     * tick a grip-drag ends -- it only clears later this same
-                     * tick, in the live-tracking block further down -- so
-                     * this guard is really "was this release the end of a
-                     * drag", not "is a drag starting right now". Without it,
-                     * releasing a dragged row over its new slot also read as
-                     * a tap on whatever ended up there and started playing
-                     * it, which is not what letting go of a drag means. */
+                } else if (screen == SC_QUEUE && idx >= 0 && scroll + idx < queue_n &&
+                           !queue_drag_active && !queue_swipe_active) {
+                    /* R70: queue_drag_active/queue_swipe_active are still true
+                     * here on the exact tick a drag or swipe ends -- they only
+                     * clear later this same tick, in the live-tracking block
+                     * further down -- so this guard really means "was this
+                     * release the end of a drag or swipe", not "is one
+                     * starting right now". Without it, releasing a dragged
+                     * row over its new slot (or a swipe that sprang back
+                     * short of the delete threshold) also read as a tap on
+                     * whatever track was under the finger and started
+                     * playing it, which is not what letting go of either
+                     * gesture means. */
                     int qidx = queue_display_index(scroll + idx);
                     if (qidx >= 0) {
                         audio_set_speed(1000);
@@ -9235,8 +9311,9 @@ int music_entry(void *a0, void *a1) {
             int grip_x0 = FB_W - 24 - (index_visible() ? INDEX_W : 0) - 32;
             int list_top = CONTENT_Y + QUEUE_SUMMARY_H;
             int press_display_i = (touch_y - list_top) / ROW_H + scroll;
-            int grip_hit = touch_x >= grip_x0 && touch_y >= list_top &&
-                           press_display_i >= 0 && press_display_i < queue_n;
+            int valid_row = touch_y >= list_top &&
+                            press_display_i >= 0 && press_display_i < queue_n;
+            int grip_hit = valid_row && touch_x >= grip_x0;
             int was_qdrag = queue_drag_active;
             queue_drag_active = touch_down && grip_hit;
             if (queue_drag_active && !was_qdrag) {
@@ -9262,8 +9339,41 @@ int music_entry(void *a0, void *a1) {
                     dirty = 1;
                 }
             }
+
+            /* R70: swipe-to-remove. Only a candidate when the press wasn't
+             * on the grip (grip always means reorder, never delete), and
+             * only actually latches once horizontal travel clearly leads
+             * vertical -- an ordinary vertical scroll started on a row's
+             * body must never be mistaken for the start of a delete swipe.
+             * Once latched it stays latched for the rest of the gesture
+             * (queue_swipe_active persists below rather than being
+             * recomputed from live_x/live_y every tick), the same "can't
+             * un-become itself mid-drag" shape edge_active already has. */
+            if (!queue_swipe_active && touch_down && valid_row && !grip_hit) {
+                int dx = live_x - touch_x, dy = live_y - touch_y;
+                if (abs(dx) > abs(dy) && abs(dx) > 10) {
+                    queue_swipe_active = 1;
+                    queue_swipe_display_i = press_display_i;
+                }
+            }
+            if (queue_swipe_active) {
+                if (!touch_down) {
+                    /* 120px, not a fraction of FB_W -- a swipe threshold that
+                     * scales with screen width would need retuning on every
+                     * device this ever ran on; a fixed distance doesn't. */
+                    if (queue_swipe_dx <= -120 || queue_swipe_dx >= 120)
+                        queue_remove_display(queue_swipe_display_i);
+                    queue_swipe_active = 0;
+                    queue_swipe_dx = 0;
+                } else {
+                    queue_swipe_dx = live_x - touch_x;
+                }
+                dirty = 1;
+            }
         } else {
             queue_drag_active = 0;
+            queue_swipe_active = 0;
+            queue_swipe_dx = 0;
         }
 
         /* List scrolling: tracked live, one pixel at a time, rather than
@@ -9310,7 +9420,7 @@ int music_entry(void *a0, void *a1) {
                                        abs(live_x - touch_x) >= abs(live_y - touch_y);
             int was = list_dragging;
             list_dragging = touch_down && scrollable && !index_active &&
-                            !scrub_active && !qs_open && !queue_drag_active &&
+                            !scrub_active && !qs_open && !queue_drag_active && !queue_swipe_active &&
                             touch_y >= drag_top && !edge_active && !edge_zone_ambiguous;
             if (list_dragging && !was) {
                 /* A raw drag on the list itself is free browsing, not bound
