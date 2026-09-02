@@ -2391,6 +2391,19 @@ static int  queue_mixed;
  * goes nowhere. Sourcing SC_QUEUE from two different gestures means "back"
  * out of it has to know which one got it there -- set on both entries. */
 static int  queue_via_back;
+
+/* R70: drag-to-reorder via the grip handle. queue_drag_active is gated on
+ * the touch having started inside the grip's own hit zone -- touch_x/
+ * touch_y are fixed at the press location for the life of a gesture (see
+ * the raw touch reader), so testing them once here at press time and again
+ * every tick afterward is the same test, no separate "just pressed" edge
+ * needed. Audiobooks never reach this: their own queue button goes
+ * straight to go_back() into the chapter list (SC_TRACKS), never SC_QUEUE
+ * -- see that call site's own comment -- so no explicit exclusion is
+ * needed here either. */
+static int  queue_drag_active;
+static int  queue_drag_display_i;   /* current slot of the row being dragged */
+static int  queue_drag_grab_dy;     /* touch_y minus the row's own top, at grab time */
 static char cur_artist[LIB_NAME_LEN];
 static char cur_album[LIB_NAME_LEN];
 /* BG73: whether cur_artist/cur_album (whatever's currently loaded into
@@ -3258,6 +3271,37 @@ static void shuffle_regenerate(void) {
 static int shuffle_find_pos(int idx) {
     for (int i = 0; i < shuffle_n; i++) if (shuffle_order[i] == idx) return i;
     return -1;
+}
+
+/* R70: moves the track at display position `from` to display position `to`,
+ * shifting whatever's between them -- shuffle_order[] when shuffle's on
+ * (same branch queue_display_index() below uses, so this always reorders
+ * whatever the screen is actually showing), queue[] directly otherwise.
+ * queue[] is also cur_track's own index space, so a direct reorder there
+ * has to carry cur_track along with whichever physical slot the playing
+ * track ends up in -- tracked by path rather than by hand-rolling the
+ * index arithmetic a shift-by-one would need, since a wrong index here
+ * plays the wrong track outright rather than just displaying one. */
+static void queue_move_display(int from, int to) {
+    if (from == to || from < 0 || to < 0 || from >= queue_n || to >= queue_n) return;
+    if (shuffle_enabled) {
+        if (shuffle_n != queue_n) shuffle_regenerate();
+        int v = shuffle_order[from];
+        if (from < to) for (int i = from; i < to; i++) shuffle_order[i] = shuffle_order[i + 1];
+        else            for (int i = from; i > to; i--) shuffle_order[i] = shuffle_order[i - 1];
+        shuffle_order[to] = v;
+    } else {
+        char playing_path[LIB_PATH_LEN];
+        int had_playing = cur_track >= 0 && cur_track < queue_n;
+        if (had_playing) snprintf(playing_path, sizeof(playing_path), "%s", queue[cur_track].path);
+        lib_track_t v = queue[from];
+        if (from < to) for (int i = from; i < to; i++) queue[i] = queue[i + 1];
+        else            for (int i = from; i > to; i--) queue[i] = queue[i - 1];
+        queue[to] = v;
+        if (had_playing)
+            for (int i = 0; i < queue_n; i++)
+                if (!strcmp(queue[i].path, playing_path)) { cur_track = i; break; }
+    }
 }
 
 /* -1 means "nothing plays next" -- callers already treat that as a no-op,
@@ -4232,9 +4276,20 @@ static void draw_screen(uint16_t *fb) {
             if (idx < 0) break;
             lib_track_t *t = &queue[idx];
             int playing = audio_is_active() && idx == cur_track;
+            /* R70: the row currently under the grip -- same highlight shape
+             * as "playing" (full-row fill plus an accent edge), so a
+             * dragged row is unmistakable as it snaps between slots, but a
+             * full-width accent edge rather than playing's 4px one, so the
+             * two never look identical if a track happens to be both. */
+            int dragging_this = queue_drag_active && display_i == queue_drag_display_i;
             if (playing) {
                 fill_rect_clip(fb, 0, y, FB_W, ROW_H, COL_ROW, CONTENT_Y, clip_bot);
                 fill_rect_clip(fb, 0, y, 4, ROW_H, COL_ACCENT, CONTENT_Y, clip_bot);
+            }
+            if (dragging_this) {
+                if (!playing) fill_rect_clip(fb, 0, y, FB_W, ROW_H, COL_ROW, CONTENT_Y, clip_bot);
+                fill_rect_clip(fb, 0, y, FB_W, 2, COL_ACCENT, CONTENT_Y, clip_bot);
+                fill_rect_clip(fb, 0, y + ROW_H - 2, FB_W, 2, COL_ACCENT, CONTENT_Y, clip_bot);
             }
             /* R70 step 1: FB_W - 150, not the usual FB_W - 110 every other
              * duration-bearing row uses -- 40px carved out on the right for
@@ -4252,12 +4307,11 @@ static void draw_screen(uint16_t *fb) {
                 draw_text_clip(fb, right - bw, y + 22, b, COL_DIM, TEXT_PX_SMALL,
                                FB_W, CONTENT_Y, clip_bot);
             }
-            /* R70 step 1: the drag handle itself -- not yet wired to anything
-             * (see this loop's own BG71 comment for the reorder plan), just
-             * marking where dragging a row will grab once it is. */
+            /* R70: the drag handle -- accent while this exact row is the one
+             * being dragged, same as the rest of dragging_this's highlight. */
             draw_grip_icon_clip(fb, FB_W - 24 - (index_visible() ? INDEX_W : 0) - 16,
                                  y + (ROW_H - 24) / 2,
-                                 playing ? COL_ACCENT : COL_DIM, CONTENT_Y, clip_bot);
+                                 (playing || dragging_this) ? COL_ACCENT : COL_DIM, CONTENT_Y, clip_bot);
             fill_rect_clip(fb, 0, y + ROW_H - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
             y += ROW_H;
         }
@@ -8753,7 +8807,15 @@ int music_entry(void *a0, void *a1) {
                     if (audio_is_active()) screen = SC_PLAYING;
                     else if (!radio_msg[0])
                         snprintf(radio_msg, sizeof(radio_msg), "Could not reach that station");
-                } else if (screen == SC_QUEUE && idx >= 0 && scroll + idx < queue_n) {
+                } else if (screen == SC_QUEUE && idx >= 0 && scroll + idx < queue_n && !queue_drag_active) {
+                    /* R70: queue_drag_active is still true here on the exact
+                     * tick a grip-drag ends -- it only clears later this same
+                     * tick, in the live-tracking block further down -- so
+                     * this guard is really "was this release the end of a
+                     * drag", not "is a drag starting right now". Without it,
+                     * releasing a dragged row over its new slot also read as
+                     * a tap on whatever ended up there and started playing
+                     * it, which is not what letting go of a drag means. */
                     int qidx = queue_display_index(scroll + idx);
                     if (qidx >= 0) {
                         audio_set_speed(1000);
@@ -9121,6 +9183,49 @@ int music_entry(void *a0, void *a1) {
             }
         }
 
+        /* R70: drag-to-reorder, via the grip handle -- checked ahead of List
+         * scrolling below so a grip-drag can suppress the ordinary scroll
+         * drag entirely (queue_drag_active feeds into scrollable's own
+         * condition further down), the same way scrub_active/qs_open
+         * already do for their own drags. touch_x/touch_y are fixed at
+         * the press location for the whole gesture (see the raw touch
+         * reader), so this hit test is stable for as long as the touch
+         * lasts -- no separate "just pressed" transition to track. */
+        if (screen == SC_QUEUE) {
+            int grip_x0 = FB_W - 24 - (index_visible() ? INDEX_W : 0) - 32;
+            int list_top = CONTENT_Y + QUEUE_SUMMARY_H;
+            int press_display_i = (touch_y - list_top) / ROW_H + scroll;
+            int grip_hit = touch_x >= grip_x0 && touch_y >= list_top &&
+                           press_display_i >= 0 && press_display_i < queue_n;
+            int was_qdrag = queue_drag_active;
+            queue_drag_active = touch_down && grip_hit;
+            if (queue_drag_active && !was_qdrag) {
+                queue_drag_display_i = press_display_i;
+                queue_drag_grab_dy = touch_y - (list_top + (press_display_i - scroll) * ROW_H);
+                dirty = 1;
+            } else if (!queue_drag_active && was_qdrag) {
+                dirty = 1;   /* release: clear the highlight */
+            } else if (queue_drag_active) {
+                int ghost_top = live_y - queue_drag_grab_dy;
+                int slot_top  = list_top + (queue_drag_display_i - scroll) * ROW_H;
+                /* Only re-target once the finger has crossed into a new
+                 * slot's own span, not merely nudged the current one --
+                 * rounding to the nearest row would flip the target the
+                 * instant the finger passed a row's midpoint in either
+                 * direction, which reads as flickery rather than deliberate. */
+                int target = queue_drag_display_i;
+                if (ghost_top < slot_top - ROW_H / 2 && target > 0) target--;
+                else if (ghost_top > slot_top + ROW_H / 2 && target < queue_n - 1) target++;
+                if (target != queue_drag_display_i) {
+                    queue_move_display(queue_drag_display_i, target);
+                    queue_drag_display_i = target;
+                    dirty = 1;
+                }
+            }
+        } else {
+            queue_drag_active = 0;
+        }
+
         /* List scrolling: tracked live, one pixel at a time, rather than
          * jumping by whatever whole number of rows the release distance
          * happened to divide into — which is where "four items at a time"
@@ -9165,7 +9270,7 @@ int music_entry(void *a0, void *a1) {
                                        abs(live_x - touch_x) >= abs(live_y - touch_y);
             int was = list_dragging;
             list_dragging = touch_down && scrollable && !index_active &&
-                            !scrub_active && !qs_open &&
+                            !scrub_active && !qs_open && !queue_drag_active &&
                             touch_y >= drag_top && !edge_active && !edge_zone_ambiguous;
             if (list_dragging && !was) {
                 /* A raw drag on the list itself is free browsing, not bound
