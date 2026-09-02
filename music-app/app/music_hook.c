@@ -4312,7 +4312,15 @@ static void draw_screen(uint16_t *fb) {
             draw_grip_icon_clip(fb, FB_W - 24 - (index_visible() ? INDEX_W : 0) - 16,
                                  y + (ROW_H - 24) / 2,
                                  (playing || dragging_this) ? COL_ACCENT : COL_DIM, CONTENT_Y, clip_bot);
-            fill_rect_clip(fb, 0, y + ROW_H - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
+            /* BUG fix: this 1px COL_LINE separator used to draw unconditionally,
+             * landing right on top of dragging_this's own 2px bottom accent
+             * border and painting over its last pixel -- the top border stayed
+             * a clean 2px while the bottom read as 1px of accent plus 1px of
+             * grey, visibly thinner. The accent border already marks this row's
+             * bottom edge, so the plain separator is redundant here, not just
+             * harmless to skip. */
+            if (!dragging_this)
+                fill_rect_clip(fb, 0, y + ROW_H - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
             y += ROW_H;
         }
         if (mini_visible()) draw_mini(fb);
@@ -5910,9 +5918,41 @@ static int go_back(void) {
             }
             /* Straight from the queue copy — no second trip to the database,
              * and it is right even if the browser has wandered off. For a
-             * book the queue is its chapters, so this is the chapter list. */
-            memcpy(tracks, queue, sizeof(queue[0]) * (size_t)queue_n);
-            track_n = queue_n;
+             * book the queue is its chapters, so this is the chapter list.
+             *
+             * R70 fix: a plain album is the one exception -- it re-queries
+             * fresh instead, so a queue reorder can't leak into what's
+             * supposed to be the album's own stable, tag/DB-derived order.
+             * Reported live as "One Vision" (from A Kind of Magic, no less)
+             * appearing to move within the *album* itself after being
+             * dragged in the Queue screen -- nothing on disk or in the SQL
+             * index was actually touched (R70's reorder only ever mutates
+             * queue[]/shuffle_order[] in memory), but handing that reordered
+             * queue[] to tracks[] via a plain memcpy and presenting it as
+             * the album's own browsable order is a real display bug
+             * regardless of what's true underneath. Playlists/chapters/
+             * episodes still take the memcpy below: a playlist's queue *is*
+             * its order (and per R70 a reorder there is meant to end up
+             * persisted, not routed around), and there's no equivalent
+             * fresh query this cheap for chapters or episodes.
+             *
+             * cur_track indexes into tracks[] everywhere below this (see
+             * BG73's own comment on tracks[cur_track] a little further down)
+             * -- after a fresh query, tracks[] is a different array in a
+             * different order than queue[], so cur_track has to be remapped
+             * by path rather than carried over as a raw index. */
+            if (!audiobook_mode && !podcast_mode && !q_is_playlist) {
+                char playing_path[LIB_PATH_LEN];
+                snprintf(playing_path, sizeof(playing_path), "%s",
+                         (cur_track >= 0 && cur_track < queue_n) ? queue[cur_track].path : "");
+                track_n = lib_tracks_for_album(q_artist, q_album, tracks,
+                                               (int)(sizeof(tracks) / sizeof(tracks[0])), 0);
+                for (int i = 0; i < track_n; i++)
+                    if (!strcmp(tracks[i].path, playing_path)) { cur_track = i; break; }
+            } else {
+                memcpy(tracks, queue, sizeof(queue[0]) * (size_t)queue_n);
+                track_n = queue_n;
+            }
             snprintf(cur_artist, sizeof(cur_artist), "%s", q_artist);
             snprintf(cur_album,  sizeof(cur_album),  "%s", q_album);
             /* BG73: this view *is* the queue, so whether it's a playlist is
