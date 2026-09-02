@@ -3803,6 +3803,28 @@ static void draw_queue_icon(uint16_t *fb, int x, int y, uint16_t c) {
     fill_triangle(fb, x + 23, y + 17, 13, +1, c);
 }
 
+/* R70 step 1: the reorder handle -- six dots, two columns of three, the same
+ * "grab here to drag" glyph most touch UIs already use for a reorderable
+ * list, so it needs no label to read as "drag this row" at a glance. Visual
+ * only for now: draw_grip_icon() just marks where a drag will start once R70
+ * actually wires one up (not yet -- see SC_QUEUE's own row-drawing comment).
+ * (x, y) is the icon's top-left; 12x24 overall (two 4px dots per row, 4px
+ * gaps both ways). */
+static void draw_grip_icon(uint16_t *fb, int x, int y, uint16_t c) {
+    for (int row = 0; row < 3; row++)
+        for (int col = 0; col < 2; col++)
+            fill_rect(fb, x + col * 8, y + row * 10, 4, 4, c);
+}
+
+/* Clipped, for SC_QUEUE's scrolling list -- same reasoning as
+ * fill_rect_clip() next to fill_rect() throughout this file. */
+static void draw_grip_icon_clip(uint16_t *fb, int x, int y, uint16_t c,
+                                 int clip_top, int clip_bot) {
+    for (int row = 0; row < 3; row++)
+        for (int col = 0; col < 2; col++)
+            fill_rect_clip(fb, x + col * 8, y + row * 10, 4, 4, c, clip_top, clip_bot);
+}
+
 /* Body and cone, proportioned to match -- the version this replaced paired a
  * 16px triangle with a 7px box. Two shapes, same as the bluetooth glyph. */
 static void draw_speaker(uint16_t *fb, int x, int y, uint16_t c) {
@@ -4214,13 +4236,28 @@ static void draw_screen(uint16_t *fb) {
                 fill_rect_clip(fb, 0, y, FB_W, ROW_H, COL_ROW, CONTENT_Y, clip_bot);
                 fill_rect_clip(fb, 0, y, 4, ROW_H, COL_ACCENT, CONTENT_Y, clip_bot);
             }
+            /* R70 step 1: FB_W - 150, not the usual FB_W - 110 every other
+             * duration-bearing row uses -- 40px carved out on the right for
+             * the grip below (12px icon + margin either side), so a long
+             * title doesn't draw underneath it before eliding. */
             draw_text_clip(fb, 24, y + 20, t->name, playing ? COL_ACCENT : COL_TEXT,
-                          TEXT_PX_BODY, FB_W - 110, CONTENT_Y, clip_bot);
+                          TEXT_PX_BODY, FB_W - 150, CONTENT_Y, clip_bot);
             if (t->dur_ms > 0) {
                 char b[16];
                 fmt_dur(b, sizeof(b), t->dur_ms);
-                draw_right_clip(fb, y + 22, b, CONTENT_Y, clip_bot);
+                int bw = text_width(b, TEXT_PX_SMALL);
+                /* Same right margin (24px, minus the index strip) draw_right_clip()
+                 * uses, just shifted left by the grip's own reserved column. */
+                int right = FB_W - 24 - (index_visible() ? INDEX_W : 0) - 40;
+                draw_text_clip(fb, right - bw, y + 22, b, COL_DIM, TEXT_PX_SMALL,
+                               FB_W, CONTENT_Y, clip_bot);
             }
+            /* R70 step 1: the drag handle itself -- not yet wired to anything
+             * (see this loop's own BG71 comment for the reorder plan), just
+             * marking where dragging a row will grab once it is. */
+            draw_grip_icon_clip(fb, FB_W - 24 - (index_visible() ? INDEX_W : 0) - 16,
+                                 y + (ROW_H - 24) / 2,
+                                 playing ? COL_ACCENT : COL_DIM, CONTENT_Y, clip_bot);
             fill_rect_clip(fb, 0, y + ROW_H - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
             y += ROW_H;
         }
