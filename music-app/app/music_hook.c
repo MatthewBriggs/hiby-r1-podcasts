@@ -141,8 +141,9 @@ static const char *THEME_MODE_NAMES[THEME_MODE_N] = { "Dark", "Light", "Grey", "
 static int theme_mode;
 /* R45: defined below tz_offset_minutes(), which it needs -- forward
  * declared here so apply_theme() can call it regardless of definition
- * order. */
-static int is_daytime(void);
+ * order. Returns THEME_LIGHT/THEME_DARK/THEME_GREY directly (never
+ * THEME_AUTO) -- see its own comment for why Grey gets a say here now. */
+static int auto_theme_effective(void);
 /* RP1 follow-up: defined near music_init() below, forward declared here so
  * go_back() and the header tap handler can both read g_is_standalone
  * regardless of definition order. See g_is_standalone's own comment. */
@@ -160,12 +161,13 @@ static int is_hiby_player(void);
  * there is nowhere left to go, not a boundary to bounce off. */
 static int g_is_standalone;
 static void apply_theme(void) {
-    /* R45: Auto isn't its own palette -- it picks Light or Dark by time of
-     * day and applies that one, same as if the user had picked it directly.
-     * theme_mode itself still reads "Auto" everywhere it's displayed or
-     * saved; only the six colour variables below are ever affected. */
+    /* R45: Auto isn't its own palette -- it picks Light, Dark or Grey by
+     * time of day and applies that one, same as if the user had picked it
+     * directly. theme_mode itself still reads "Auto" everywhere it's
+     * displayed or saved; only the six colour variables below are ever
+     * affected. */
     int effective = theme_mode;
-    if (effective == THEME_AUTO) effective = is_daytime() ? THEME_LIGHT : THEME_DARK;
+    if (effective == THEME_AUTO) effective = auto_theme_effective();
     switch (effective) {
     case THEME_LIGHT:
         g_col_bg     = RGB(239, 239, 235);
@@ -255,7 +257,19 @@ static int tz_offset_minutes(void) { return TZ_PRESETS[tz_idx].offset_min; }
  * account for seasons at all. Cooper's equation for solar declination, the
  * standard approximate form (accurate to about 1 degree, which is closer
  * than the assumed latitude itself is to anyone's actual position). */
-static int is_daytime(void) {
+/* R45 follow-up: reported live -- Grey was never actually reachable from
+ * Auto, at any time of day. The original version only ever chose between
+ * Light and Dark; Grey existed as a manually-selectable theme but had no
+ * role in Auto at all, which reads as a bug once Grey exists -- an "Auto"
+ * that ignores one of the three themes it could pick from isn't really
+ * automatic over all of them. Fixed by giving Grey the twilight band
+ * itself: a fixed 45-minute window straddling both sunrise and sunset,
+ * Light for the rest of the day and Dark for the rest of the night. 45
+ * minutes, not a fraction of day length, because the *reason* for a
+ * transition theme -- easing the eye between a bright and a dark palette
+ * -- doesn't get longer just because the day itself does. */
+#define AUTO_THEME_TWILIGHT_HOURS 0.75   /* 45 minutes, each side */
+static int auto_theme_effective(void) {
     time_t now = time(NULL);
     struct tm u;
     gmtime_r(&now, &u);
@@ -272,12 +286,15 @@ static int is_daytime(void) {
     const double assumed_lat = 40.0;
     double decl = 23.45 * sin(rad * (360.0 / 365.0) * (284 + day_of_year));
     double cos_omega = -tan(assumed_lat * rad) * tan(decl * rad);
-    if (cos_omega > 1.0) return 0;    /* sun never rises at this latitude today */
-    if (cos_omega < -1.0) return 1;   /* sun never sets at this latitude today */
+    if (cos_omega > 1.0) return THEME_DARK;    /* sun never rises at this latitude today */
+    if (cos_omega < -1.0) return THEME_LIGHT;  /* sun never sets at this latitude today */
     double omega = acos(cos_omega) / rad;    /* degrees */
     double sunrise = 12.0 - omega / 15.0;
     double sunset  = 12.0 + omega / 15.0;
-    return local_hour >= sunrise && local_hour < sunset;
+    if (fabs(local_hour - sunrise) <= AUTO_THEME_TWILIGHT_HOURS ||
+        fabs(local_hour - sunset)  <= AUTO_THEME_TWILIGHT_HOURS)
+        return THEME_GREY;
+    return (local_hour >= sunrise && local_hour < sunset) ? THEME_LIGHT : THEME_DARK;
 }
 
 static int button_lock_enabled;   /* off by default: a new gesture, opt in */
@@ -9777,9 +9794,9 @@ int music_entry(void *a0, void *a1) {
                  * dirty=1 below already covers redrawing once this changes
                  * the six colour variables. */
                 if (theme_mode == THEME_AUTO) {
-                    static int was_day = -1;
-                    int is_day = is_daytime();
-                    if (is_day != was_day) { was_day = is_day; apply_theme(); }
+                    static int was_effective = -1;
+                    int effective = auto_theme_effective();
+                    if (effective != was_effective) { was_effective = effective; apply_theme(); }
                 }
                 dirty = 1;
             }
