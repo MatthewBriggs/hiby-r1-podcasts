@@ -566,6 +566,13 @@ S90ADB_SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "S90adb")
 # `sh sa_hgl_dma.sh` call is left completely alone, so a smaller, more
 # obviously-correct diff.
 HGL_SCRIPT = "module_driver/sa_hgl_dma.sh"
+MODULE_INIT_SCRIPT = "module_driver/driver_default_init_script.sh"
+# brcmfmac (docs/10 in the kernel repo) looks for firmware under these exact
+# names. The vendor ships the same blobs under its own names in wifi_bcm/.
+BRCMFMAC_FW = [
+    ("lib/firmware/wifi_bcm/fw_bcm43438a1.bin", "lib/firmware/brcm/brcmfmac43430-sdio.bin"),
+    ("lib/firmware/wifi_bcm/nvram_ap6212a.txt", "lib/firmware/brcm/brcmfmac43430-sdio.txt"),
+]
 
 
 def disable_hgl(root):
@@ -580,6 +587,84 @@ def disable_hgl(root):
                  "touches HGL (mmaps /dev/fb0 directly) -- this 6MB boot-"
                  "time reservation has no consumer in a standalone build. "
                  "Originally: insmod sa_hgl_dma.ko sahd_hgl_mem_size=6291456\n")
+    return True
+
+
+def install_brcmfmac_firmware(root):
+    """Copy the vendor WiFi firmware to the names mainline brcmfmac looks for.
+
+    Verified on hardware (kernel repo docs/10): the vendor blob identifies
+    itself as "43430a1-roml ... Version: 7.45.96.123", i.e. BCM43430 rev A1 --
+    exactly what brcmfmac's BCM43430_FIRMWARE_NAME expects -- and the NVRAM is
+    already in the standard Broadcom text format brcmfmac parses, not a
+    vendor-specific one. So this is a copy under a different name, not a
+    conversion.
+
+    Harmless when brcmfmac is not in the running kernel: they are two extra
+    files nothing opens. Installing them unconditionally means the firmware is
+    already in place whenever a brcmfmac-capable kernel is flashed, rather
+    than being a separate step someone has to remember.
+
+    Returns the number of files installed."""
+    n = 0
+    for src_rel, dst_rel in BRCMFMAC_FW:
+        src = os.path.join(root, src_rel)
+        dst = os.path.join(root, dst_rel)
+        if not os.path.exists(src):
+            continue
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copy2(src, dst)
+        n += 1
+    return n
+
+
+def defer_wifi_module(root):
+    """Background the WiFi module load IN PLACE, so its chip init overlaps the
+    remaining module loads and app startup instead of blocking them.
+
+    Measured on hardware: cywdhd init costs ~1.1s of a ~4s boot, and the
+    kernel proper is done at 0.36s -- the rest is this script insmod'ing 28
+    vendor modules sequentially, with the WiFi chip by far the most expensive.
+
+    Two things this deliberately does NOT do, both learned the hard way:
+
+    1. It does not skip the module. cywdhd.ko is the only provider of
+       md_bcmdhd_bt_power, the platform device behind
+       /sys/class/rfkill/rfkill0 -- the switch /usr/bin/bt_init writes to in
+       order to power the radio. It is a combo chip and one driver owns power
+       for both, so never loading it would silently kill Bluetooth.
+
+    2. It does not move the line to the end of the script. That was tried and
+       reverted: it works, and the UI does come up sooner, but Bluetooth then
+       becomes available noticeably later, because rfkill0 only appears once
+       the WiFi chip has finished initialising. Backgrounding in place starts
+       that init at the same moment as before -- Bluetooth comes up on the
+       original schedule -- while the eight module loads behind it no longer
+       have to wait for it.
+
+    Returns False if the script isn't where expected or lacks the line."""
+    path = os.path.join(root, MODULE_INIT_SCRIPT)
+    if not os.path.exists(path):
+        return False
+    with open(path) as fh:
+        lines = fh.read().splitlines()
+    target = "sh cywdhd.sh"
+    if not any(l.strip() == target for l in lines):
+        return False
+    out = []
+    for l in lines:
+        if l.strip() == target:
+            out += [
+                "# WiFi/BT combo chip: backgrounded so its ~1.1s of init overlaps",
+                "# the module loads below and app startup. Kept in position, NOT",
+                "# moved later -- this module owns md_bcmdhd_bt_power and therefore",
+                "# rfkill0, so moving it delays Bluetooth becoming available.",
+                target + " &",
+            ]
+        else:
+            out.append(l)
+    with open(path, "w") as fh:
+        fh.write("\n".join(out) + "\n")
     return True
 
 
@@ -1035,6 +1120,13 @@ def main():
                 print(f"disabled {HGL_SCRIPT} (no consumer in a standalone build)")
             else:
                 print(f"note: {HGL_SCRIPT} not found — nothing to disable")
+            nfw = install_brcmfmac_firmware(root)
+            if nfw:
+                print(f"installed {nfw} brcmfmac firmware file(s) under lib/firmware/brcm/")
+            if defer_wifi_module(root):
+                print(f"backgrounded the WiFi module load in {MODULE_INIT_SCRIPT} (kept in place, so Bluetooth is not delayed)")
+            else:
+                print(f"note: could not defer the WiFi module in {MODULE_INIT_SCRIPT}")
 
         mtarget = os.path.join(root, MOUNT_SCRIPT)
         if os.path.exists(mtarget):
