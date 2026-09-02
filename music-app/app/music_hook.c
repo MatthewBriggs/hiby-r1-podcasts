@@ -1238,24 +1238,13 @@ static void draw_toggle_switch_h_clip(uint16_t *fb, int y, int on, int block_h,
  * plus a little either side, is ever in memory. */
 #define PAGE_MAX 32
 
-/* R65: SC_POD_SEARCH_RESULTS deliberately appended LAST, not slotted in near
- * SC_PODCASTS/SC_POD_SYNC where it reads better -- R66's resume.state
- * persists `screen` as a raw int across a real process restart (auto-
- * shutdown, or a crash-restart with a resume file still on disk from an
- * earlier one), so inserting a new value anywhere but the end silently
- * renumbers every constant after it and misreads whatever a binary built
- * before this change already wrote to that file. Caught live: adding this
- * in the middle once (since reverted) sent a resume straight to the wrong
- * screen the first time the rebuilt binary restarted with an old resume.state
- * still on disk. */
 typedef enum { SC_MENU = 0, SC_MUSIC_MENU, SC_ARTISTS, SC_ALBUMS, SC_TRACKS, SC_PLAYING,
                SC_RADIO, SC_PLAYLISTS, SC_AUDIOBOOKS, SC_PODCASTS, SC_POD_SYNC,
                SC_EQ, SC_EQ_BANDS, SC_EQ_BAND, SC_MSEB,
                SC_SETTINGS, SC_SETTINGS_THEME, SC_SETTINGS_ABOUT,
                SC_SETTINGS_TIMEZONE, SC_SETTINGS_THEMEMODE, SC_QUEUE,
                SC_ARTIST_PAGE,
-               SC_SETTINGS_WIFI, SC_SETTINGS_BT, SC_SETTINGS_USB, SC_KEYBOARD,
-               SC_POD_SEARCH_RESULTS } screen_t;
+               SC_SETTINGS_WIFI, SC_SETTINGS_BT, SC_SETTINGS_USB, SC_KEYBOARD } screen_t;
 
 /* L2: the top-level menu ("Main Menu", EXIT on the right) stays small on
  * purpose rather than listing every library-browsing facet alongside
@@ -1561,22 +1550,6 @@ static int mseb_reset_x(void) {
 static int pod_sync_x(void) {
     int sync_w = text_width("Sync", TEXT_PX_SMALL);
     return header_back_x() - 20 - sync_w;
-}
-
-/* R65: SC_PODCASTS's second header action, labelled "Add" -- discovers and
- * subscribes to a NEW show via iTunes Search, distinct from R68's planned
- * "Search" (finding something inside shows already subscribed to, by title/
- * notes). Internal names (pod_search_x/pod_search_start/
- * KB_PURPOSE_PODCAST_SEARCH/SC_POD_SEARCH_RESULTS) still say "search"
- * throughout, since that's genuinely what the iTunes lookup itself is --
- * only the on-screen label changed, matching what the button actually does
- * from the user's side (add a show you don't have yet) now that "Search"
- * means something else in this app. Sits left of Sync, same 20px gap
- * pattern as Sync itself sits left of BACK. */
-static int pod_search_x(void) {
-    int sync_w = text_width("Sync", TEXT_PX_SMALL);
-    int search_w = text_width("Add", TEXT_PX_SMALL);
-    return header_back_x() - 20 - sync_w - 20 - search_w;
 }
 
 /* R52: same idea again, for SC_QUEUE's "Clear" header action. */
@@ -2081,8 +2054,7 @@ static screen_t   kb_return_screen;
  * pointer so kb_buf's lifetime and the action are both plain state, visible
  * to mlog() and safe across a screen redraw, rather than a pointer that has
  * to be re-armed correctly on every kb_open() call site. */
-typedef enum { KB_PURPOSE_NONE = 0, KB_PURPOSE_WIFI_PASSWORD, KB_PURPOSE_WIFI_SSID_MANUAL,
-               KB_PURPOSE_PODCAST_SEARCH } kb_purpose_t;
+typedef enum { KB_PURPOSE_NONE = 0, KB_PURPOSE_WIFI_PASSWORD, KB_PURPOSE_WIFI_SSID_MANUAL } kb_purpose_t;
 static kb_purpose_t kb_purpose;
 /* Three modes, not two. The original pair had the mode key labelled "123"
  * while actually switching to *symbols* -- reported as exactly that
@@ -2355,15 +2327,6 @@ static void kb_commit(void) {
             snprintf(kb_wifi_target_ssid, sizeof(kb_wifi_target_ssid), "%s", kb_buf);
             kb_open("Password for this network", KB_PURPOSE_WIFI_PASSWORD, "");
             return;   /* stays on SC_KEYBOARD -- do not fall through to the pop below */
-        case KB_PURPOSE_PODCAST_SEARCH:
-            /* R65: kb_return_screen is SC_PODCASTS (whatever screen opened
-             * the keyboard), but Done should land on the results screen, not
-             * back where the keyboard was opened from -- same "don't fall
-             * through to the default pop" shape as the SSID case above. */
-            if (kb_buf[0]) pod_search_start(kb_buf);
-            screen = SC_POD_SEARCH_RESULTS; reset_scroll();
-            total = 0;   /* nothing back yet -- the per-tick poll below fills this in */
-            return;
         case KB_PURPOSE_NONE:
         default:
             break;
@@ -2764,29 +2727,6 @@ static void pod_rebuild_rows(void) {
     }
 }
 
-/* R65: pod_search_result()[] -> search_rows[], same reshape as the two
- * above. Title and artist fold into one line (row->count's own slot draws
- * as a bare right-aligned number elsewhere, wrong for an artist name) --
- * "Title" alone when the feed carries no artist name. */
-#define SEARCH_ROW_MAX 32
-static lib_row_t search_rows[SEARCH_ROW_MAX];
-static void search_rebuild_rows(void) {
-    int n = pod_search_result_n();
-    if (n > SEARCH_ROW_MAX) n = SEARCH_ROW_MAX;
-    for (int i = 0; i < n; i++) {
-        const pod_search_result_t *r = pod_search_result(i);
-        /* Plain hyphen, not an em dash: msyh.ttf (the only face on this
-         * device, per parse_rss.awk's own comment on curly quotes) is not
-         * guaranteed to carry every punctuation glyph outside ASCII. */
-        if (r->artist[0])
-            snprintf(search_rows[i].name, sizeof(search_rows[i].name), "%s - %s", r->name, r->artist);
-        else
-            snprintf(search_rows[i].name, sizeof(search_rows[i].name), "%s", r->name);
-        search_rows[i].count = 0;
-        search_rows[i].owner[0] = '\0';
-    }
-}
-
 /* pod_eps[] -> tracks[], same reasoning as ab_load_book() mirroring chapters
  * into tracks[] -- an undownloaded episode gets an empty path, same as any
  * other lib_track_t whose file isn't there yet, so the tap handler is what
@@ -2889,7 +2829,6 @@ static void pod_play_episode(int idx) {
 static void load_page(void) {
     if (screen == SC_AUDIOBOOKS) return;   /* ab_rows[] is already complete, no paging */
     if (screen == SC_PODCASTS) return;     /* pod_rows[] likewise -- a folder count, not a query */
-    if (screen == SC_POD_SEARCH_RESULTS) return;   /* search_rows[] likewise -- one script run, not a query */
     if (!index_visible()) return;
 
     /* Keep a compact window around the viewport. The rows used to be fetched
@@ -2921,11 +2860,6 @@ static lib_row_t *row_at(int absolute) {
         return (absolute >= 0 && absolute < ab_book_n) ? &ab_rows[absolute] : NULL;
     if (screen == SC_PODCASTS)
         return (absolute >= 0 && absolute < pod_feed_n) ? &pod_rows[absolute] : NULL;
-    if (screen == SC_POD_SEARCH_RESULTS) {
-        int n = pod_search_result_n();
-        if (n > SEARCH_ROW_MAX) n = SEARCH_ROW_MAX;
-        return (absolute >= 0 && absolute < n) ? &search_rows[absolute] : NULL;
-    }
     int local = absolute - row_base;
     return local >= 0 && local < row_n ? &rows[local] : NULL;
 }
@@ -4092,7 +4026,6 @@ static void draw_screen(uint16_t *fb) {
     else if (screen == SC_AUDIOBOOKS) { title = "Audiobooks"; right = "BACK"; }
     else if (screen == SC_PODCASTS)   { title = "Podcasts"; right = "BACK"; }
     else if (screen == SC_POD_SYNC)   { title = "Updating feeds"; right = "BACK"; }
-    else if (screen == SC_POD_SEARCH_RESULTS) { title = "Search results"; right = "BACK"; }
     else if (screen == SC_EQ)         { title = "Parametric EQ"; right = "BACK"; }
     else if (screen == SC_EQ_BANDS)   { title = "Bands"; right = "BACK"; }
     else if (screen == SC_MSEB)       { title = "MSEB"; right = "BACK"; }
@@ -4137,14 +4070,6 @@ static void draw_screen(uint16_t *fb) {
             draw_text(fb, pod_sync_x(), STATUS_H + 20,
                       pod_update_running() ? "Syncing" : "Sync",
                       pod_update_running() ? COL_DIM : COL_ACCENT, TEXT_PX_SMALL, FB_W);
-            /* R65: opens the T9 keyboard for a podcast-title/keyword lookup
-             * against iTunes Search, to subscribe to a show not on the
-             * device yet -- labelled "Add", not "Search" (see pod_search_x()'s
-             * own comment for why). Same always-tappable state as Sync --
-             * unlike Sync there is no "already running" state to dim
-             * against here, since typing on the keyboard doesn't overlap
-             * with anything a second tap could step on. */
-            draw_text(fb, pod_search_x(), STATUS_H + 20, "Add", COL_ACCENT, TEXT_PX_SMALL, FB_W);
         }
         /* R52: Queue's one extra header action -- drop everything queued
          * after the currently-playing track. Dimmed when there's nothing
@@ -5073,18 +4998,6 @@ static void draw_screen(uint16_t *fb) {
         return;
     }
 
-    /* R65: only the "nothing to show yet" states get a custom draw here --
-     * once there are real results, falling through to the generic row-list
-     * code below (same one SC_PODCASTS/SC_AUDIOBOOKS use) draws them,
-     * scrolling and all, for free. */
-    if (screen == SC_POD_SEARCH_RESULTS && total == 0) {
-        draw_text(fb, 24, y + 6,
-                  pod_search_running() ? "Searching..." :
-                  pod_search_status()[0] ? pod_search_status() : "No results.",
-                  COL_DIM, TEXT_PX_BODY, FB_W - 48);
-        return;
-    }
-
     if (screen == SC_EQ) {
         int ry = eq_row_enabled_y();
         draw_text(fb, 24, ry + 24, "Enabled", COL_TEXT, TEXT_PX_BODY, FB_W - 140);
@@ -6009,11 +5922,6 @@ static int go_back(void) {
         case SC_SETTINGS:
         case SC_MUSIC_MENU:
             screen = SC_MENU; reset_scroll();
-            break;
-        case SC_POD_SEARCH_RESULTS:
-            /* Same as SC_POD_SYNC's own back target -- this is a sub-screen
-             * of Podcasts, not the top-level menu. */
-            screen = SC_PODCASTS; reset_scroll();
             break;
         case SC_PLAYLISTS:
         case SC_ARTISTS:
@@ -8284,22 +8192,7 @@ int music_entry(void *a0, void *a1) {
                     }
                 }
                 }
-            } else if (screen != SC_KEYBOARD && y < CONTENT_Y) {
-                /* R65 fix: SC_KEYBOARD's own Cancel/Done sit at y=20/56 (see
-                 * draw_keyboard()), which is < CONTENT_Y like every other
-                 * screen's header row -- so without this exclusion, tapping
-                 * either one was swallowed right here instead of ever
-                 * reaching the dedicated "else if (screen == SC_KEYBOARD)"
-                 * case further down this same chain. The generic fallback at
-                 * the bottom of this block (screen != SC_MENU && x > FB_W -
-                 * 120) then fired go_back() for a Done tap (Done sits well
-                 * right of that line) -- which has no SC_KEYBOARD case of its
-                 * own, so it fell into the default: case built for SC_TRACKS/
-                 * queue-shaped screens and landed on Albums, kb_commit()
-                 * never called at all. Reported live via R65's own podcast
-                 * search (type a query, tap Done, land on Albums) but this
-                 * predates that feature -- it's the keyboard's Done button
-                 * in general, not anything specific to search. */
+            } else if (y < CONTENT_Y) {
                 /* mseb_reset_x()/pod_sync_x()'s own on-screen position sits
                  * well left of the old fixed "FB_W - 120" boundary these
                  * zones used to end at, which left a dead strip between the
@@ -8315,8 +8208,6 @@ int music_entry(void *a0, void *a1) {
                 } else if (screen == SC_PODCASTS && x >= pod_sync_x() - 16 && x < header_back_x() - 16) {
                     if (!pod_update_running()) { pod_update_start(); pod_sync_log_n = 0; }
                     screen = SC_POD_SYNC; reset_scroll();
-                } else if (screen == SC_PODCASTS && x >= pod_search_x() - 16 && x < pod_sync_x() - 16) {
-                    kb_open("Add a podcast", KB_PURPOSE_PODCAST_SEARCH, "");
                 } else if (screen == SC_QUEUE && x >= queue_clear_x() - 16 && x < header_back_x() - 16) {
                     /* R52: drop everything queued after the currently-
                      * playing track -- that one keeps playing undisturbed
@@ -8908,21 +8799,6 @@ int music_entry(void *a0, void *a1) {
                         mlog("[music] %s -> %d chapters in %d file(s)\n",
                              cur_album, ab_book.chap_n, ab_book.file_n);
                     }
-                } else if (screen == SC_POD_SEARCH_RESULTS && scroll + idx < pod_search_result_n()) {
-                    /* pod_subscribe() only writes settings.txt/regenerates
-                     * feeds.txt -- it fetches nothing itself. A subscribed
-                     * feed with no folder on disk yet would make Podcasts
-                     * look unchanged, as if the tap did nothing, so kick off
-                     * the same Sync the header button runs and land on its
-                     * progress screen instead -- one tap actually produces a
-                     * downloaded, browsable feed, matching what tapping
-                     * "Subscribe" reads as everywhere else. */
-                    const pod_search_result_t *r = pod_search_result(scroll + idx);
-                    if (r) {
-                        pod_subscribe(r->url);
-                        if (!pod_update_running()) { pod_update_start(); pod_sync_log_n = 0; }
-                        screen = SC_POD_SYNC; reset_scroll();
-                    }
                 } else if (screen == SC_PODCASTS && scroll + idx < pod_feed_n) {
                     snprintf(cur_feed, sizeof(cur_feed), "%s", pod_feeds[scroll + idx].name);
                     pod_ep_n = pod_load_episodes(cur_feed, pod_eps, POD_MAX_ITEMS);
@@ -9028,17 +8904,6 @@ int music_entry(void *a0, void *a1) {
             dirty = 1;
         }
         pod_update_reap();
-
-        /* R65: search runs the same detached-subprocess shape as the sync
-         * above, just with no log tail to show mid-flight -- one poll, one
-         * redraw once results land. */
-        if (pod_search_running()) {
-            if (pod_search_poll()) {
-                search_rebuild_rows();
-                if (screen == SC_POD_SEARCH_RESULTS) total = pod_search_result_n();
-                dirty = 1;
-            }
-        }
 
         /* Pulling the headphones out should not carry on broadcasting to the
          * room. Only for the wired route — unplugging the jack says nothing

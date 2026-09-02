@@ -123,10 +123,7 @@ legacy TLS ciphers that every modern podcast host rejects:
 ```bash
 adb shell mkdir -p /data/mnt/sd_0/.podsync
 adb push music-app/podsync/podsync_once.sh music-app/podsync/parse_rss.awk /data/mnt/sd_0/.podsync/
-adb push music-app/podsync/podsearch_once.sh music-app/podsync/parse_itunes.awk /data/mnt/sd_0/.podsync/
 ```
-
-The last two are for in-app podcast search (the Search button on the Podcasts screen) — same `curl`/`cacert.pem` below, no separate setup.
 
 The device has **no CA store at all** and `/etc` is read-only, so curl needs
 a bundle on the card — Mozilla's, as published by the curl project, is dated,

@@ -26,17 +26,7 @@
 #ifndef PODCAST_H
 #define PODCAST_H
 
-/* R65 fix: was 64 -- a real subscribed feed's folder name ("Transmissions -
- * The Definitive Story of Joy Division & New Order") landed at exactly 64
- * characters, silently truncated to 63 by every snprintf(...POD_NAME_LEN...)
- * copying it in. cur_feed then held a name one character short of the real
- * on-disk folder, opendir() in pod_load_episodes() failed to find it, and
- * the episode list came back empty with no error -- reported live via the
- * new in-app search (R65) surfacing a longer real-world title than any feed
- * added by hand so far happened to have, but the limit itself predates that
- * feature. Doubled, not nudged, so this isn't just moving the same wall a
- * few characters further out for the next long title. */
-#define POD_NAME_LEN  128
+#define POD_NAME_LEN  64
 #define POD_PATH_LEN  384
 #define POD_MAX_ITEMS 220   /* matches the standalone app's own MAX_ITEMS */
 
@@ -108,32 +98,5 @@ void pod_update_reap(void);
  * wrapping to the screen width is a drawing concern, left to the caller. 0
  * if there's no sidecar or it's empty. */
 int pod_load_notes(const char *audio_path, char *out, int max_len);
-
-/* R65: in-app podcast search, via iTunes's directory (see podcast.c's own
- * comment on the source picked and why). Same detached-script,
- * poll-a-result-file shape as pod_update_start()/pod_update_tail() above. */
-typedef struct {
-    char name[POD_NAME_LEN];      /* collection/podcast title */
-    char artist[POD_NAME_LEN];
-    char url[POD_PATH_LEN];       /* feed URL -- what pod_subscribe() takes */
-} pod_search_result_t;
-
-void pod_search_start(const char *query);
-int  pod_search_running(void);
-/* Call every frame while a search is running. Returns 1 the moment it's
- * finished (results are loaded and ready), 0 while still in flight. */
-int  pod_search_poll(void);
-int  pod_search_result_n(void);
-const pod_search_result_t *pod_search_result(int i);
-/* Set when pod_search_result_n() comes back 0 -- "no results", "NO
- * NETWORK", etc, whatever podsearch_once.sh's own log last said. */
-const char *pod_search_status(void);
-
-/* Adds a feed URL to settings.txt's Podcasts section (R64's real source of
- * truth) and regenerates feeds.txt from it immediately, so a subscribe
- * takes effect on the next Sync without needing a settings.txt round-trip
- * through the SD card first. Returns 1 if newly added, 0 if already
- * subscribed (not an error). */
-int pod_subscribe(const char *url);
 
 #endif
