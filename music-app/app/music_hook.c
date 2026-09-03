@@ -7517,7 +7517,27 @@ static void set_locked(int on) {
     locked = on;
     audio_set_screen_locked(on);   /* BG90 follow-up -- see its own comment in audio.h */
     if (on) {
-        saved_brightness = read_int_file(BACKLIGHT);
+        /* BG95 follow-up, found live: the button-lock double-press handler
+         * (see its own comment) deliberately forces set_locked() to re-run
+         * its full body even when this app already believes it's locked --
+         * needed so a double-press can still toggle button_locked on top of
+         * an already-locked screen. But a real double *press* (not just a
+         * bounce) reaching that handler within DOUBLE_PRESS_MS of a plain
+         * single-press lock means this exact line runs a second time with
+         * the backlight already at zero from the first -- read_int_file()
+         * comes back ~0, silently overwriting the real value this same
+         * call had just captured moments earlier. music.log showed it
+         * happening on nearly every lock for this user specifically (two
+         * "locked" lines ~200ms apart, well inside the 400ms window --
+         * their own habitual double-click, not hardware bounce), and every
+         * wake after one used that clobbered value or DEFAULT_BRIGHTNESS
+         * instead of the level actually in use, reported live as
+         * brightness dropping "to 50%" between wakes. Only overwrite while
+         * there's still something real on the panel to capture -- a
+         * redundant re-lock of an already-dark screen has nothing to gain
+         * from re-reading it anyway. */
+        int b = read_int_file(BACKLIGHT);
+        if (b > 0) saved_brightness = b;
         write_int_file(BACKLIGHT, 0);
         /* Dark is not off. With only the backlight at zero the LCD controller
          * carries on scanning out: measured at ~61 framebuffer interrupts a
@@ -7619,7 +7639,21 @@ static int handle_keys(int fd, key_src_t src) {
                 have_last_power_press = 0;   /* don't chain into a third press */
                 button_locked = !button_locked;
                 locked = !button_locked;     /* so set_locked() below isn't a same-state no-op */
-                if (!button_locked) g_wake_t0 = us_now();   /* BG98: this call is the wake */
+                if (!button_locked) {
+                    /* BG95 follow-up: the "dark for any reason" wake path
+                     * below already trusts last_lit_bright over
+                     * saved_brightness for exactly this reason -- this path
+                     * unlocks just as often (arguably more, since it's the
+                     * one two power presses close together actually reach)
+                     * but never had the same protection. Worth having
+                     * regardless of what's currently corrupting
+                     * saved_brightness -- see set_locked()'s own comment on
+                     * the specific way this user's double-click habit was
+                     * doing it -- since this is the general-purpose fix, not
+                     * a patch for one specific cause. */
+                    if (last_lit_bright > 0) saved_brightness = last_lit_bright;
+                    g_wake_t0 = us_now();   /* BG98: this call is the wake */
+                }
                 set_locked(button_locked);
                 if (!button_locked) g_wake_setlocked_us = us_now() - g_wake_t0;
                 if (button_locked) {
