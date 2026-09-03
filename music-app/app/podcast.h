@@ -26,7 +26,14 @@
 #ifndef PODCAST_H
 #define PODCAST_H
 
-#define POD_NAME_LEN  64
+/* Bug found live, 2026-09: 64 silently truncated a real feed folder name
+ * of exactly 64 characters ("Transmissions - The Definitive Story of Joy
+ * Division & New Order") by one, since snprintf() reserves a byte for the
+ * NUL -- pod_load_episodes() then built its opendir() path from the
+ * truncated name, which doesn't exist on disk, and got 0 episodes back
+ * with no error. 128 gives real feed titles (which run longer than album
+ * names) genuine headroom rather than another number to hit eventually. */
+#define POD_NAME_LEN  128
 #define POD_PATH_LEN  384
 #define POD_MAX_ITEMS 220   /* matches the standalone app's own MAX_ITEMS */
 
