@@ -1000,9 +1000,9 @@ ADBON = "usr/bin/adbon"
 # hardware: "sd mounted=0" while android0 is bound and the host has the
 # volume, then remounted with 135 library entries visible and the player
 # still running.
-ADBOFF_SAFE = '#!/bin/sh\n# ADB -> USB mass storage.\n#\n# Two problems this guards against, both observed on hardware:\n#\n# 1. Concurrency. The app backgrounds this on every tap of the USB screen\n#    ("/usr/bin/adboff >/dev/null 2>&1 &"). A user who taps again because\n#    nothing visibly happened gets a second copy running alongside the\n#    first: one tears down adb_demo while the other tries to bind android0,\n#    they fight over the single UDC, and the device ends up with NO gadget\n#    bound at all -- no ADB, no storage, power cycle only. The log showed\n#    three invocations in three seconds, and adbon/adboff overlapping in the\n#    same second. A shared lock makes repeated taps harmless.\n#\n# 2. Corruption. Stock exports /dev/mmcblk0 while /dev/mmcblk0p1 is still\n#    mounted read-write here, so the host and the player are two writers on\n#    one exFAT filesystem. Full umount preferred; remount read-only is the\n#    fallback when a track is open mid-playback, which still leaves the host\n#    as the only writer.\nSD=/usr/data/mnt/sd_0\nLOG=/usr/data/usbswitch.log\nLOCK=/tmp/usbswitch.lock\n\nif ! mkdir "$LOCK" 2>/dev/null; then\n    OLD=$(cat "$LOCK/pid" 2>/dev/null)\n    if [ -n "$OLD" ] && [ ! -d "/proc/$OLD" ]; then\n        echo "$(date) adboff: clearing stale lock from pid $OLD" >> "$LOG"\n        rm -rf "$LOCK"\n        mkdir "$LOCK" 2>/dev/null || exit 0\n    else\n        echo "$(date) adboff: switch already in progress, ignoring" >> "$LOG"\n        exit 0\n    fi\nfi\necho $$ > "$LOCK/pid"\ntrap \'rm -rf "$LOCK" 2>/dev/null\' EXIT INT TERM HUP\n\nif [ -n "$(cat /sys/kernel/config/usb_gadget/android0/UDC 2>/dev/null)" ]; then\n    echo "$(date) adboff: already in storage mode, nothing to do" >> "$LOG"\n    exit 0\nfi\n\nsync\nif mount | grep -q " $SD "; then\n    if umount "$SD" 2>/dev/null; then\n        echo "$(date) adboff: card unmounted" >> "$LOG"\n    elif mount -o remount,ro "$SD" 2>/dev/null; then\n        echo "$(date) adboff: card busy, remounted read-only" >> "$LOG"\n    else\n        echo "$(date) adboff: WARNING could not release card" >> "$LOG"\n    fi\nfi\nsync\n\n/etc/init.d/adb/S440adb stop\n/usr/bin/usb_dev_mass_storage.sh start /dev/mmcblk0\necho "$(date) adboff: done, android0=[$(cat /sys/kernel/config/usb_gadget/android0/UDC 2>/dev/null)]" >> "$LOG"\nexit 0\n'
+ADBOFF_SAFE = '#!/bin/sh\n# ADB -> USB mass storage.\n#\n# Locking: flock, not a lockdir. The app backgrounds this on every tap, so\n# concurrent copies must not race over the single UDC -- but a lock is only\n# safe if a holder that dies or hangs cannot wedge the feature. flock is\n# released by the kernel when the holder dies (SIGKILL included), and the\n# critical section below is kept to gadget manipulation only: the SD card\n# mount, which is the operation that can block on I/O, is deliberately\n# outside it. An earlier mkdir-based lock wedged exactly this way and needed\n# a reboot to clear.\n#\n# The card is released before exporting it: stock hands /dev/mmcblk0 to the\n# host while /dev/mmcblk0p1 is still mounted rw here, which is two writers on\n# one exFAT filesystem.\nSD=/usr/data/mnt/sd_0\nLOG=/usr/data/usbswitch.log\nstep() { echo "$(date) adboff: $*" >> "$LOG"; }\n\nexec 9>/tmp/usbswitch.lock\nif ! flock -n 9; then step "switch already in progress, ignoring"; exit 0; fi\n\nif [ -n "$(cat /sys/kernel/config/usb_gadget/android0/UDC 2>/dev/null)" ]; then\n    step "already in storage mode, nothing to do"; exit 0\nfi\n\nsync\nif mount | grep -q " $SD "; then\n    if umount "$SD" 2>/dev/null; then step "card unmounted"\n    elif mount -o remount,ro "$SD" 2>/dev/null; then step "card busy, remounted read-only"\n    else step "WARNING could not release card"; fi\nfi\nsync\n\nstep "stopping adb gadget"\n/etc/init.d/adb/S440adb stop >/dev/null 2>&1\nstep "starting mass storage"\n/usr/bin/usb_dev_mass_storage.sh start /dev/mmcblk0 >/dev/null 2>&1\nstep "done, android0=[$(cat /sys/kernel/config/usb_gadget/android0/UDC 2>/dev/null)]"\nexit 0\n'
 
-ADBON_SAFE = '#!/bin/sh\n# USB mass storage -> ADB. Shares adboff\'s lock so the two cannot overlap;\n# see that script\'s header for why. Re-mounts the card rather than flipping\n# it back to rw, because the host may have changed the filesystem and cached\n# metadata would be stale. fmask/dmask are explicit because mount otherwise\n# inherits the caller\'s umask, and boot mounts it 0022.\nSD=/usr/data/mnt/sd_0\nLOG=/usr/data/usbswitch.log\nLOCK=/tmp/usbswitch.lock\n\nif ! mkdir "$LOCK" 2>/dev/null; then\n    OLD=$(cat "$LOCK/pid" 2>/dev/null)\n    if [ -n "$OLD" ] && [ ! -d "/proc/$OLD" ]; then\n        echo "$(date) adbon: clearing stale lock from pid $OLD" >> "$LOG"\n        rm -rf "$LOCK"\n        mkdir "$LOCK" 2>/dev/null || exit 0\n    else\n        echo "$(date) adbon: switch already in progress, ignoring" >> "$LOG"\n        exit 0\n    fi\nfi\necho $$ > "$LOCK/pid"\ntrap \'rm -rf "$LOCK" 2>/dev/null\' EXIT INT TERM HUP\n\nif [ -n "$(cat /sys/kernel/config/usb_gadget/adb_demo/UDC 2>/dev/null)" ]; then\n    echo "$(date) adbon: already in ADB mode, nothing to do" >> "$LOG"\n    exit 0\nfi\n\n/usr/bin/usb_dev_mass_storage.sh stop /dev/mmcblk0\n/etc/init.d/adb/S440adb start\n\nif mount | grep -q " $SD "; then\n    umount "$SD" 2>/dev/null || mount -o remount,rw "$SD" 2>/dev/null\nfi\nmkdir -p "$SD"\nif mount | grep -q " $SD "; then\n    echo "$(date) adbon: card still mounted (remounted rw)" >> "$LOG"\nelse\n    mount -t exfat -o fmask=0022,dmask=0022 /dev/mmcblk0p1 "$SD" 2>/dev/null \\\n        && echo "$(date) adbon: card remounted" >> "$LOG" \\\n        || echo "$(date) adbon: WARNING remount failed" >> "$LOG"\nfi\necho "$(date) adbon: done, adb_demo=[$(cat /sys/kernel/config/usb_gadget/adb_demo/UDC 2>/dev/null)]" >> "$LOG"\nexit 0\n'
+ADBON_SAFE = '#!/bin/sh\n# USB mass storage -> ADB. Shares adboff\'s flock; see that script\'s header.\n#\n# Order matters here. First ask the gadget to eject the medium: writing an\n# empty string to lun.0/file closes the LUN and reports SS_MEDIUM_NOT_PRESENT,\n# which is a far politer teardown than yanking the gadget while the host has\n# it open. The kernel refuses this with EBUSY if the host has set PREVENT\n# MEDIUM REMOVAL (macOS does while a volume is mounted), so it is best-effort\n# and its failure is not fatal.\n#\n# The card remount happens AFTER the lock is dropped. mount can block in\n# uninterruptible I/O when the host has not let go, and holding the switch\n# lock across that is what previously wedged the feature until a reboot.\nSD=/usr/data/mnt/sd_0\nLUN=/sys/kernel/config/usb_gadget/android0/functions/mass_storage.0/lun.0/file\nLOG=/usr/data/usbswitch.log\nstep() { echo "$(date) adbon: $*" >> "$LOG"; }\n\nexec 9>/tmp/usbswitch.lock\nif ! flock -n 9; then step "switch already in progress, ignoring"; exit 0; fi\n\nif [ -n "$(cat /sys/kernel/config/usb_gadget/adb_demo/UDC 2>/dev/null)" ]; then\n    step "already in ADB mode, nothing to do"; exit 0\nfi\n\nif [ -f "$LUN" ]; then\n    if echo "" > "$LUN" 2>/dev/null; then step "medium ejected"\n    else step "medium eject refused (host holds it) -- continuing"; fi\nfi\n\nstep "stopping mass storage"\n/usr/bin/usb_dev_mass_storage.sh stop /dev/mmcblk0 >/dev/null 2>&1\nstep "starting adb gadget"\n/etc/init.d/adb/S440adb start >/dev/null 2>&1\nstep "adb gadget up, adb_demo=[$(cat /sys/kernel/config/usb_gadget/adb_demo/UDC 2>/dev/null)]"\n\n# Drop the lock before touching the card: a blocking mount must never be able\n# to stop the next switch.\nflock -u 9 2>/dev/null\nexec 9>&-\n\nif mount | grep -q " $SD "; then\n    umount "$SD" 2>/dev/null || mount -o remount,rw "$SD" 2>/dev/null\nfi\nmkdir -p "$SD"\nif mount | grep -q " $SD "; then\n    step "card already mounted (rw)"\nelse\n    step "remounting card"\n    mount -t exfat -o fmask=0022,dmask=0022 /dev/mmcblk0p1 "$SD" 2>/dev/null \\\n        && step "card remounted" || step "WARNING remount failed"\nfi\nstep "done"\nexit 0\n'
 
 
 def protect_sd_during_storage(root):
@@ -1013,14 +1013,31 @@ def protect_sd_during_storage(root):
     checked for the expected vendor content first, so a firmware whose
     scripts differ is left alone rather than silently overwritten.
 
-    They also serialise on a shared lock. The app backgrounds these on every
-    tap, so a user tapping again because nothing visibly happened got a
-    second copy racing the first over the single UDC -- observed live as
-    three adboff invocations in three seconds, and adbon/adboff overlapping
-    in the same second, leaving no gadget bound at all. Verified by firing
-    five concurrent adboff and three concurrent adbon on hardware: four and
-    two respectively logged "already in progress, ignoring", and the switch
+    They also serialise, on an flock rather than a lockdir. The app
+    backgrounds these on every tap, so a user tapping again because nothing
+    visibly happened got a second copy racing the first over the single UDC
+    -- observed live as three adboff invocations in three seconds, and
+    adbon/adboff overlapping in the same second, leaving no gadget bound at
+    all. Verified by firing five concurrent adboff and three concurrent adbon
+    on hardware: four and two respectively were refused, and the switch
     completed correctly both ways with the player still alive.
+
+    A first attempt used a mkdir lockdir with a pid file and treated a lock
+    as stale only if the recorded pid was dead. That is defeated by a holder
+    which is alive but BLOCKED, and it duly wedged: one adbon took the lock,
+    never returned, and every later tap was correctly refused until a reboot
+    cleared /tmp. flock is used instead because the kernel releases it when
+    the holder dies, SIGKILL included -- verified by killing a holder and
+    confirming the next run proceeds.
+
+    More importantly the card remount now happens OUTSIDE the critical
+    section. mount is the operation that can block in uninterruptible I/O
+    when the host has not released the volume, and holding the switch lock
+    across it is what caused that wedge. adbon also asks the gadget to eject
+    the medium first (an empty write to lun.0/file closes the LUN and reports
+    SS_MEDIUM_NOT_PRESENT) rather than yanking it, which is best-effort only:
+    fsg_store_file returns -EBUSY when the host has set PREVENT MEDIUM
+    REMOVAL, as macOS does whenever a volume is mounted.
 
     Preferred path is a full umount: measured on hardware, library_standalone
     holds zero fds under the mount when idle, so it succeeds. The fallback is
@@ -1039,8 +1056,8 @@ def protect_sd_during_storage(root):
             continue
         with open(path) as fh:
             cur = fh.read()
-        if "usbswitch.lock" in cur:
-            continue                     # already ours (locked version)
+        if "flock -n 9" in cur:
+            continue                     # already ours (flock version)
         if not all(m in cur for m in must_have):
             continue                     # not the script this was written against
         with open(path, "w") as fh:
