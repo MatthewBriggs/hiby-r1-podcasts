@@ -411,6 +411,15 @@ static void mlog(const char *fmt, ...) {
  * milliseconds, and the transport must stay live throughout. The UI draws a
  * plain panel until the bitmap appears. */
 #define ART_PX FB_W   /* Now Playing art runs edge-to-edge, like stock */
+/* BG104: a Last.fm/Spotify cover comes back at whatever resolution the host
+ * chose to publish, sometimes well over a thousand pixels a side -- fine to
+ * store, but confirmed live to cause a visible flicker on this device's
+ * panel (see BACKLOG.md), most likely a downsampling artifact that a large
+ * reduction ratio makes bad enough to be visible in cover_load()'s own box
+ * filter. 800 keeps real detail (this screen never shows a cover past
+ * ART_PX/FB_W) while landing nowhere near that ratio for anything a host
+ * plausibly serves. */
+#define FETCHED_COVER_MAX_DIM 800
 
 static pthread_mutex_t art_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint16_t *art_bits;            /* ART_PX * ART_PX, or NULL */
@@ -606,6 +615,11 @@ static void *art_worker(void *arg) {
                 source = "spotify";
             }
             if (ok) {
+                /* BG104: shrink before caching/showing it -- see
+                 * FETCHED_COVER_MAX_DIM's own comment. A no-op return (0)
+                 * when the fetch was already small enough; either way
+                 * cover_load() below reads whatever ended up on disk. */
+                cover_downscale_max(dest, FETCHED_COVER_MAX_DIM);
                 bits = cover_load(dest, dir, ART_PX);
                 mlog("[music] %s: cover fetched for %s / %s\n", source, artist, album);
             } else {
@@ -745,6 +759,8 @@ static void *view_art_worker(void *arg) {
             if (!ok && spotify_has_key() && spotify_fetch_cover(artist, album, dest) == 0)
                 ok = 1;
             if (ok) {
+                /* BG104: see art_worker()'s matching call for why. */
+                cover_downscale_max(dest, FETCHED_COVER_MAX_DIM);
                 bits = cover_load(dest, dir, ART_PX);
             } else {
                 FILE *f = fopen(nomatch, "w");

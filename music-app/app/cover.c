@@ -50,6 +50,20 @@ static boolean (*x_finish)(j_decompress_ptr);
 static void (*x_destroy)(j_decompress_ptr);
 static void (*x_calc_dims)(j_decompress_ptr);
 
+/* BG104: compress-side symbols, loaded separately from (and lazily after)
+ * the decompress ones above -- cover_load() must keep working even on a
+ * hypothetical build whose libjpeg.so.9 is missing these, and tying them
+ * into the same all-or-nothing load_lib() would make a compress-only
+ * problem take decoding down with it for no reason. */
+static void (*xc_create)(j_compress_ptr, int, size_t);
+static void (*xc_destroy)(j_compress_ptr);
+static void (*xc_stdio_dest)(j_compress_ptr, FILE *);
+static void (*xc_set_defaults)(j_compress_ptr);
+static void (*xc_set_quality)(j_compress_ptr, int, boolean);
+static void (*xc_start)(j_compress_ptr, boolean);
+static JDIMENSION (*xc_write_scanlines)(j_compress_ptr, JSAMPARRAY, JDIMENSION);
+static void (*xc_finish)(j_compress_ptr);
+
 /* Was 8 MB, which rejected a perfectly ordinary 1400x1400 progressive cover
  * (Apple's own documented *minimum* recommended podcast artwork size) --
  * its coefficient array alone is 1400*1400*3*sizeof(JCOEF) = ~11.2 MB,
@@ -86,6 +100,33 @@ static int load_lib(void) {
         !x_start || !x_read_scanlines || !x_finish || !x_destroy) {
         dlclose(g_lib);
         g_lib = NULL;
+        return 0;
+    }
+    return 1;
+}
+
+static int g_compress_tried;
+
+/* Off the same g_lib handle load_lib() already opened -- calling load_lib()
+ * first both ensures g_lib exists and reuses its own "is the library there
+ * at all" failure path, rather than duplicating a second dlopen. */
+static int load_lib_compress(void) {
+    if (g_compress_tried) return xc_create != NULL;
+    g_compress_tried = 1;
+    if (!load_lib()) return 0;
+
+    xc_create        = (void (*)(j_compress_ptr, int, size_t))dlsym(g_lib, "jpeg_CreateCompress");
+    xc_destroy       = (void (*)(j_compress_ptr))dlsym(g_lib, "jpeg_destroy_compress");
+    xc_stdio_dest    = (void (*)(j_compress_ptr, FILE *))dlsym(g_lib, "jpeg_stdio_dest");
+    xc_set_defaults  = (void (*)(j_compress_ptr))dlsym(g_lib, "jpeg_set_defaults");
+    xc_set_quality   = (void (*)(j_compress_ptr, int, boolean))dlsym(g_lib, "jpeg_set_quality");
+    xc_start         = (void (*)(j_compress_ptr, boolean))dlsym(g_lib, "jpeg_start_compress");
+    xc_write_scanlines = (JDIMENSION (*)(j_compress_ptr, JSAMPARRAY, JDIMENSION))dlsym(g_lib, "jpeg_write_scanlines");
+    xc_finish        = (void (*)(j_compress_ptr))dlsym(g_lib, "jpeg_finish_compress");
+
+    if (!xc_create || !xc_destroy || !xc_stdio_dest || !xc_set_defaults ||
+        !xc_set_quality || !xc_start || !xc_write_scanlines || !xc_finish) {
+        xc_create = NULL;   /* the load_lib_compress() != NULL check above */
         return 0;
     }
     return 1;
@@ -448,4 +489,203 @@ uint16_t *cover_load(const char *jpeg_path, const char *cache_key, int px) {
 
     save_cache(cache_key, px, out);
     return out;
+}
+
+/* BG104: see cover.h's own comment -- shrink a network-fetched cover before
+ * it ever reaches cover_load()'s own box filter, rather than trying to make
+ * that filter itself behave better at a large reduction ratio. Two
+ * independent decode/encode stages, each with its own setjmp scope: sharing
+ * one across both halves would need extra bookkeeping to stop the shared
+ * error handler from re-destroying/re-closing whichever half had already
+ * finished cleanly by the time the other one failed. */
+int cover_downscale_max(const char *jpeg_path, int max_dim) {
+    if (max_dim <= 0) return -1;
+    if (!load_lib()) return -1;
+
+    FILE *f = fopen(jpeg_path, "rb");
+    if (!f) return -1;
+
+    struct jpeg_decompress_struct cinfo;
+    struct jump_err jerr;
+    JSAMPLE *row = NULL;
+    JSAMPLE *outbuf = NULL;
+    long *racc = NULL, *gacc = NULL, *bacc = NULL;
+    int target_w = 0, target_h = 0;
+
+    memset(&cinfo, 0, sizeof(cinfo));
+    cinfo.err = x_std_error(&jerr.pub);
+    jerr.pub.error_exit = on_error;
+    jerr.pub.output_message = on_message;
+
+    if (setjmp(jerr.jump)) {
+        if (x_destroy) x_destroy(&cinfo);
+        free(row); free(outbuf); free(racc); free(gacc); free(bacc);
+        fclose(f);
+        return -1;
+    }
+
+    x_create(&cinfo, JPEG_LIB_VERSION, sizeof(struct jpeg_decompress_struct));
+    x_stdio_src(&cinfo, f);
+    x_read_header(&cinfo, TRUE);
+
+    if (cinfo.image_width > COVER_MAX_DIM || cinfo.image_height > COVER_MAX_DIM ||
+        cinfo.image_width == 0 || cinfo.image_height == 0)
+        longjmp(jerr.jump, 1);
+
+    int src_w = (int)cinfo.image_width, src_h = (int)cinfo.image_height;
+    if (src_w <= max_dim && src_h <= max_dim) {
+        x_destroy(&cinfo);
+        fclose(f);
+        return 0;   /* already within bounds -- not an error, nothing to do */
+    }
+
+    if (cinfo.progressive_mode) {
+        int64_t coeffs = (int64_t)src_w * src_h *
+                         (cinfo.num_components > 0 ? cinfo.num_components : 3) *
+                         (int64_t)sizeof(JCOEF);
+        if (coeffs > COVER_MEM_BUDGET) longjmp(jerr.jump, 1);
+    }
+
+    /* Longer side becomes max_dim; the other keeps the source's own ratio --
+     * unlike cover_load()'s square thumbnail, this is the actual cover.jpg
+     * on disk, and cropping it on the way in would throw away real image
+     * content every future viewer of this file gets, not just this app. */
+    if (src_w >= src_h) {
+        target_w = max_dim;
+        target_h = (int)((int64_t)src_h * max_dim / src_w);
+    } else {
+        target_h = max_dim;
+        target_w = (int)((int64_t)src_w * max_dim / src_h);
+    }
+    if (target_w < 1) target_w = 1;
+    if (target_h < 1) target_h = 1;
+
+    /* Same cheap pre-scale idea as cover_load(): ask libjpeg to skip most of
+     * the IDCT work rather than decode at full size only to shrink it right
+     * back down in the box filter below. */
+    cinfo.scale_num = 1;
+    cinfo.scale_denom = 1;
+    for (int d = 8; d >= 1; d--) {
+        if (src_w / d >= target_w && src_h / d >= target_h) {
+            cinfo.scale_denom = d;
+            break;
+        }
+    }
+    cinfo.out_color_space = JCS_RGB;
+    cinfo.do_fancy_upsampling = FALSE;
+    if (x_calc_dims) x_calc_dims(&cinfo);
+    x_start(&cinfo);
+
+    int w = (int)cinfo.output_width, h = (int)cinfo.output_height;
+    int comps = cinfo.output_components;
+    if (w <= 0 || h <= 0 || comps < 1) longjmp(jerr.jump, 1);
+
+    row    = malloc((size_t)w * (size_t)comps);
+    outbuf = malloc((size_t)target_w * (size_t)target_h * 3);
+    racc   = malloc((size_t)w * sizeof(long));
+    gacc   = malloc((size_t)w * sizeof(long));
+    bacc   = malloc((size_t)w * sizeof(long));
+    if (!row || !outbuf || !racc || !gacc || !bacc) longjmp(jerr.jump, 1);
+
+    /* Same box-filter accumulation shape as cover_load() above, generalized
+     * to an independent target_w/target_h rather than one shared px (and no
+     * x_off/y_off crop -- see the comment above target_w/target_h). */
+    int next_src_row = 0, rows = 0, have_rows = 0;
+    for (int y = 0; y < target_h; y++) {
+        int row_end = (int)((int64_t)(y + 1) * h / target_h);
+        if (row_end > h) row_end = h;
+        if (row_end > next_src_row || !have_rows) {
+            if (row_end <= next_src_row) row_end = next_src_row + 1;
+            if (row_end > h) row_end = h;
+            memset(racc, 0, (size_t)w * sizeof(long));
+            memset(gacc, 0, (size_t)w * sizeof(long));
+            memset(bacc, 0, (size_t)w * sizeof(long));
+            rows = 0;
+            while (next_src_row < row_end && cinfo.output_scanline < cinfo.output_height) {
+                JSAMPROW rp = row;
+                x_read_scanlines(&cinfo, &rp, 1);
+                for (int sx = 0; sx < w; sx++) {
+                    const JSAMPLE *p = row + (size_t)sx * comps;
+                    racc[sx] += p[0];
+                    gacc[sx] += comps > 1 ? p[1] : p[0];
+                    bacc[sx] += comps > 2 ? p[2] : p[0];
+                }
+                next_src_row++;
+                rows++;
+            }
+            if (rows == 0) rows = 1;
+            have_rows = 1;
+        }
+        JSAMPLE *orow = outbuf + (size_t)y * (size_t)target_w * 3;
+        for (int x = 0; x < target_w; x++) {
+            int col_start = (int)((int64_t)x * w / target_w);
+            int col_end = (int)((int64_t)(x + 1) * w / target_w);
+            if (col_end <= col_start) col_end = col_start + 1;
+            if (col_end > w) col_end = w;
+            long rs = 0, gs = 0, bs = 0;
+            for (int sx = col_start; sx < col_end; sx++) {
+                rs += racc[sx]; gs += gacc[sx]; bs += bacc[sx];
+            }
+            int n = (col_end - col_start) * rows;
+            orow[x * 3 + 0] = (JSAMPLE)(rs / n);
+            orow[x * 3 + 1] = (JSAMPLE)(gs / n);
+            orow[x * 3 + 2] = (JSAMPLE)(bs / n);
+        }
+    }
+    free(racc); free(gacc); free(bacc);
+    racc = gacc = bacc = NULL;
+
+    while (cinfo.output_scanline < cinfo.output_height) {
+        JSAMPROW rp = row;
+        x_read_scanlines(&cinfo, &rp, 1);
+    }
+    x_finish(&cinfo);
+    x_destroy(&cinfo);
+    fclose(f);
+    free(row);
+    row = NULL;
+
+    /* ---- encode outbuf as a fresh baseline JPEG, write-then-rename ---- */
+    if (!load_lib_compress()) { free(outbuf); return -1; }
+
+    char tmp_path[600];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp-shrink", jpeg_path);
+    FILE *out_f = fopen(tmp_path, "wb");
+    if (!out_f) { free(outbuf); return -1; }
+
+    struct jpeg_compress_struct cout;
+    struct jump_err jerr2;
+    memset(&cout, 0, sizeof(cout));
+    cout.err = x_std_error(&jerr2.pub);
+    jerr2.pub.error_exit = on_error;
+    jerr2.pub.output_message = on_message;
+
+    if (setjmp(jerr2.jump)) {
+        if (xc_destroy) xc_destroy(&cout);
+        fclose(out_f);
+        unlink(tmp_path);
+        free(outbuf);
+        return -1;
+    }
+
+    xc_create(&cout, JPEG_LIB_VERSION, sizeof(struct jpeg_compress_struct));
+    xc_stdio_dest(&cout, out_f);
+    cout.image_width = (JDIMENSION)target_w;
+    cout.image_height = (JDIMENSION)target_h;
+    cout.input_components = 3;
+    cout.in_color_space = JCS_RGB;
+    xc_set_defaults(&cout);
+    xc_set_quality(&cout, 85, TRUE);
+    xc_start(&cout, TRUE);
+    while (cout.next_scanline < cout.image_height) {
+        JSAMPROW rp = outbuf + (size_t)cout.next_scanline * (size_t)target_w * 3;
+        xc_write_scanlines(&cout, &rp, 1);
+    }
+    xc_finish(&cout);
+    xc_destroy(&cout);
+    fclose(out_f);
+    free(outbuf);
+
+    if (rename(tmp_path, jpeg_path) != 0) { unlink(tmp_path); return -1; }
+    return 0;
 }
