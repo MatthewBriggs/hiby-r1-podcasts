@@ -9740,16 +9740,31 @@ int music_entry(void *a0, void *a1) {
                  * off/header_h math (see the draw/tap-handling code above),
                  * not scroll+((touch_y-CONTENT_Y)/ROW_H) -- that assumed
                  * content starting at CONTENT_Y, which is only still true
-                 * for pod_list's unchanged layout. */
+                 * for pod_list's unchanged layout.
+                 *
+                 * BUG fix: this used to redo that header-relative math by
+                 * hand -- (content_y - header_h) / ROW_H -- rather than
+                 * calling track_index_at(), which R56 introduced specifically
+                 * so a row's position never has to be recomputed a second,
+                 * independent way (see that function's own comment: BG2/
+                 * BG61-class bugs are exactly two copies of the same
+                 * arithmetic drifting apart). This plain division predates
+                 * disc banners entirely and was never updated for them, so a
+                 * long-press on a genuine multi-disc album resolved to the
+                 * wrong track by however many banner-heights preceded it --
+                 * plain tap-to-play (already routed through track_index_at())
+                 * was unaffected, which is why only the press-and-hold sheet
+                 * (Play Next / Add to Queue) ever acted on the wrong song.
+                 * Reported live on "Substance 1987": holding a Disc 2 track
+                 * opened the sheet for a different track a couple of rows
+                 * off. */
                 int idx;
                 if (pod_list) {
                     idx = scroll + (touch_y - CONTENT_Y) / ROW_H;
                 } else {
                     int off = scroll * ROW_H + scroll_px;
-                    int header_h = tracks_hdr_h();
                     int content_y = touch_y + off;
-                    idx = (content_y - header_h) / ROW_H;
-                    if (content_y < header_h) idx = -1;
+                    idx = track_index_at(content_y);
                 }
                 hold_fired = 1;
                 if (idx >= 0 && idx < track_n) {
