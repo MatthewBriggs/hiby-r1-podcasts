@@ -2578,6 +2578,28 @@ static int vis_rows(void) {
     return h / ROW_H;
 }
 
+/* Same reasoning as vis_rows()'s own comment on the mini player, for the
+ * one list on this screen that predates vis_rows()/off-based scrolling and
+ * never got folded into it: SC_SETTINGS_BT's scan results are a small,
+ * bespoke, non-scrolling draw loop, so a mini player showing underneath
+ * playback in progress (very much the common case -- pairing a new
+ * headset while something's already playing over the old one) could draw
+ * device rows into the same screen area the mini player owns. The mini
+ * player's own tap zone takes priority globally over every screen's own
+ * content (checked earlier in the tap-dispatch chain), so those rows drew
+ * as if tappable but silently went to the mini player instead -- reported
+ * live as "I can't tap to select a bluetooth device... it's like the tap
+ * doesn't get picked up on". Shared by the draw loop and the tap handler,
+ * same "one boundary, not two copies of it" reasoning as MINI_BTN_R's own
+ * comment (BG21) and track_index_at()'s (BG2/BG61) -- a device that isn't
+ * actually visible must never be reachable to tap, and vice versa. */
+static int bt_scan_max_visible(void) {
+    int bottom = mini_visible() ? FB_H - MINI_H : FB_H;
+    int list_top = CONTENT_Y + 3 * ROW_H;   /* toggle, status, "Scan for devices" */
+    int avail = bottom - list_top;
+    return avail > 0 ? avail / ROW_H : 0;
+}
+
 /* Only the two lists long enough to need it -- and not Recent, capped at
  * PAGE_MAX items and sorted by recency rather than alphabetically, where a
  * letter strip would have nothing meaningful to jump to. */
@@ -5659,7 +5681,8 @@ static void draw_screen(uint16_t *fb) {
         if (dev_n == 0) {
             draw_text(fb, 24, ry + 20, "No devices found yet", COL_DIM, TEXT_PX_SMALL, FB_W - 48);
         } else {
-            for (int i = 0; i < dev_n && ry < FB_H - ROW_H; i++) {
+            int bt_max_visible = bt_scan_max_visible();
+            for (int i = 0; i < dev_n && i < bt_max_visible; i++) {
                 draw_text_clip(fb, 24, ry + 20, devs[i].name[0] ? devs[i].name : devs[i].mac,
                               COL_TEXT, TEXT_PX_BODY, FB_W - 48, CONTENT_Y, FB_H);
                 draw_right_clip(fb, ry + 20, devs[i].mac, CONTENT_Y, FB_H);
@@ -8731,7 +8754,14 @@ int music_entry(void *a0, void *a1) {
                     bt_found_dev_t devs[8];
                     int n = bt_scan_devices(devs, 8);
                     int idx = row - 3;
-                    if (idx >= 0 && idx < n) bt_pair(devs[idx].mac);
+                    /* bt_scan_max_visible(), not just idx < n -- see its own
+                     * comment. A device past the mini player's own reserved
+                     * area was never actually reachable to look at, so a tap
+                     * landing there belongs to the mini player instead
+                     * (checked earlier in this same chain), not to a device
+                     * that only looks tappable. */
+                    if (idx >= 0 && idx < n && idx < bt_scan_max_visible())
+                        bt_pair(devs[idx].mac);
                 }
             } else if (screen == SC_SETTINGS_THEME) {
                 int idx = (y - CONTENT_Y) / ROW_H;
