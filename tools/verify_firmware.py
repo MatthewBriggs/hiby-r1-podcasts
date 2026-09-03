@@ -30,6 +30,11 @@ VERSION_FILE = "etc/r1_audiobook_version"
 EMBED_BINARY = "usr/lib/libra/library_standalone"   # see patch_firmware.py --embed-binary
 SET_FUNCTIONS_FILES = ("usr/resource/set_functions.json",
                        "usr/resource/midi_set_functions.json")
+HGL_SCRIPT = "module_driver/sa_hgl_dma.sh"
+MODULE_INIT_SCRIPT = "module_driver/driver_default_init_script.sh"
+ADB_INIT_SCRIPT = "etc/init.d/adb/S440adb"
+BRCMFMAC_FILES = ("lib/firmware/brcm/brcmfmac43430-sdio.bin",
+                  "lib/firmware/brcm/brcmfmac43430-sdio.txt")
 
 
 def detect_format(path):
@@ -397,7 +402,8 @@ def main():
                 for k in removed:
                     print(f"    - {k}")
                 expected = {SCRIPT, MOUNT_SCRIPT, CONFIG_JSON, VERSION_FILE,
-                            BT_INIT, "module_driver/sa_hgl_dma.sh"}
+                            BT_INIT, HGL_SCRIPT, MODULE_INIT_SCRIPT,
+                            ADB_INIT_SCRIPT, "usr/bin/adboff", "usr/bin/adbon"}
                 expected |= set(SET_FUNCTIONS_FILES)
                 # kernel_build_id: --kernel-build-id re-stamps this file, which
                 # shows up as "changed" (not "added") whenever the base image
@@ -414,9 +420,15 @@ def main():
                 # New, not changed, on a vanilla base -- a mod base already
                 # carries this file, so there it would show up as "changed"
                 # (or not at all, if identical) instead.
-                expected_added = {"etc/init.d/S90adb", "usr/resource/kernel_build_id"}
+                expected_added = {"etc/init.d/S90adb", "usr/resource/kernel_build_id",
+                                  "etc/init.d/S22_bt_init", EMBED_BINARY}
+                expected_added |= set(BRCMFMAC_FILES)
+                # hasten_bt_init() renames S80_bt_init -> S22_bt_init (the
+                # first slot after /usr/data is mounted) rather than editing
+                # it in place, so the old name legitimately disappears.
+                expected_removed = {"etc/init.d/S80_bt_init"}
                 if (set(changed) <= expected and set(added) <= expected_added
-                        and not removed):
+                        and set(removed) <= expected_removed):
                     print(f"    only expected files changed ({len(changed)}), "
                           f"as intended")
                 else:
