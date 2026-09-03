@@ -27,6 +27,7 @@ MOUNT_SCRIPT = "usr/bin/mount_ubifs.sh"
 BT_INIT = "usr/bin/bt_init"
 CONFIG_JSON = "usr/resource/config.json"
 VERSION_FILE = "etc/r1_audiobook_version"
+EMBED_BINARY = "usr/lib/libra/library_standalone"   # see patch_firmware.py --embed-binary
 SET_FUNCTIONS_FILES = ("usr/resource/set_functions.json",
                        "usr/resource/midi_set_functions.json")
 
@@ -352,6 +353,17 @@ def main():
             # own full replacement (see build_standalone_supervisor() in
             # patch_firmware.py). Only neither is a real problem.
             ok &= (has or standalone)
+            if standalone and "SEED_BINARY=" in body:
+                embed_path = os.path.join(root, EMBED_BINARY)
+                if os.path.exists(embed_path):
+                    size = os.path.getsize(embed_path)
+                    print(f"    embedded binary            yes ({EMBED_BINARY}, {size} bytes)")
+                else:
+                    print(f"    embedded binary            NO -- supervisor "
+                          f"expects one at /{EMBED_BINARY} but it isn't in "
+                          f"the image (a fresh device would boot with "
+                          f"nothing to seed /usr/data with)")
+                    ok = False
         else:
             print(f"\n  {SCRIPT} MISSING")
             ok = False

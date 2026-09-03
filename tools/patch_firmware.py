@@ -163,6 +163,107 @@ def patch_bt_init(text):
     return None
 
 
+
+# ---------------------------------------------------------------- bt timing
+#
+# Stock bt_init spends ~12s in sleep(1): 1 after the rfkill write, 5 after
+# brcm_patchram_plus, 1 after "hciconfig up", 1 after the reset, 2 after
+# bt-agent, and 1 each around the alsa.conf write and the bt-adapter calls.
+#
+# Measured on hardware (LEAN_4, 2026-09-02), stock, from a cold boot:
+#
+#     rfkill0 present (cywdhd finished)   uptime  3.88s
+#     hci0 present                        uptime  8.98s
+#     /tmp/bt_init_ok                     uptime 16.29s
+#
+# So Bluetooth was not actually usable until 16.3s, and cywdhd -- the thing
+# previously blamed for BT being late -- accounted for 0.44s of that, under
+# 3%. The sleeps are the whole story.
+#
+# Each sleep below becomes "wait until the thing we were sleeping for is
+# true", polling every 50ms, with a timeout. The timeout is the failure
+# bound, not the normal path, so the worst case is no worse than stock's
+# blind sleep and the normal case is much faster. Re-running the rewritten
+# script on hardware, against a full rfkill power-cycle of the radio, it
+# completes in 5.79s instead of ~12.4s with every milestone reached
+# (bluetoothd, bt-agent and bluealsa all up, alias set, Hibylink SP
+# registered, same "Powered 1 -> 0" end state).
+#
+# The rfkill wait is also what makes backgrounding cywdhd safe: with
+# defer_wifi_module in play, rfkill0 may not exist yet when this script runs.
+
+BT_WAIT_HELPER = '# bt_wait <max_seconds> "<shell test>" -- poll every 50ms until true.\n# Replaces the fixed sleeps this script used to use; see patch_firmware.py.\nbt_wait() {\n    _n=$(( $1 * 20 )); _c="$2"; _i=0\n    while [ "$_i" -lt "$_n" ]; do\n        eval "$_c" >/dev/null 2>&1 && return 0\n        usleep 50000 2>/dev/null || sleep 1\n        _i=$(( _i + 1 ))\n    done\n    return 1\n}\n\nrm /var/run/messagebus.pid -rf'
+
+# (anchor, replacement, description) -- each must match exactly once.
+BT_TIMING_EDITS = (
+    ("rm /var/run/messagebus.pid -rf",
+     BT_WAIT_HELPER,
+     "bt_wait helper"),
+
+    ("echo 1 > /sys/class/rfkill/rfkill0/state\n"
+     "sleep 1 # if invoke this script in c with system(), must sleep for a while!!!!!",
+     "# rfkill0 is registered by cywdhd (md_bcmdhd_bt_power). If that module\n"
+     "# is being loaded in the background, the node may not be there yet.\n"
+     "bt_wait 10 '[ -e /sys/class/rfkill/rfkill0/state ]'\n"
+     "echo 1 > /sys/class/rfkill/rfkill0/state",
+     "rfkill write (-1s, +wait for node)"),
+
+    ("&\nsleep 5\n",
+     "&\n# was: sleep 5 -- wait for patchram to register the adapter instead\n"
+     "bt_wait 15 '[ -d /sys/class/bluetooth/hci0 ]'\n",
+     "patchram (-5s)"),
+
+    ("hciconfig hci0 up\nsleep 1",
+     "hciconfig hci0 up\n"
+     "bt_wait 5 'hciconfig hci0 | grep -q \"UP RUNNING\"'",
+     "hci0 up (-1s)"),
+
+    ("hciconfig hci0 reset\nsleep 1",
+     "# bluez has to be on the bus before the reset is meaningful\n"
+     "bt_wait 5 'dbus-send --system --print-reply --dest=org.bluez / "
+     "org.freedesktop.DBus.Peer.Ping'\n"
+     "hciconfig hci0 reset\n"
+     "bt_wait 5 'hciconfig hci0 | grep -q \"UP RUNNING\"'",
+     "bluez reset (-1s, +wait for bus)"),
+
+    ("bt-agent -c NoInputNoOutput &\nsleep 2",
+     "bt-agent -c NoInputNoOutput &\nbt_wait 5 'pidof bt-agent'",
+     "bt-agent (-2s)"),
+
+    ("# add hibylink serial port\nsleep 1",
+     "# add hibylink serial port\nbt_wait 5 'bt-adapter --list'",
+     "hibylink SP (-1s)"),
+)
+
+
+def patch_bt_init_timing(text):
+    """Replace bt_init's fixed sleeps with condition polling.
+
+    Returns (new_text, [descriptions]) or None if already applied. Anchors
+    that do not match are skipped and reported rather than being fatal --
+    this script differs slightly between the vanilla and mod images, and a
+    partially-applied speedup is still a speedup.
+    """
+    if "bt_wait()" in text:
+        return None                      # already done
+    applied = []
+    for anchor, repl, desc in BT_TIMING_EDITS:
+        if text.count(anchor) == 1:
+            text = text.replace(anchor, repl, 1)
+            applied.append(desc)
+    if not applied:
+        return None
+    # The lone "sleep 1" between the alsa.conf block and the bt-adapter calls
+    # has no unique neighbouring text, so it is handled positionally: it is
+    # the sleep that guards bluealsa coming up.
+    if "\nsleep 1\n\nif [ -f /usr/resource/bt_name ]" in text:
+        text = text.replace(
+            "\nsleep 1\n\nif [ -f /usr/resource/bt_name ]",
+            "\nbt_wait 5 'pidof bluealsa'\n\nif [ -f /usr/resource/bt_name ]", 1)
+        applied.append("bluealsa (-1s)")
+    return text, applied
+
+
 ANCHOR_MOUNT = 'mount -o sync -t ubifs /dev/${ubi_name}_0 $mount_path'
 INSERT_MOUNT = 'mount -o noatime -t ubifs /dev/${ubi_name}_0 $mount_path'
 
@@ -471,7 +572,35 @@ done
 '''
 
 
-def build_standalone_supervisor(original_text, binary_path):
+# Rootfs-relative home for an embedded release binary -- NOT /usr/data,
+# which is a separate mount that shadows anything placed there in the
+# image itself, so a file living only in the squashfs tree at that path
+# would just be invisible at runtime. usr/lib is ordinary rootfs, always
+# present after unsquashfs regardless of mount order.
+EMBED_DIR = "usr/lib/libra"
+EMBED_BINARY_NAME = "library_standalone"
+
+STANDALONE_SEED_BLOCK = '''
+# Release-embedded binary (--embed-binary): this rootfs carries its own
+# copy of BINARY, seeded at build time. If /usr/data doesn't already hold
+# a matching version -- a fresh device, or one that was never separately
+# adb-pushed a build for this exact release -- copy it in before the loop
+# below ever tries to launch it. Once /usr/data holds any version, plain
+# adb-push iteration keeps overwriting it exactly as before this existed;
+# this only fires when the two disagree, so it can never clobber a dev
+# build mid-session, only bring a version-mismatched or empty /usr/data
+# up to what this firmware actually shipped with.
+SEED_BINARY="/{embed_dir}/{embed_name}"
+SEED_VERSION="{seed_version}"
+DATA_VERSION_FILE="/usr/data/.library_standalone_version"
+if [ -f "$SEED_BINARY" ] && [ "$(cat "$DATA_VERSION_FILE" 2>/dev/null)" != "$SEED_VERSION" ]; then
+    cp -f "$SEED_BINARY" "$BINARY" && chmod 755 "$BINARY"
+    echo "$SEED_VERSION" > "$DATA_VERSION_FILE"
+fi
+'''
+
+
+def build_standalone_supervisor(original_text, binary_path, seed_version=None):
     """RP1: full-replacement supervisor that launches `binary_path` (an
     on-device path, e.g. /usr/data/library_standalone) directly in a
     crash-counted loop -- no hiby_player, no DEV_HOOK/LD_PRELOAD at all.
@@ -482,11 +611,21 @@ def build_standalone_supervisor(original_text, binary_path):
     which player runs after it, so that preamble is kept unmodified.
     Returns None if the anchor isn't found, same "stop rather than guess"
     contract every other supervisor-shape function here follows.
+
+    seed_version, if given (see --embed-binary/--embed-version), inserts
+    STANDALONE_SEED_BLOCK right before the crash-loop starts -- once per
+    boot, not once per crash-restart within a boot.
     """
     if VANILLA_ANCHOR_PREAMBLE_END not in original_text:
         return None
     preamble = original_text.split(VANILLA_ANCHOR_PREAMBLE_END)[0] + VANILLA_ANCHOR_PREAMBLE_END
     body = STANDALONE_SUPERVISOR_BODY.format(binary_path=binary_path)
+    if seed_version:
+        seed_block = STANDALONE_SEED_BLOCK.format(
+            embed_dir=EMBED_DIR, embed_name=EMBED_BINARY_NAME, seed_version=seed_version)
+        marker = "while true; do"
+        idx = body.index(marker)
+        body = body[:idx] + seed_block + "\n" + body[idx:]
     return preamble + "\n" + body
 
 
@@ -622,9 +761,11 @@ def defer_wifi_module(root):
     """Background the WiFi module load IN PLACE, so its chip init overlaps the
     remaining module loads and app startup instead of blocking them.
 
-    Measured on hardware: cywdhd init costs ~1.1s of a ~4s boot, and the
-    kernel proper is done at 0.36s -- the rest is this script insmod'ing 28
-    vendor modules sequentially, with the WiFi chip by far the most expensive.
+    Measured on hardware (LEAN_4, 2026-09-02): dhd_module_init in -> out is
+    0.44s, and the kernel proper is done at 0.357s of a 3.95s boot-to-adb --
+    the rest is this script insmod'ing 28 vendor modules sequentially, with the
+    WiFi chip by far the most expensive single one. (An earlier note here said
+    ~1.1s; that was an over-read of the log, corrected by direct measurement.)
 
     Two things this deliberately does NOT do, both learned the hard way:
 
@@ -655,10 +796,11 @@ def defer_wifi_module(root):
     for l in lines:
         if l.strip() == target:
             out += [
-                "# WiFi/BT combo chip: backgrounded so its ~1.1s of init overlaps",
+                "# WiFi/BT combo chip: backgrounded so its 0.44s of init overlaps",
                 "# the module loads below and app startup. Kept in position, NOT",
                 "# moved later -- this module owns md_bcmdhd_bt_power and therefore",
                 "# rfkill0, so moving it delays Bluetooth becoming available.",
+                "# bt_init now waits for rfkill0 rather than assuming it exists.",
                 target + " &",
             ]
         else:
@@ -666,6 +808,217 @@ def defer_wifi_module(root):
     with open(path, "w") as fh:
         fh.write("\n".join(out) + "\n")
     return True
+
+
+
+
+# The D-Bus preamble bt_init runs before it touches the radio at all.
+# Measured on hardware: dbus-uuidgen 0.050s + dbus-daemon spawn 0.180s =
+# ~0.23s, and brcm_patchram_plus is backgrounded anyway, so the chip can be
+# downloading its firmware during that instead of after it.
+BT_DBUS_BLOCK = """rm /var/run/messagebus.pid -rf
+# turn on dbus-daemon service
+mkdir -p /tmp/dbus
+mkdir -p /var/lib/dbus
+dbus-uuidgen > /var/lib/dbus/machine-id
+dbus-daemon --config-file=/usr/share/dbus-1/system.conf
+"""
+
+BT_PATCHRAM_TAIL = """&
+# was: sleep 5 -- wait for patchram to register the adapter instead
+"""
+
+
+def reorder_bt_init_radio_first(text):
+    """Start the radio before the D-Bus preamble, not after it.
+
+    Runs after patch_bt_init_timing() and keys off that function's own
+    marker comment, so it only applies to a script this tool has already
+    converted to polling.
+
+    Why this is safe: nothing between the top of the script and the
+    brcm_patchram_plus launch needs D-Bus. The rfkill write is a sysfs poke,
+    the BD address comes from a file, and the firmware choice is a sysfs read
+    plus a case statement. bluetoothd -- the first thing that actually needs a
+    bus -- is started well after the hci0 wait, by which point the moved block
+    has long since run.
+
+    The 4.26s that patchram spends is chip-side (measured: 4.188s of it is
+    read() blocking on the UART across 746 reads, 191 HCI commands, ~22ms of
+    chip processing each), so overlapping anything with it is a real gain.
+
+    Returns the new text, or None if the anchors are not both present exactly
+    once -- same stop-rather-than-guess contract as the rest of this file.
+    """
+    if text.count(BT_DBUS_BLOCK) != 1 or text.count(BT_PATCHRAM_TAIL) != 1:
+        return None
+    if text.index(BT_DBUS_BLOCK) > text.index(BT_PATCHRAM_TAIL):
+        return None                      # already reordered
+    moved = ("# D-Bus setup, moved down from the top of the script: it costs\n"
+             "# ~0.23s and the radio does not need it, so it now runs while\n"
+             "# brcm_patchram_plus is already downloading firmware.\n"
+             + BT_DBUS_BLOCK)
+    text = text.replace(BT_DBUS_BLOCK, "", 1)
+    text = text.replace(BT_PATCHRAM_TAIL,
+                        "&\n\n" + moved + "\n"
+                        "# was: sleep 5 -- wait for patchram to register the adapter instead\n",
+                        1)
+    return text
+
+
+def background_touch_module(root):
+    """Background the touchscreen module load.
+
+    Measured: the cst8xx_touch i2c probe costs 0.298s (1.359 -> 1.657 in
+    dmesg), the largest single schedulable gap left in the module init
+    script now that cywdhd is backgrounded. Nothing needs the touchscreen
+    until the player starts at S92, roughly 1.5s later.
+
+    OFF BY DEFAULT -- tried on hardware 2026-09-03 and it broke the
+    touchscreen. Not a driver problem: the module still loads and
+    hyn_ts_probe still succeeds (at 2.117s). What changes is the input
+    ENUMERATION ORDER. Backgrounded, "jz adc keyboard" wins the race:
+
+        working:      event1 = hyn_ts,          event2 = jz adc keyboard
+        backgrounded: event1 = jz adc keyboard, event2 = hyn_ts
+
+    and music_hook.c hardcodes both -- it opens /dev/input/event1 for touch
+    and lists event2 in scan_inputs()'s fixed[] table as "side buttons",
+    which it then EVIOCGRABs exclusively. So the app reads the keyboard as
+    touch and grabs the touchscreen as buttons.
+
+    The technique itself is sound and worth ~0.3s. Enabling it needs
+    music_hook.c to resolve nodes by name out of /proc/bus/input/devices --
+    which scan_inputs() already does for AVRCP devices, so the pattern is
+    right there. Until that lands, leave this off.
+
+    Returns True if the line was changed.
+    """
+    path = os.path.join(root, MODULE_INIT_SCRIPT)
+    if not os.path.exists(path):
+        return False
+    with open(path) as fh:
+        lines = fh.read().splitlines()
+    target = "sh cst8xx_touch.sh"
+    if not any(l.strip() == target for l in lines):
+        return False
+    out = []
+    for l in lines:
+        if l.strip() == target:
+            out += [
+                "# Touchscreen probe costs ~0.3s and nothing needs it until the",
+                "# player starts at S92. Backgrounded -- see background_touch_module().",
+                target + " &",
+            ]
+        else:
+            out.append(l)
+    with open(path, "w") as fh:
+        fh.write("\n".join(out) + "\n")
+    return True
+
+
+
+ADB_INIT_SCRIPT = "etc/init.d/adb/S440adb"
+
+# Stock's ADB<->USB-storage switch is one-way on this build, and the reason is
+# a pair of assumptions in the vendor scripts that only hold if ADB is *not* a
+# permanent fixture.
+#
+# /usr/bin/adboff  = S440adb stop      + usb_dev_mass_storage.sh start
+# /usr/bin/adbon   = mass_storage stop + S440adb start
+#
+# usb_dev_mass_storage.sh's storage_stop() finishes with
+# "umount /sys/kernel/config" -- it tears down the whole configfs mount, not
+# just its own gadget. On this device that umount always fails EBUSY (observed
+# on every run, in both directions). S440adb start then hits
+#
+#     if [ -d /sys/kernel/config/usb_gadget ]; then
+#         echo "Usage: usb configfs already mounted"
+#         exit 1
+#     fi
+#
+# and exits 1 without recreating the ADB gadget -- silently, since adbon
+# returns 0 regardless. Net effect measured on hardware: after switching to
+# storage and back, there is NO gadget bound at all. No ADB, no storage, no
+# USB device of any kind, recoverable only by a power cycle.
+#
+# Both edits below make S440adb tolerate a configfs that someone else mounted:
+# mount it only if it is not already there, and refuse only if the ADB gadget
+# itself already exists. Verified on hardware: full ADB -> storage -> ADB round
+# trip, the card enumerating on the host as a 511.9GB volume, and adb
+# reconnecting on its own with no reboot.
+ADB_MOUNT_ANCHOR = "\tmount -t configfs none /sys/kernel/config\n"
+ADB_MOUNT_FIXED = ("\t[ -d /sys/kernel/config/usb_gadget ] || "
+                   "mount -t configfs none /sys/kernel/config\n")
+ADB_GUARD_ANCHOR = "\tif [ -d /sys/kernel/config/usb_gadget ]; then\n"
+ADB_GUARD_FIXED = "\tif [ -d /sys/kernel/config/usb_gadget/adb_demo ]; then\n"
+
+
+def fix_usb_mode_switch(root):
+    """Make switching back from USB storage to ADB actually work.
+
+    See the comment above for the failure and the evidence. Returns a list of
+    the edits applied, or None if the script is missing or already fixed.
+    """
+    path = os.path.join(root, ADB_INIT_SCRIPT)
+    if not os.path.exists(path):
+        return None
+    with open(path) as fh:
+        text = fh.read()
+    # NB: a plain "usb_gadget/adb_demo ]; then" test is a false positive --
+    # the stock stop) branch already contains "if [ ! -d .../adb_demo ]; then".
+    # Match the fixed guard line exactly instead.
+    if ADB_GUARD_FIXED in text:
+        return None                      # already fixed
+    applied = []
+    if text.count(ADB_MOUNT_ANCHOR) == 1:
+        text = text.replace(ADB_MOUNT_ANCHOR, ADB_MOUNT_FIXED, 1)
+        applied.append("mount configfs only if not already mounted")
+    if text.count(ADB_GUARD_ANCHOR) == 1:
+        text = text.replace(ADB_GUARD_ANCHOR, ADB_GUARD_FIXED, 1)
+        applied.append("refuse only if adb_demo already exists")
+    if not applied:
+        return None
+    with open(path, "w") as fh:
+        fh.write(text)
+    return applied
+
+
+def hasten_bt_init(root):
+    """Move bt_init from S80 to S22, so its fixed cost overlaps the rest of boot.
+
+    Measured on hardware (LEAN_4, 2026-09-02): the dominant cost in bt_init is
+    brcm_patchram_plus, which takes 4.26s before hci0 appears. That figure is
+    *fixed* -- it was measured at --tosleep=50000, 20000, 10000 and 5000 and
+    came back 4.25-4.26s every time, and the .hcd is only 46KB, so it is
+    neither the per-command sleep nor the 3Mbaud transfer. It is the chip's own
+    bring-up plus hardcoded delays inside brcm_patchram_plus, and we have no
+    source for that binary. So it cannot be made shorter -- only started sooner.
+
+    S80_bt_init already runs the script backgrounded ("$PL01 &"), so nothing
+    downstream waits on it. Its real dependencies are:
+
+      - /usr/data mounted, for bt_macaddr.txt and alsa.conf   -> S21mount_ubifs
+      - rfkill0, i.e. cywdhd loaded                           -> S11, and the
+        patched script now waits for the node rather than assuming it
+      - /dev/ttyS0                                            -> kernel, always
+      - its own dbus-daemon, which it starts itself           -> not S30dbus
+
+    So S22 is the first slot where it can run, and moving it there overlaps
+    those 4.26s with S30/S40/S43/S50 and the player start instead of paying
+    them after all of it.
+
+    Returns the new filename, or None if there is nothing to do.
+    """
+    initd = os.path.join(root, "etc/init.d")
+    src = os.path.join(initd, "S80_bt_init")
+    dst = os.path.join(initd, "S22_bt_init")
+    if os.path.exists(dst):
+        return None                      # already hastened
+    if not os.path.exists(src):
+        return None
+    os.rename(src, dst)
+    return "S22_bt_init"
 
 
 def install_boot_adb(root):
@@ -982,13 +1335,38 @@ def main():
     ap.add_argument("--standalone", metavar="DEVICE_PATH", nargs="?",
                     const="/usr/data/library_standalone",
                     help="RP1: replace hiby_player.sh entirely with a loop "
-                         "that launches DEVICE_PATH (an on-device path, not "
-                         "a local file -- nothing is embedded in the image) "
+                         "that launches DEVICE_PATH (an on-device path) "
                          "directly, no hiby_player and no DEV_HOOK/LD_PRELOAD "
                          "at all. Defaults to /usr/data/library_standalone "
                          "if given with no value. Only works against a bare "
                          "vanilla hiby_player.sh -- see "
-                         "build_standalone_supervisor()'s own comment.")
+                         "build_standalone_supervisor()'s own comment. Pair "
+                         "with --embed-binary to also ship a matching binary "
+                         "inside the image itself, rather than assuming "
+                         "DEVICE_PATH is already populated some other way.")
+    ap.add_argument("--embed-binary", metavar="LOCAL_PATH",
+                    help="bake a local library_standalone build into the "
+                         "rootfs itself (under usr/lib/libra/), so flashing "
+                         "this .upt alone -- no separate adb push -- gets a "
+                         "fresh or version-mismatched device to a working "
+                         "install. Requires --standalone and --embed-version. "
+                         "The DEVICE_PATH from --standalone is still what "
+                         "actually runs; this only seeds it on first boot "
+                         "after a version change, so an existing device "
+                         "mid-session with a newer adb-pushed dev build is "
+                         "never overwritten by flashing an older release.")
+    ap.add_argument("--embed-version", metavar="VERSION",
+                    help="version string for --embed-binary (e.g. '0.45', "
+                         "matching LIBRARY_VERSION in music_hook.c) -- "
+                         "stamped alongside the embedded binary and compared "
+                         "against /usr/data's own marker at boot to decide "
+                         "whether to copy it in.")
+    ap.add_argument("--background-touch", action="store_true",
+                    help="background the touchscreen module load (~0.3s off "
+                         "boot). OFF by default: it reorders input device "
+                         "enumeration and music_hook.c hardcodes event1/event2, "
+                         "so it currently breaks touch. See "
+                         "background_touch_module().")
     ap.add_argument("--kernel-build-id", metavar="ID",
                     help="stamp usr/resource/kernel_build_id with this "
                          "string (e.g. '4.4.94_r1') -- read by the app's "
@@ -1010,6 +1388,15 @@ def main():
         die(f"{args.input} not found")
     if os.path.exists(args.output):
         die(f"{args.output} already exists — refusing to overwrite")
+    if args.embed_binary:
+        if not args.standalone:
+            die("--embed-binary requires --standalone (it seeds that DEVICE_PATH)")
+        if not args.embed_version:
+            die("--embed-binary requires --embed-version")
+        if not os.path.exists(args.embed_binary):
+            die(f"{args.embed_binary} not found")
+    elif args.embed_version:
+        die("--embed-version has no effect without --embed-binary")
 
     iso = pycdlib.PyCdlib()
     iso.open(args.input)
@@ -1073,17 +1460,40 @@ def main():
         with open(target, "r") as fh:
             original = fh.read()
 
+        already_standalone = False
         if args.standalone:
             # A full replacement, not an incremental patch -- DEV_HOOK/
             # MAX_CRASHES already being present says nothing about whether
             # this can proceed, so that check is skipped entirely here.
-            patched = build_standalone_supervisor(original, args.standalone)
+            patched = build_standalone_supervisor(
+                original, args.standalone, seed_version=args.embed_version)
             kind = f"standalone ({args.standalone})"
             if patched is None:
                 die(f"{SCRIPT} does not match the bare vanilla shape "
                     f"--standalone was written against (missing the batd "
                     f"preamble anchor) -- see build_standalone_supervisor()'s "
                     f"own comment.")
+            if args.embed_binary:
+                embed_dir_abs = os.path.join(root, EMBED_DIR)
+                os.makedirs(embed_dir_abs, exist_ok=True)
+                embed_target = os.path.join(embed_dir_abs, EMBED_BINARY_NAME)
+                shutil.copy2(args.embed_binary, embed_target)
+                os.chmod(embed_target, 0o755)
+                print(f"embedded {args.embed_binary} -> "
+                      f"/{EMBED_DIR}/{EMBED_BINARY_NAME} "
+                      f"(version {args.embed_version}, seeds {args.standalone} "
+                      f"on first boot after a version change)")
+        elif 'BINARY="' in original and "CRASH_COUNT=0" in original:
+            # Already one of our own --standalone images being re-patched (to
+            # swap a kernel, or pick up a rootfs fix like the bt_init timing
+            # work). The supervisor is exactly what we would write, so leave
+            # it alone rather than trying to apply the incremental mod-based
+            # patch to it -- it has MAX_CRASHES, so that path would otherwise
+            # be taken and would die on the launch-block anchor it does not
+            # have. Everything else in this pass still applies normally.
+            patched = None
+            already_standalone = True
+            kind = "standalone (already present, left as-is)"
         else:
             if "DEV_HOOK" in original:
                 die(f"{SCRIPT} already contains DEV_HOOK — this image is already patched")
@@ -1110,12 +1520,17 @@ def main():
                     f"from what this tool knows. Patch it by hand, using "
                     f"patch_script() (mod-based) or build_vanilla_supervisor() "
                     f"(vanilla) above as the reference.")
-        with open(target, "w") as fh:
-            fh.write(patched)
-        print(f"patched {SCRIPT} ({kind} base, "
-              f"{len(original.splitlines())} -> {len(patched.splitlines())} lines)")
+        if patched is None:
+            print(f"note: {SCRIPT} left unchanged — {kind}")
+        else:
+            with open(target, "w") as fh:
+                fh.write(patched)
+            print(f"patched {SCRIPT} ({kind} base, "
+                  f"{len(original.splitlines())} -> {len(patched.splitlines())} lines)")
 
-        if args.standalone:
+        # These apply to any standalone image, including one of our own being
+        # re-patched -- they are rootfs tweaks, not supervisor surgery.
+        if args.standalone or already_standalone:
             if disable_hgl(root):
                 print(f"disabled {HGL_SCRIPT} (no consumer in a standalone build)")
             else:
@@ -1123,6 +1538,30 @@ def main():
             nfw = install_brcmfmac_firmware(root)
             if nfw:
                 print(f"installed {nfw} brcmfmac firmware file(s) under lib/firmware/brcm/")
+            if args.background_touch:
+                if background_touch_module(root):
+                    print("backgrounded the touchscreen module load (~0.3s) — "
+                          "NOTE: breaks touch unless music_hook.c resolves input "
+                          "nodes by name; see background_touch_module()")
+                else:
+                    print("note: touchscreen module line not found, left alone")
+
+            usbfix = fix_usb_mode_switch(root)
+            if usbfix:
+                print(f"patched {ADB_INIT_SCRIPT} (ADB<->storage switch: "
+                      f"{'; '.join(usbfix)})")
+            else:
+                print(f"note: {ADB_INIT_SCRIPT} not patched — already fixed, "
+                      f"missing, or the anchors have moved")
+
+            hb = hasten_bt_init(root)
+            if hb:
+                print(f"moved etc/init.d/S80_bt_init -> {hb} "
+                      f"(BT bring-up overlaps the rest of boot)")
+            else:
+                print("note: bt_init not moved — already at S22, or S80_bt_init "
+                      "missing")
+
             if defer_wifi_module(root):
                 print(f"backgrounded the WiFi module load in {MODULE_INIT_SCRIPT} (kept in place, so Bluetooth is not delayed)")
             else:
@@ -1150,9 +1589,34 @@ def main():
                 print(f"note: {BT_INIT} not patched — HFP already on, or the "
                       f"bluealsa line has moved")
             else:
-                with open(btarget, "w") as fh:
-                    fh.write(bpatched)
+                btext = bpatched
                 print(f"patched {BT_INIT} (bluealsa: +hfp-ag for battery reporting)")
+
+            # Independent of the HFP tweak: take the ~12s of fixed sleeps out
+            # of this script. Measured 12.4s -> 5.79s on hardware.
+            btiming = patch_bt_init_timing(btext)
+            if btiming is None:
+                print(f"note: {BT_INIT} sleeps not replaced — already polling, "
+                      f"or none of the sleep anchors matched")
+            else:
+                btext, applied = btiming
+                print(f"patched {BT_INIT} (sleep -> poll: {', '.join(applied)})")
+                bpatched = btext
+
+            # Start the radio before the D-Bus preamble rather than after it.
+            reordered = reorder_bt_init_radio_first(btext)
+            if reordered is None:
+                print(f"note: {BT_INIT} radio/D-Bus order unchanged — already "
+                      f"reordered, or the anchors did not match")
+            else:
+                btext = reordered
+                bpatched = btext
+                print(f"patched {BT_INIT} (patchram now starts ~0.23s earlier, "
+                      f"before the D-Bus preamble)")
+
+            if bpatched is not None:
+                with open(btarget, "w") as fh:
+                    fh.write(btext)
 
         about = enable_about_tile(root)
         if about:

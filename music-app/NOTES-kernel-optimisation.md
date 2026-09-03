@@ -840,3 +840,121 @@ and the DTB substitution method, all documented above.
 renders correctly, no hang -- its only flaw is that stock's >128-descriptor
 blits fail to draw), and treat option B as the fix. Do **not** raise
 `hdesc_max`; that path is now definitively closed.
+
+### SOLVED — Bluetooth boot time is in `bt_init`, not `cywdhd` (2026-09-02)
+
+**The assumption was wrong.** Both the initial request and `patch_firmware.py`'s own comments assumed `cywdhd` — the WiFi/BT combo module — was what made Bluetooth late. Measurement showed it is not.
+
+**Baseline, cold boot (stock `bt_init`, LEAN_4 kernel):**
+
+| Milestone | Uptime |
+|---|---|
+| `adb` responsive | 3.81 s |
+| `rfkill0` present (`cywdhd` finished) | 3.88 s |
+| `hci0` present | 8.98 s |
+| `/tmp/bt_init_ok` (Bluetooth actually usable) | **16.29 s** |
+
+`cywdhd` accounts for only **0.44 s** (`dhd_module_init` in at 1.816 s, out at 2.262 s) — under 3 % of the 16.3 s gap. Deferring or splitting the driver could never have paid for itself.
+
+**Where the 16.3 s actually went — ~12 s of fixed sleeps in `/usr/bin/bt_init`:**
+
+| Step | Sleep |
+|---|---|
+| after rfkill write | `sleep 1` |
+| after `brcm_patchram_plus` | `sleep 5` |
+| after `hciconfig hci0 up` | `sleep 1` |
+| after `hciconfig hci0 reset` | `sleep 1` |
+| after `bt-agent` | `sleep 2` |
+| before `bt-adapter` calls | `sleep 1` |
+| before `sdptool add HIBYLINK_SP` | `sleep 1` |
+
+**Fix 1 — sleep-to-poll rewrite (`patch_bt_init_timing`).** Every sleep became a `bt_wait()` condition poll (50 ms period) with the old timeout as the failure bound. The rfkill step additionally waits for `/sys/class/rfkill/rfkill0` to exist rather than assuming it.
+
+Measured on hardware against a full rfkill power-cycle of the radio:
+
+```
+stock:   ~12.4 s
+patched:  5.78 s
+patched:  5.78 s
+```
+
+All milestones reached each time (`bluetoothd`, `bt-agent`, `bluealsa` running, alias set, HibyLink SP registered, same `Powered: 1 -> 0` end state as stock).
+
+Phase breakdown of the 5.86 s instrumented run:
+
+| Phase | Time |
+|---|---|
+| rfkill on | 0.04 s |
+| MAC address resolved | 0.36 s |
+| `hci0` appeared (patchram done) | **4.65 s** |
+| `hci0` UP RUNNING | 4.67 s |
+| bluez on D-Bus | 4.78 s |
+| `hci0` UP after reset | 4.91 s |
+| `bt-agent` up | 4.96 s |
+| `bluealsa` up | 5.07 s |
+| adapter configured | 5.69 s |
+| done | 5.86 s |
+
+**Finding — the remaining ~4.3 s is `brcm_patchram_plus` and it cannot be shortened.** The `.hcd` firmware is only 46,324 bytes (~0.015 s at 3 Mbaud), so transfer time is not the factor. Varying `--tosleep` produced no change:
+
+| `--tosleep` | Result | Time |
+|---|---|---|
+| 50000 µs | addr OK, UP RUNNING | 4.26 s |
+| 20000 µs | addr OK, UP RUNNING | 4.25 s |
+| 10000 µs | addr OK, UP RUNNING | 4.26 s |
+| 5000 µs | addr OK, UP RUNNING | 4.26 s |
+
+The delay is the chip's own bring-up plus hardcoded waits inside the closed-source `brcm_patchram_plus`. This cost can only be **started earlier**, not made smaller.
+
+**Fix 2 — start `bt_init` earlier (`hasten_bt_init`): `S80_bt_init` → `S22_bt_init`.** `S80` already ran the script backgrounded (`"$PL01" &`), so nothing downstream blocked on it; it was simply being started late. Real dependencies:
+
+| Dependency | Satisfied by |
+|---|---|
+| `/usr/data` mounted (`bt_macaddr.txt`, `alsa.conf`) | `S21mount_ubifs` |
+| `rfkill0` / `cywdhd` | `S11` (patched script now polls for it) |
+| `/dev/ttyS0` | kernel, always present |
+| D-Bus | `bt_init` starts its own `dbus-daemon`; does **not** depend on `S30dbus` |
+
+**S22 is therefore the earliest safe slot.** Moving there overlaps the fixed 4.26 s `brcm_patchram_plus` cost with `S30`/`S40`/`S43`/`S50` and the player start instead of paying it after all of them.
+
+**WiFi, "as late as possible".** `defer_wifi_module` backgrounds `cywdhd` in place (moving it to the end was tried before and delayed Bluetooth). With `bt_init` now waiting on `rfkill0` instead of assuming it, backgrounding is safe. `cywdhd`'s 0.44 s therefore comes off the boot critical path entirely.
+
+Going further — not loading `cywdhd` at all until WiFi is switched on — was considered and rejected for now: `cywdhd` is the sole provider of `md_bcmdhd_bt_power`/`rfkill0`, and because it **cannot be reloaded after `rmmod`**, a load-on-demand design has no recovery path if the first attempt fails.
+
+**Constraint discovered the same night: `cywdhd` cannot be reloaded.** Its exit path unregisters the platform driver but not the platform device, so a subsequent `insmod` hits:
+
+```
+sysfs: cannot create duplicate filename '/devices/platform/md_bcmdhd_bt_power'
+kobject_add_internal failed for md_bcmdhd_bt_power with -EEXIST
+```
+
+`insmod` returns `EEXIST`. One attempt per boot; recovery is a reboot.
+
+**Correction to earlier notes:** `defer_wifi_module`'s docstring claimed `cywdhd` init costs "~1.1 s of a ~4 s boot". Measured twice on LEAN_4 it is **0.44 s**. Its other figure — kernel proper done at 0.36 s — remains accurate (measured 0.357 s).
+
+**Result after flashing, measured cold boot:**
+
+| Milestone | Before | After |
+|---|---|---|
+| `hci0` present | 8.98 s | **7.42 s** |
+| `/tmp/bt_init_ok` (Bluetooth usable) | 16.29 s | **9.11 s** |
+
+Verified on the flashed device: `library_standalone` running, `hci0 UP RUNNING
+PSCAN ISCAN` with the correct BD address, `bluetoothd`/`bt-agent`/`bluealsa`
+all up, `cywdhd` loaded and `wlan0` associated with an IP, SD card mounted.
+(`hci0` reads `DOWN` in the instant after `bt_init` finishes — that is stock's
+own end state too, since the script closes with `bt-adapter --set Powered Off`;
+it goes `UP RUNNING` when the player powers it on.)
+
+**What this is and is not compared against.** Both numbers were measured on the
+same `LEAN_4` kernel and the same 0.44-standalone rootfs, so the 7.2 s delta is
+a clean like-for-like isolation of this change. It is **not** a measurement
+against stock firmware. Two things make it a fair proxy anyway: every `sleep`
+removed here was HiBy's own, untouched by this project (the only prior edit to
+`bt_init` was the `bluealsa` HFP line), and `S80` ordering was stock too. What
+is not controlled for is the kernel — `LEAN_4` is 380,928 bytes smaller than
+the stock-config build, which would shift when `S22`/`S80` runs by perhaps
+0.1-0.4 s, moving both figures together rather than changing the delta. A true
+stock baseline needs a flash of `hiby-r1-STOCKKERNEL-abtest.upt` (or
+`0.44-standalone.upt`, which still carries the stock kernel) and has not been
+taken.
