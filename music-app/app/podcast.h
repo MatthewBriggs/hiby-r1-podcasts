@@ -71,6 +71,12 @@ int pod_load_episodes(const char *feed, pod_episode_t *out, int max);
 void pod_resume_store(const char *path, int ms, int dur);
 int  pod_resume_lookup(const char *path, int *dur_out);
 
+/* R70: deletes a downloaded episode's file to free card space and drops its
+ * resume entry. Does not touch pod_eps[]/tracks[] -- the caller clears its
+ * own copy's path/downloaded/dur_ms so the row keeps its place in the list,
+ * shown as not-downloaded (same as an episode that was never fetched). */
+void pod_delete_download(const char *path);
+
 /* On-demand download of one manifest-only episode (R18), same fork+curl
  * shape update_start() uses for the whole-feed sync below, scoped to one
  * file. One at a time. `idx` indexes the array pod_load_episodes() last

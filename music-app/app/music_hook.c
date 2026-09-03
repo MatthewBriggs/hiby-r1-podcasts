@@ -2432,6 +2432,31 @@ static int  queue_drag_grab_dy;     /* touch_y minus the row's own top, at grab 
 static int  queue_swipe_active;
 static int  queue_swipe_display_i;
 static int  queue_swipe_dx;         /* live_x - touch_x while active, signed */
+
+/* R70: same grip/drag/swipe shapes as SC_QUEUE's own above, extended to a
+ * playlist's own track list (SC_TRACKS with browsing_is_playlist set).
+ * Kept as separate state rather than reusing the queue_* variables --
+ * SC_QUEUE and this can never be showing at once, but sharing variables
+ * across two unrelated screens is exactly the kind of thing that grows a
+ * subtle bug the day one of them changes without the other. This screen's
+ * own continuous-scroll coordinate space (header_h/off, not CONTENT_Y/
+ * scroll) also means the hit-testing arithmetic genuinely differs, not
+ * just the variable names. */
+static int  playlist_drag_active;
+static int  playlist_drag_idx;        /* index into tracks[] being dragged */
+static int  playlist_drag_grab_dy;    /* touch_y minus the row's own top, at grab time */
+static int  playlist_swipe_active;
+static int  playlist_swipe_idx;
+static int  playlist_swipe_dx;
+/* R70: swipe-to-remove on a podcast feed's episode list -- no grip, no drag,
+ * since episodes carry no user-chosen order to reorder (they're newest-
+ * first by mtime/pubdate, same as SC_PODCASTS itself). Flat CONTENT_Y/
+ * scroll coordinate space, same as SC_QUEUE, not track_index_at() -- this
+ * is the ab_list/pod_list "flat list" SC_TRACKS path, not the continuous-
+ * scroll one playlists and plain albums share. */
+static int  pod_swipe_active;
+static int  pod_swipe_idx;
+static int  pod_swipe_dx;
 static char cur_artist[LIB_NAME_LEN];
 static char cur_album[LIB_NAME_LEN];
 /* BG73: whether cur_artist/cur_album (whatever's currently loaded into
@@ -2440,6 +2465,77 @@ static char cur_album[LIB_NAME_LEN];
  * queue_play_next() so a fresh queue or a Play Next both know which of the
  * two "leave the rest alone" vs "drop the rest" rules applies. */
 static int  browsing_is_playlist;
+
+/* R70: the .m3u path for whatever playlist SC_TRACKS is currently showing,
+ * looked up fresh by name rather than cached at the one call site that
+ * opens a playlist from SC_PLAYLISTS -- browsing_is_playlist can also
+ * become true via the "back from Now Playing" route (see its own BG73
+ * comment), which never touches a cached path, so a cache would be stale
+ * or empty there. A rare, deliberate action (starting a drag or a swipe),
+ * not a redraw-rate concern -- same reasoning the Bluetooth pairing tap
+ * handler already uses for re-querying bt_scan_devices() fresh. Returns 0
+ * and leaves out untouched if cur_album no longer matches any playlist on
+ * the card (deleted or renamed since it was opened). */
+static int cur_playlist_path(char *out, size_t outsz) {
+    pl_t pl[PL_MAX];
+    int n = pl_list(pl, PL_MAX);
+    for (int i = 0; i < n; i++) {
+        if (!strcmp(pl[i].name, cur_album)) {
+            snprintf(out, outsz, "%s", pl[i].path);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* R70: writes tracks[0..track_n) back to the current playlist's .m3u, in
+ * whatever order the array is in right now -- called after every reorder
+ * and every remove, same "commit immediately" shape queue_move_display()/
+ * queue_remove_display() use for the Now Playing queue. A no-op (not an
+ * error) if cur_album no longer names a real playlist on the card -- see
+ * cur_playlist_path()'s own comment on when that happens. */
+static void playlist_persist(void) {
+    char path[LIB_PATH_LEN];
+    if (!cur_playlist_path(path, sizeof(path))) return;
+    static char paths[PAGE_MAX * 8][LIB_PATH_LEN];
+    int n = track_n < (int)(sizeof(paths) / sizeof(paths[0])) ?
+            track_n : (int)(sizeof(paths) / sizeof(paths[0]));
+    for (int i = 0; i < n; i++)
+        snprintf(paths[i], sizeof(paths[i]), "%s", tracks[i].path);
+    pl_write(path, paths, n);
+}
+
+/* R70: moves tracks[from] to tracks[to], shifting between, and persists.
+ * Unlike queue_move_display() this never has a shuffle order to reorder
+ * instead -- playlists don't shuffle -- so it's always a direct array
+ * shift. Does NOT touch queue[]/cur_track even if this exact playlist is
+ * also the one currently playing: browsing and playback are already kept
+ * as separate concerns everywhere else in this file (q_is_playlist vs
+ * browsing_is_playlist), and reaching into a live queue mid-drag would be
+ * a bigger, riskier change than this feature needs. Known limitation, not
+ * silently glossed over: the "now playing" row highlight (idx == cur_track)
+ * can point at the wrong row until the next fresh play of this playlist,
+ * if it is both open for editing and currently playing at the same time. */
+static void playlist_move_track(int from, int to) {
+    if (from == to || from < 0 || to < 0 || from >= track_n || to >= track_n) return;
+    lib_track_t v = tracks[from];
+    if (from < to) for (int i = from; i < to; i++) tracks[i] = tracks[i + 1];
+    else            for (int i = from; i > to; i--) tracks[i] = tracks[i - 1];
+    tracks[to] = v;
+    playlist_persist();
+}
+
+/* R70: removes tracks[idx] from the browse list and persists. Does not
+ * touch queue[]/playback -- removing a track from a playlist you're
+ * looking at is not the same act as removing it from what's currently
+ * playing, and if this playlist happens to be both, ongoing playback is
+ * left alone on purpose (see playlist_move_track()'s own comment). */
+static void playlist_remove_track(int idx) {
+    if (idx < 0 || idx >= track_n) return;
+    for (int i = idx; i < track_n - 1; i++) tracks[i] = tracks[i + 1];
+    track_n--;
+    playlist_persist();
+}
 /* Same idea as browsing_is_playlist just above, for a second thing SC_TRACKS
  * needs to remember about how it was reached: an album opened from the
  * artist page's own album list has "back" return there directly (nothing
@@ -2808,6 +2904,20 @@ static void pod_rebuild_tracks(void) {
         t->disc  = -1;
         track_n++;
     }
+}
+
+/* R70: swipe-to-remove on the episode list. Re-reads the feed from disk
+ * afterward rather than patching pod_eps[idx] in place -- same one-shot
+ * recompute pattern a completed download already uses just above -- so a
+ * still-manifest-listed episode reappears as not-downloaded (the normal
+ * look for one never fetched) instead of this needing its own idea of what
+ * an emptied slot should show. Downloaded-only: nothing to delete for an
+ * episode that is only a manifest entry to begin with. */
+static void pod_remove_download(int idx) {
+    if (idx < 0 || idx >= pod_ep_n || !pod_eps[idx].downloaded) return;
+    pod_delete_download(pod_eps[idx].path);
+    pod_ep_n = pod_load_episodes(cur_feed, pod_eps, POD_MAX_ITEMS);
+    pod_rebuild_tracks();
 }
 
 /* Mirrors ab_save_current_pos() exactly -- see its comment for why the
@@ -4985,6 +5095,9 @@ static void draw_screen(uint16_t *fb) {
          * duration-summing loop already does the same over every track on
          * every scroll_to_px() call. */
         int multi_disc = tracks_multi_disc();
+        /* R70: drag-to-reorder/swipe-to-remove, playlists only -- never a
+         * plain album (its order is the album's, not the user's to edit). */
+        int show_edit = browsing_is_playlist;
         int ry = header_h;
         int last_disc = -999;
         for (int idx = 0; idx < track_n; idx++) {
@@ -5014,21 +5127,46 @@ static void draw_screen(uint16_t *fb) {
             if (row_y + ROW_H > 0) {
                 int playing = audio_is_active() && idx == cur_track &&
                              !strcmp(cur_album, q_album) && !strcmp(cur_artist, q_artist);
-                if (playing) {
+                /* R70: same shapes as SC_QUEUE's own dragging_this/
+                 * swiping_this -- see that screen's own comments for why
+                 * each highlight/reveal is drawn the way it is. */
+                int dragging_this = show_edit && playlist_drag_active && idx == playlist_drag_idx;
+                int swiping_this = show_edit && playlist_swipe_active && idx == playlist_swipe_idx;
+                int dx0 = swiping_this ? playlist_swipe_dx : 0;
+                if (swiping_this)
+                    fill_rect_clip(fb, 0, row_y, FB_W, ROW_H, COL_ACCENT, 0, clip_bot);
+                if (playing && !swiping_this) {
                     fill_rect_clip(fb, 0, row_y, FB_W, ROW_H, COL_ROW, 0, clip_bot);
                     fill_rect_clip(fb, 0, row_y, 4, ROW_H, COL_ACCENT, 0, clip_bot);
                 }
+                if (dragging_this) {
+                    if (!playing) fill_rect_clip(fb, 0, row_y, FB_W, ROW_H, COL_ROW, 0, clip_bot);
+                    fill_rect_clip(fb, 0, row_y, FB_W, 2, COL_ACCENT, 0, clip_bot);
+                    fill_rect_clip(fb, 0, row_y + ROW_H - 2, FB_W, 2, COL_ACCENT, 0, clip_bot);
+                }
                 if (t->track > 0) snprintf(buf, sizeof(buf), "%d", t->track);
                 else              buf[0] = '\0';
-                draw_text_clip(fb, 20, row_y + 22, buf, COL_DIM, TEXT_PX_SMALL,
-                              56, 0, clip_bot);
-                draw_text_clip(fb, 68, row_y + 20, t->name, playing ? COL_ACCENT : COL_TEXT,
-                              TEXT_PX_BODY, FB_W - 110, 0, clip_bot);
+                draw_text_clip(fb, 20 + dx0, row_y + 22, buf, COL_DIM, TEXT_PX_SMALL,
+                              56 + dx0, 0, clip_bot);
+                draw_text_clip(fb, 68 + dx0, row_y + 20, t->name, playing ? COL_ACCENT : COL_TEXT,
+                              TEXT_PX_BODY, (show_edit ? FB_W - 150 : FB_W - 110) + dx0, 0, clip_bot);
                 if (t->dur_ms > 0) {
                     fmt_dur(buf, sizeof(buf), t->dur_ms);
-                    draw_right_clip(fb, row_y + 22, buf, 0, clip_bot);
+                    if (show_edit) {
+                        int bw = text_width(buf, TEXT_PX_SMALL);
+                        int right = FB_W - 24 - 40;
+                        draw_text_clip(fb, right - bw + dx0, row_y + 22, buf, COL_DIM,
+                                       TEXT_PX_SMALL, FB_W, 0, clip_bot);
+                    } else {
+                        draw_right_clip(fb, row_y + 22, buf, 0, clip_bot);
+                    }
                 }
-                fill_rect_clip(fb, 0, row_y + ROW_H - 1, FB_W, 1, COL_LINE, 0, clip_bot);
+                if (show_edit)
+                    draw_grip_icon_clip(fb, FB_W - 24 - 16 + dx0, row_y + (ROW_H - 24) / 2,
+                                         (playing || dragging_this) ? COL_ACCENT : COL_DIM,
+                                         0, clip_bot);
+                if (!dragging_this && !swiping_this)
+                    fill_rect_clip(fb, 0, row_y + ROW_H - 1, FB_W, 1, COL_LINE, 0, clip_bot);
             }
             ry += ROW_H;
         }
@@ -5121,7 +5259,15 @@ static void draw_screen(uint16_t *fb) {
                    queue_n > 0 && t->path[0] && !strcmp(t->path, queue[0].path))
                 : (audio_is_active() && idx == cur_track &&
                    !strcmp(cur_album, q_album) && !strcmp(cur_artist, q_artist));
-            if (playing) {
+            /* R70: swipe-to-remove reveal, episodes only -- only ever true for
+             * a downloaded one (pod_remove_download()'s own gate), so the
+             * duration column below is always the branch showing during a
+             * swipe, never the Download affordance. */
+            int swiping_this = pod_list && pod_swipe_active && idx == pod_swipe_idx;
+            int dx0 = swiping_this ? pod_swipe_dx : 0;
+            if (swiping_this)
+                fill_rect_clip(fb, 0, y, FB_W, ROW_H, COL_ACCENT, CONTENT_Y, clip_bot);
+            if (playing && !swiping_this) {
                 fill_rect_clip(fb, 0, y, FB_W, ROW_H, COL_ROW, CONTENT_Y, clip_bot);
                 fill_rect_clip(fb, 0, y, 4, ROW_H, COL_ACCENT, CONTENT_Y, clip_bot);
             }
@@ -5157,7 +5303,7 @@ static void draw_screen(uint16_t *fb) {
              * same visual language a disabled control uses elsewhere in
              * this app, so the list reads at a glance which rows play and
              * which only start a download. */
-            draw_text_clip(fb, 68, y + 20, t->name,
+            draw_text_clip(fb, 68 + dx0, y + 20, t->name,
                           playing ? COL_ACCENT
                           : (pod_list && !pod_eps[idx].downloaded) ? COL_DIM
                           : COL_TEXT,
@@ -5180,9 +5326,17 @@ static void draw_screen(uint16_t *fb) {
                 draw_right_clip(fb, y + 22, buf, CONTENT_Y, clip_bot);
             } else if (t->dur_ms > 0) {
                 fmt_dur(buf, sizeof(buf), t->dur_ms);
-                draw_right_clip(fb, y + 22, buf, CONTENT_Y, clip_bot);
+                if (dx0) {
+                    int bw = text_width(buf, TEXT_PX_SMALL);
+                    int right = FB_W - 24 - (index_visible() ? INDEX_W : 0);
+                    draw_text_clip(fb, right - bw + dx0, y + 22, buf, COL_DIM,
+                                   TEXT_PX_SMALL, FB_W, CONTENT_Y, clip_bot);
+                } else {
+                    draw_right_clip(fb, y + 22, buf, CONTENT_Y, clip_bot);
+                }
             }
-            fill_rect_clip(fb, 0, y + ROW_H - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
+            if (!swiping_this)
+                fill_rect_clip(fb, 0, y + ROW_H - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
             y += ROW_H;
         }
         if (sheet_note[0] && !mini_visible()) {
@@ -8817,7 +8971,13 @@ int music_entry(void *a0, void *a1) {
                      * once for scroll_px). Also correctly resolves to
                      * nothing (-1) for a tap that lands on a banner itself. */
                     int idx = track_index_at(content_y);
-                    if (idx >= 0 && idx < track_n) {
+                    /* R70: playlist_drag_active/playlist_swipe_active are
+                     * still true here on the exact tick a drag or swipe
+                     * ends -- same reasoning as SC_QUEUE's own guard (see
+                     * its comment) -- so this excludes a drag/swipe release
+                     * from also registering as tap-to-play. */
+                    if (idx >= 0 && idx < track_n &&
+                        !playlist_drag_active && !playlist_swipe_active) {
                         audio_set_speed(1000);
                         screen = SC_PLAYING;
                         played_from_browse = 1;
@@ -8976,10 +9136,15 @@ int music_entry(void *a0, void *a1) {
                     screen = SC_ARTIST_PAGE; reset_scroll();
                     artist_art_request(artist_page_name);
                     mlog("[music] %s -> %d albums\n", cur_artist, artist_page_album_n);
-                } else if (screen == SC_TRACKS && scroll + idx < track_n) {
+                } else if (screen == SC_TRACKS && scroll + idx < track_n &&
+                           !pod_swipe_active) {
                     /* Plain albums are caught by their own SC_TRACKS branch
                      * above now (R46) -- only ab_list/pod_list ever reach
-                     * here. */
+                     * here. !pod_swipe_active: same "was this release the
+                     * end of a gesture" guard R70 uses everywhere else --
+                     * without it, a swipe that let go short of the delete
+                     * threshold also read as a tap on whichever episode was
+                     * under the finger and started (or downloaded) it. */
                     if (pod_list) {
                         /* This list is one feed's episodes. An undownloaded
                          * one starts its download instead of playing --
@@ -9478,6 +9643,114 @@ int music_entry(void *a0, void *a1) {
             queue_swipe_dx = 0;
         }
 
+        /* R70: same grip/drag/swipe shapes, extended to a playlist's own
+         * track list. Coordinate space differs from SC_QUEUE's: this screen
+         * scrolls continuously (header_h/off), not row-indexed from
+         * CONTENT_Y, so content_y + track_index_at() (already shared with
+         * the tap and press-and-hold handlers -- see BG103) does the
+         * hit-testing instead of a flat division. Never true for a plain
+         * album (browsing_is_playlist gates it) or audiobook chapters
+         * (ab_list excludes this branch entirely). */
+        if (screen == SC_TRACKS && !ab_list && !pod_list && browsing_is_playlist) {
+            int off = scroll * ROW_H + scroll_px;
+            int header_h = tracks_hdr_h();
+            int content_y = touch_y + off;
+            int press_idx = track_index_at(content_y);
+            /* A row hidden under the mini player is not actually visible,
+             * so a touch landing there must not register as a grip/swipe
+             * start on it -- same reasoning BG102 already applied to the
+             * Bluetooth scan list, just the other direction (there, a
+             * hidden row read as tappable; here, without this, one would
+             * read as draggable). */
+            int mini_bottom = mini_visible() ? FB_H - MINI_H : FB_H;
+            int grip_x0 = FB_W - 56;
+            int valid_row = press_idx >= 0 && press_idx < track_n && touch_y < mini_bottom;
+            int grip_hit = valid_row && touch_x >= grip_x0;
+            int was_pdrag = playlist_drag_active;
+            playlist_drag_active = touch_down && grip_hit;
+            if (playlist_drag_active && !was_pdrag) {
+                playlist_drag_idx = press_idx;
+                int slot_top = header_h + press_idx * ROW_H - off;
+                playlist_drag_grab_dy = touch_y - slot_top;
+                dirty = 1;
+            } else if (!playlist_drag_active && was_pdrag) {
+                dirty = 1;
+            } else if (playlist_drag_active) {
+                int ghost_top = live_y - playlist_drag_grab_dy;
+                int slot_top = header_h + playlist_drag_idx * ROW_H - off;
+                int target = playlist_drag_idx;
+                if (ghost_top < slot_top - ROW_H / 2 && target > 0) target--;
+                else if (ghost_top > slot_top + ROW_H / 2 && target < track_n - 1) target++;
+                if (target != playlist_drag_idx) {
+                    playlist_move_track(playlist_drag_idx, target);
+                    playlist_drag_idx = target;
+                    dirty = 1;
+                }
+            }
+
+            if (!playlist_swipe_active && touch_down && valid_row && !grip_hit) {
+                int dx = live_x - touch_x, dy = live_y - touch_y;
+                if (abs(dx) > abs(dy) && abs(dx) > 10) {
+                    playlist_swipe_active = 1;
+                    playlist_swipe_idx = press_idx;
+                }
+            }
+            if (playlist_swipe_active) {
+                if (!touch_down) {
+                    if (playlist_swipe_dx <= -120 || playlist_swipe_dx >= 120)
+                        playlist_remove_track(playlist_swipe_idx);
+                    playlist_swipe_active = 0;
+                    playlist_swipe_dx = 0;
+                } else {
+                    playlist_swipe_dx = live_x - touch_x;
+                }
+                dirty = 1;
+            }
+        } else {
+            playlist_drag_active = 0;
+            playlist_swipe_active = 0;
+            playlist_swipe_dx = 0;
+        }
+
+        /* R70: swipe-to-remove on a podcast episode list -- no grip, no
+         * drag (see pod_swipe_active's own comment). Flat CONTENT_Y/scroll
+         * coordinate space, the same one this screen's tap dispatch already
+         * uses (the "idx = (y - CONTENT_Y) / ROW_H" further up), not
+         * track_index_at() -- that function belongs to the *other* SC_TRACKS
+         * path (continuous-scroll, plain albums/playlists). Gated on a
+         * downloaded episode only: nothing to delete for one that is still
+         * just a manifest entry, and pod_remove_download() itself no-ops on
+         * that case too, but excluding it here keeps a not-yet-downloaded
+         * row from visually reacting to a swipe that would do nothing. */
+        if (screen == SC_TRACKS && pod_list) {
+            int press_idx = scroll + (touch_y - CONTENT_Y) / ROW_H;
+            int mini_bottom = mini_visible() ? FB_H - MINI_H : FB_H;
+            int valid_row = touch_y >= CONTENT_Y && touch_y < mini_bottom &&
+                            press_idx >= 0 && press_idx < track_n &&
+                            pod_eps[press_idx].downloaded;
+            if (!pod_swipe_active && touch_down && valid_row) {
+                int dx = live_x - touch_x, dy = live_y - touch_y;
+                if (abs(dx) > abs(dy) && abs(dx) > 10) {
+                    pod_swipe_active = 1;
+                    pod_swipe_idx = press_idx;
+                }
+            }
+            if (pod_swipe_active) {
+                if (!touch_down) {
+                    if (pod_swipe_dx <= -120 || pod_swipe_dx >= 120)
+                        pod_remove_download(pod_swipe_idx);
+                    pod_swipe_active = 0;
+                    pod_swipe_dx = 0;
+                } else {
+                    pod_swipe_dx = live_x - touch_x;
+                }
+                dirty = 1;
+            }
+        } else {
+            pod_swipe_active = 0;
+            pod_swipe_dx = 0;
+        }
+
         /* List scrolling: tracked live, one pixel at a time, rather than
          * jumping by whatever whole number of rows the release distance
          * happened to divide into — which is where "four items at a time"
@@ -9523,6 +9796,7 @@ int music_entry(void *a0, void *a1) {
             int was = list_dragging;
             list_dragging = touch_down && scrollable && !index_active &&
                             !scrub_active && !qs_open && !queue_drag_active && !queue_swipe_active &&
+                            !playlist_drag_active && !playlist_swipe_active && !pod_swipe_active &&
                             touch_y >= drag_top && !edge_active && !edge_zone_ambiguous;
             if (list_dragging && !was) {
                 /* A raw drag on the list itself is free browsing, not bound

@@ -143,6 +143,20 @@ void pod_resume_store(const char *path, int ms, int dur) {
     free(keep);
 }
 
+/* R70: swipe-to-remove on the episode list frees the download, not the
+ * episode itself -- pod_load_episodes() re-derives "not downloaded" from
+ * the file's absence next time it runs (from episodes.tsv if the feed
+ * still lists it there, same as any episode never downloaded in the first
+ * place). Only touches disk and the resume file; the caller owns clearing
+ * its own pod_eps[]/tracks[] entry's path/downloaded/dur_ms fields, same
+ * split pod_download_start()/pod_download_poll() already have with the
+ * caller for the opposite direction. */
+void pod_delete_download(const char *path) {
+    if (!path || !path[0]) return;
+    unlink(path);
+    pod_resume_store(path, 0, 0);
+}
+
 /* ---- episodes ---------------------------------------------------------- */
 
 /* Cached from the last pod_load_episodes() call, so pod_download_start(idx)

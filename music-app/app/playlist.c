@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <unistd.h>
 
 #include "playlist.h"
 
@@ -73,6 +74,26 @@ int pl_read(const char *file, char (*paths)[LIB_PATH_LEN], int max) {
     }
     fclose(f);
     return n;
+}
+
+/* R70: full rewrite, not an in-place edit -- a reorder moves every line
+ * anyway, and a remove is one line shorter, so there is no cheap partial
+ * update to make. Deliberately loses any EXTINF/header decoration a
+ * playlist might carry if it came from somewhere other than this app's own
+ * pl_append() -- those are plain "#EXTM3U" + bare paths already, so this
+ * matches their native shape exactly and drops nothing real. Written to a
+ * temp file first and renamed over the original, same crash-safety shape
+ * pod_sync_feeds_from_settings() already uses for settings.txt. */
+int pl_write(const char *file, char (*paths)[LIB_PATH_LEN], int n) {
+    char tmp[LIB_PATH_LEN + 8];
+    snprintf(tmp, sizeof(tmp), "%s.new", file);
+    FILE *f = fopen(tmp, "w");
+    if (!f) return -1;
+    fputs("#EXTM3U\n", f);
+    for (int i = 0; i < n; i++) fprintf(f, "%s\n", paths[i]);
+    fclose(f);
+    if (rename(tmp, file) != 0) { unlink(tmp); return -1; }
+    return 0;
 }
 
 int pl_append(const char *file, const char *track_path) {
