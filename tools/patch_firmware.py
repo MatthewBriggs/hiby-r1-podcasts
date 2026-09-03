@@ -984,6 +984,63 @@ def fix_usb_mode_switch(root):
     return applied
 
 
+
+ADBOFF = "usr/bin/adboff"
+ADBON = "usr/bin/adbon"
+
+# Stock hands the whole card to the host without ever letting go of it:
+# usb_dev_mass_storage.sh exports /dev/mmcblk0 while /dev/mmcblk0p1 is still
+# mounted read-write on the device. Two independent writers on one exFAT
+# filesystem is a corruption risk, and it only ever worked because stock's
+# hiby_player owned the card itself -- under --standalone the supervisor
+# mounts it and nothing releases it.
+#
+# These replacements wrap the vendor's own two commands, unchanged, with a
+# release on the way out and a re-mount on the way back. Verified on
+# hardware: "sd mounted=0" while android0 is bound and the host has the
+# volume, then remounted with 135 library entries visible and the player
+# still running.
+ADBOFF_SAFE = '#!/bin/sh\n# ADB -> USB mass storage, releasing the SD card first.\n#\n# Stock exports /dev/mmcblk0 to the host while the device still has\n# /dev/mmcblk0p1 mounted read-write. Two independent writers to one exFAT\n# filesystem corrupts it. Stock got away with it because hiby_player owned\n# the card itself; with library_standalone the supervisor mounts it and\n# nothing ever let go.\n#\n# Preferred: a full umount, so the host is the only party touching the\n# device and no stale metadata survives. Measured on hardware: the player\n# holds zero fds under the mount when idle, so this normally succeeds.\n# Fallback: remount read-only, which still leaves the host as the sole\n# writer -- enough to prevent corruption -- for the case where a track is\n# open mid-playback.\nSD=/usr/data/mnt/sd_0\nLOG=/usr/data/usbswitch.log\n\nsync\nif mount | grep -q " $SD "; then\n    if umount "$SD" 2>/dev/null; then\n        echo "$(date) adboff: card unmounted" >> "$LOG"\n    elif mount -o remount,ro "$SD" 2>/dev/null; then\n        echo "$(date) adboff: card busy, remounted read-only" >> "$LOG"\n    else\n        echo "$(date) adboff: WARNING could not release card" >> "$LOG"\n    fi\nfi\nsync\n\n/etc/init.d/adb/S440adb stop\n/usr/bin/usb_dev_mass_storage.sh start /dev/mmcblk0\nexit 0\n'
+
+ADBON_SAFE = '#!/bin/sh\n# USB mass storage -> ADB, re-attaching the SD card afterwards.\n#\n# The host may have changed the filesystem, so this re-mounts rather than\n# just flipping back to rw: a fresh mount discards cached metadata that is\n# now wrong. fmask/dmask are explicit because mount otherwise inherits the\n# caller\'s umask, and boot mounts it 0022.\nSD=/usr/data/mnt/sd_0\nLOG=/usr/data/usbswitch.log\n\n/usr/bin/usb_dev_mass_storage.sh stop /dev/mmcblk0\n/etc/init.d/adb/S440adb start\n\nif mount | grep -q " $SD "; then\n    umount "$SD" 2>/dev/null || mount -o remount,rw "$SD" 2>/dev/null\nfi\nmkdir -p "$SD"\nif mount | grep -q " $SD "; then\n    echo "$(date) adbon: card still mounted (remounted rw)" >> "$LOG"\nelse\n    mount -t exfat -o fmask=0022,dmask=0022 /dev/mmcblk0p1 "$SD" 2>/dev/null \\\n        && echo "$(date) adbon: card remounted" >> "$LOG" \\\n        || echo "$(date) adbon: WARNING remount failed" >> "$LOG"\nfi\nexit 0\n'
+
+
+def protect_sd_during_storage(root):
+    """Release the SD card before exporting it, and re-mount it afterwards.
+
+    Replaces adboff/adbon rather than patching them -- they are four lines
+    each and the replacements run the vendor's identical commands. Both are
+    checked for the expected vendor content first, so a firmware whose
+    scripts differ is left alone rather than silently overwritten.
+
+    Preferred path is a full umount: measured on hardware, library_standalone
+    holds zero fds under the mount when idle, so it succeeds. The fallback is
+    remount read-only, which still leaves the host as the only writer -- the
+    property that actually prevents corruption -- for the case where a track
+    is open mid-playback.
+
+    Returns the list of files rewritten, or None if there is nothing to do.
+    """
+    done = []
+    for name, body, must_have in (
+            (ADBOFF, ADBOFF_SAFE, ("S440adb stop", "usb_dev_mass_storage.sh start")),
+            (ADBON, ADBON_SAFE, ("usb_dev_mass_storage.sh stop", "S440adb start"))):
+        path = os.path.join(root, name)
+        if not os.path.exists(path):
+            continue
+        with open(path) as fh:
+            cur = fh.read()
+        if "usr/data/usbswitch.log" in cur:
+            continue                     # already ours
+        if not all(m in cur for m in must_have):
+            continue                     # not the script this was written against
+        with open(path, "w") as fh:
+            fh.write(body)
+        os.chmod(path, 0o755)
+        done.append(name)
+    return done or None
+
+
 def hasten_bt_init(root):
     """Move bt_init from S80 to S22, so its fixed cost overlaps the rest of boot.
 
@@ -1545,6 +1602,14 @@ def main():
                           "nodes by name; see background_touch_module()")
                 else:
                     print("note: touchscreen module line not found, left alone")
+
+            sdsafe = protect_sd_during_storage(root)
+            if sdsafe:
+                print(f"patched {', '.join(sdsafe)} (release the SD card "
+                      f"before exporting it to the host)")
+            else:
+                print("note: adboff/adbon not patched — already safe, missing, "
+                      "or they differ from the vendor scripts this expects")
 
             usbfix = fix_usb_mode_switch(root)
             if usbfix:
