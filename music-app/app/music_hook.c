@@ -2834,16 +2834,26 @@ static int bt_scan_max_visible(void) {
     return avail > 0 ? avail / ROW_H : 0;
 }
 
-/* RP2: same "one boundary, not two copies" reasoning as bt_scan_max_visible()
- * just above, for the Wi-Fi screen's own scan list. One row further down
- * than Bluetooth's: toggle, status, "Scan for networks", "Add network
- * manually", *then* the scanned list starts. */
-static int wifi_scan_max_visible(void) {
-    int bottom = mini_visible() ? FB_H - MINI_H : FB_H;
-    int list_top = CONTENT_Y + 4 * ROW_H;
-    int avail = bottom - list_top;
-    return avail > 0 ? avail / ROW_H : 0;
-}
+/* R75: requested live ("the wifi scan list should be scrollable"). Unlike
+ * SC_SETTINGS_BT (still capped to whatever fits above the mini player,
+ * BG102's own documented remaining limit), this screen now scrolls like
+ * SC_SETTINGS' own longer list does -- scan results can run well past a
+ * screenful on a dense apartment building or office, where Bluetooth
+ * devices in range rarely do. wifi_nets/wifi_net_n/wifi_nets_refresh_at
+ * moved to file scope (were function-local statics in the draw block)
+ * since the scroll-limit calculation and the tap handler both need to
+ * read the current result count too, not just the draw call that
+ * refreshes it -- same "compute/refresh once, every reader this frame
+ * sees the same thing" shape g_header_show_back already established for
+ * the back arrow. */
+static wifi_found_net_t wifi_nets[10];
+static int              wifi_net_n;
+static time_t           wifi_nets_refresh_at;
+
+/* 4 fixed rows (toggle, status, "Scan for networks", "Add network
+ * manually") plus however many results are currently cached -- the
+ * scroll-limit ternary's own `total` for this screen. */
+static int wifi_row_n(void) { return 4 + wifi_net_n; }
 
 /* Only the two lists long enough to need it -- and not Recent, capped at
  * PAGE_MAX items and sorted by recency rather than alphabetically, where a
@@ -3353,6 +3363,7 @@ static int scroll_to_px(int total_px) {
                 (screen == SC_RADIO)  ? station_n :
                 (screen == SC_PLAYLISTS) ? playlist_n + 1 :   /* +1: R71's own "New Playlist" row */
                 (screen == SC_SETTINGS) ? settings_content_rows() :
+                (screen == SC_SETTINGS_WIFI) ? wifi_row_n() :   /* R75 */
                 (screen == SC_SETTINGS_TIMEZONE) ? TZ_N : total;
     int max_top = limit - vis_rows();
     if (max_top < 0) max_top = 0;
@@ -4609,48 +4620,57 @@ static void draw_screen(uint16_t *fb) {
     }
 
     if (screen == SC_PLAYLISTS) {
-        /* Clipped top and bottom so a row locked to a letter (index_lock_end)
-         * never paints over the header above or the mini player below.
+        /* R76: smooth per-pixel scroll, same off-based shape the album-
+         * detail page and Settings already use, rather than the whole-row
+         * "page flip" this screen (and several others) had instead --
+         * requested live ("smooth scrolling as in albums, everywhere").
+         * Iterated by absolute row index rather than vis_rows() count, so
+         * a row half-scrolled off either edge still draws its visible
+         * sliver instead of only ever showing whole rows.
          * R71: row 0 is "New Playlist" (an action, not a playlist), so
          * every real entry's index is shifted by one -- idx - 1, not idx,
          * into playlists[]. */
-        for (int i = 0; i < vis_rows(); i++) {
-            int idx = scroll + i;
-            if (idx > playlist_n) break;
+        int off = scroll * ROW_H + scroll_px;
+        for (int idx = 0; idx <= playlist_n; idx++) {
+            int ry = CONTENT_Y + idx * ROW_H - off;
+            if (ry + ROW_H < CONTENT_Y) continue;
+            if (ry > clip_bot) break;
             if (idx == 0) {
-                draw_text(fb, 24, y + 20, "New Playlist", COL_ACCENT, TEXT_PX_BODY, FB_W - 40);
+                draw_text_clip(fb, 24, ry + 20, "New Playlist", COL_ACCENT, TEXT_PX_BODY,
+                              FB_W - 40, CONTENT_Y, clip_bot);
             } else {
-                draw_text_clip(fb, 24, y + 20, playlists[idx - 1].name, COL_TEXT, TEXT_PX_BODY,
+                draw_text_clip(fb, 24, ry + 20, playlists[idx - 1].name, COL_TEXT, TEXT_PX_BODY,
                                FB_W - 40, CONTENT_Y, clip_bot);
             }
-            fill_rect_clip(fb, 0, y + ROW_H - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
-            y += ROW_H;
+            fill_rect_clip(fb, 0, ry + ROW_H - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
         }
         if (mini_visible()) draw_mini(fb);
         return;
     }
 
     if (screen == SC_RADIO) {
-        for (int i = 0; i < vis_rows(); i++) {
-            int idx = scroll + i;
-            if (idx >= station_n) break;
+        /* R76: smooth per-pixel scroll -- see SC_PLAYLISTS' own comment. */
+        int off = scroll * ROW_H + scroll_px;
+        for (int idx = 0; idx < station_n; idx++) {
+            int ry = CONTENT_Y + idx * ROW_H - off;
+            if (ry + ROW_H < CONTENT_Y) continue;
+            if (ry > clip_bot) break;
             int playing = radio_mode && audio_is_active() &&
                           !strcmp(stations[idx].name, radio_name);
             if (playing) {
-                fill_rect_clip(fb, 0, y, FB_W, ROW_H, COL_ROW, CONTENT_Y, clip_bot);
-                fill_rect_clip(fb, 0, y, 4, ROW_H, COL_ACCENT, CONTENT_Y, clip_bot);
+                fill_rect_clip(fb, 0, ry, FB_W, ROW_H, COL_ROW, CONTENT_Y, clip_bot);
+                fill_rect_clip(fb, 0, ry, 4, ROW_H, COL_ACCENT, CONTENT_Y, clip_bot);
             }
             /* A station with no URL is shown dimmed rather than hidden: it is
              * a slot in the file waiting to be filled in. */
             int have = stations[idx].url[0] != '\0';
-            draw_text_clip(fb, 24, y + 20, stations[idx].name,
+            draw_text_clip(fb, 24, ry + 20, stations[idx].name,
                            playing ? COL_ACCENT : (have ? COL_TEXT : COL_DIM),
                            TEXT_PX_BODY, FB_W - 40, CONTENT_Y, clip_bot);
-            fill_rect_clip(fb, 0, y + ROW_H - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
-            y += ROW_H;
+            fill_rect_clip(fb, 0, ry + ROW_H - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
         }
         if (station_n == 0)
-            draw_text(fb, 24, y + 20, "No stations configured", COL_DIM, TEXT_PX_BODY, FB_W - 40);
+            draw_text(fb, 24, CONTENT_Y + 20, "No stations configured", COL_DIM, TEXT_PX_BODY, FB_W - 40);
         /* A station that plays nothing because Wi-Fi is off looks exactly like
          * a station that is broken. Say which. */
         if (!st_net_up())
@@ -4678,17 +4698,26 @@ static void draw_screen(uint16_t *fb) {
             for (int i = from; i < queue_n; i++) remain_ms += queue[i].dur_ms;
             fmt_dur(dbuf, sizeof(dbuf), remain_ms);
             snprintf(line, sizeof(line), "%s \xc2\xb7 %s total", cbuf, dbuf);
+            /* Fixed, not scrolled -- vis_rows() already excludes this height
+             * from the scrollable area (see its own SC_QUEUE case), so this
+             * is a sticky header, not the list's own first row. */
             draw_text_clip(fb, 24, y + 16, line, COL_DIM, TEXT_PX_SMALL, FB_W - 40, CONTENT_Y, clip_bot);
             fill_rect_clip(fb, 0, y + QUEUE_SUMMARY_H - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
         }
-        y += QUEUE_SUMMARY_H;
+        /* R76: smooth per-pixel scroll for the rows below the fixed summary
+         * -- see SC_PLAYLISTS' own comment. list_top (not CONTENT_Y) is
+         * both the row loop's base and its own top clip bound, so a
+         * scrolled row can never bleed up over the summary line itself. */
+        int list_top = CONTENT_Y + QUEUE_SUMMARY_H;
+        int off = scroll * ROW_H + scroll_px;
         /* BG71: the actual upcoming play order -- queue_display_index()
          * walks shuffle_order[] when shuffle's on rather than plain array
          * order, so this genuinely reflects what happens next rather than
          * just the album's own track order. */
-        for (int i = 0; i < vis_rows(); i++) {
-            int display_i = scroll + i;
-            if (display_i >= queue_n) break;
+        for (int display_i = 0; display_i < queue_n; display_i++) {
+            int y = list_top + display_i * ROW_H - off;
+            if (y + ROW_H < list_top) continue;
+            if (y > clip_bot) break;
             int idx = queue_display_index(display_i);
             if (idx < 0) break;
             lib_track_t *t = &queue[idx];
@@ -4710,15 +4739,15 @@ static void draw_screen(uint16_t *fb) {
             int swiping_this = queue_swipe_active && display_i == queue_swipe_display_i;
             int dx0 = swiping_this ? queue_swipe_dx : 0;
             if (swiping_this)
-                fill_rect_clip(fb, 0, y, FB_W, ROW_H, COL_ACCENT, CONTENT_Y, clip_bot);
+                fill_rect_clip(fb, 0, y, FB_W, ROW_H, COL_ACCENT, list_top, clip_bot);
             if (playing && !swiping_this) {
-                fill_rect_clip(fb, 0, y, FB_W, ROW_H, COL_ROW, CONTENT_Y, clip_bot);
-                fill_rect_clip(fb, 0, y, 4, ROW_H, COL_ACCENT, CONTENT_Y, clip_bot);
+                fill_rect_clip(fb, 0, y, FB_W, ROW_H, COL_ROW, list_top, clip_bot);
+                fill_rect_clip(fb, 0, y, 4, ROW_H, COL_ACCENT, list_top, clip_bot);
             }
             if (dragging_this) {
-                if (!playing) fill_rect_clip(fb, 0, y, FB_W, ROW_H, COL_ROW, CONTENT_Y, clip_bot);
-                fill_rect_clip(fb, 0, y, FB_W, 2, COL_ACCENT, CONTENT_Y, clip_bot);
-                fill_rect_clip(fb, 0, y + ROW_H - 2, FB_W, 2, COL_ACCENT, CONTENT_Y, clip_bot);
+                if (!playing) fill_rect_clip(fb, 0, y, FB_W, ROW_H, COL_ROW, list_top, clip_bot);
+                fill_rect_clip(fb, 0, y, FB_W, 2, COL_ACCENT, list_top, clip_bot);
+                fill_rect_clip(fb, 0, y + ROW_H - 2, FB_W, 2, COL_ACCENT, list_top, clip_bot);
             }
             /* R70 step 1: FB_W - 150, not the usual FB_W - 110 every other
              * duration-bearing row uses -- 40px carved out on the right for
@@ -4734,7 +4763,7 @@ static void draw_screen(uint16_t *fb) {
              * window, just moved, so the row's own text reads exactly as it
              * always did throughout the swipe -- only its position changes. */
             draw_text_clip(fb, 24 + dx0, y + 20, t->name, playing ? COL_ACCENT : COL_TEXT,
-                          TEXT_PX_BODY, FB_W - 150 + dx0, CONTENT_Y, clip_bot);
+                          TEXT_PX_BODY, FB_W - 150 + dx0, list_top, clip_bot);
             if (t->dur_ms > 0) {
                 char b[16];
                 fmt_dur(b, sizeof(b), t->dur_ms);
@@ -4743,13 +4772,13 @@ static void draw_screen(uint16_t *fb) {
                  * uses, just shifted left by the grip's own reserved column. */
                 int right = FB_W - 24 - (index_visible() ? INDEX_W : 0) - 40;
                 draw_text_clip(fb, right - bw + dx0, y + 22, b, COL_DIM, TEXT_PX_SMALL,
-                               FB_W + dx0, CONTENT_Y, clip_bot);
+                               FB_W + dx0, list_top, clip_bot);
             }
             /* R70: the drag handle -- accent while this exact row is the one
              * being dragged, same as the rest of dragging_this's highlight. */
             draw_grip_icon_clip(fb, FB_W - 24 - (index_visible() ? INDEX_W : 0) - 16 + dx0,
                                  y + (ROW_H - 24) / 2,
-                                 (playing || dragging_this) ? COL_ACCENT : COL_DIM, CONTENT_Y, clip_bot);
+                                 (playing || dragging_this) ? COL_ACCENT : COL_DIM, list_top, clip_bot);
             /* BUG fix: this 1px COL_LINE separator used to draw unconditionally,
              * landing right on top of dragging_this's own 2px bottom accent
              * border and painting over its last pixel -- the top border stayed
@@ -4760,8 +4789,7 @@ static void draw_screen(uint16_t *fb) {
              * grey line cutting across a full-row accent reveal would read
              * as a rendering glitch, not a deliberate row boundary. */
             if (!dragging_this && !swiping_this)
-                fill_rect_clip(fb, 0, y + ROW_H - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
-            y += ROW_H;
+                fill_rect_clip(fb, 0, y + ROW_H - 1, FB_W, 1, COL_LINE, list_top, clip_bot);
         }
         if (mini_visible()) draw_mini(fb);
         return;
@@ -5690,25 +5718,31 @@ static void draw_screen(uint16_t *fb) {
     }
 
     if (screen == SC_EQ_BANDS) {
-        for (int i = 0; i < vis_rows(); i++) {
-            int idx = scroll + i;
-            if (idx >= eq_cur.band_n) break;
+        /* R76: smooth per-pixel scroll -- see SC_PLAYLISTS' own comment.
+         * eq_cur.band[] is a small in-memory array, not database-paged, so
+         * (unlike SC_ARTISTS/SC_ALBUMS -- deliberately left alone, see the
+         * scrollable-screens note near the `continuous` flag below) there's
+         * no data-window concern here, only draw position. */
+        int off = scroll * ROW_H + scroll_px;
+        for (int idx = 0; idx < eq_cur.band_n; idx++) {
+            int ry = CONTENT_Y + idx * ROW_H - off;
+            if (ry + ROW_H < CONTENT_Y) continue;
+            if (ry > clip_bot) break;
             eq_band_t *b = &eq_cur.band[idx];
             const char *tn = b->type == EQ_PEAK ? "Peak" :
                             b->type == EQ_LOW_SHELF ? "Low shelf" : "High shelf";
             snprintf(buf, sizeof(buf), "Band %d \xc2\xb7 %s", idx + 1, tn);
-            draw_text_clip(fb, 24, y + 14, buf, b->on ? COL_TEXT : COL_DIM,
+            draw_text_clip(fb, 24, ry + 14, buf, b->on ? COL_TEXT : COL_DIM,
                           TEXT_PX_BODY, FB_W - 110, CONTENT_Y, clip_bot);
             snprintf(buf, sizeof(buf), "%.0f Hz  \xc2\xb7  %+.1f dB  \xc2\xb7  Q %.2f",
                     b->fc, b->gain_db, b->q);
-            draw_text_clip(fb, 24, y + 42, buf, COL_DIM, TEXT_PX_SMALL,
+            draw_text_clip(fb, 24, ry + 42, buf, COL_DIM, TEXT_PX_SMALL,
                           FB_W - 110, CONTENT_Y, clip_bot);
-            draw_toggle_switch(fb, y, b->on);
-            fill_rect_clip(fb, 0, y + ROW_H - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
-            y += ROW_H;
+            draw_toggle_switch_h_clip(fb, ry, b->on, ROW_H, CONTENT_Y, clip_bot);
+            fill_rect_clip(fb, 0, ry + ROW_H - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
         }
         if (eq_cur.band_n == 0)
-            draw_text(fb, 24, y + 20, "No bands in this profile", COL_DIM, TEXT_PX_BODY, FB_W - 40);
+            draw_text(fb, 24, CONTENT_Y + 20, "No bands in this profile", COL_DIM, TEXT_PX_BODY, FB_W - 40);
         if (mini_visible()) draw_mini(fb);
         return;
     }
@@ -5986,59 +6020,61 @@ static void draw_screen(uint16_t *fb) {
     }
 
     if (screen == SC_SETTINGS_WIFI) {
-        /* Short, non-scrolling screen -- doesn't need the set_row_*_y()
-         * scroll-position machinery SC_SETTINGS' own longer list uses. */
-        int ry = CONTENT_Y;
+        /* R75: same off/_clip shape SC_SETTINGS' own longer list already
+         * uses -- see that screen's comment on why _clip specifically
+         * (rows can scroll up into the header, and plain draw_text/
+         * fill_rect only clip against the physical screen edges, not
+         * CONTENT_Y). */
+        int off = scroll * ROW_H + scroll_px;
+        int clip_bot = mini_visible() ? FB_H - MINI_H : FB_H;
+        int ry = CONTENT_Y - off;
         int on = st_wifi_on();
-        draw_text(fb, 24, ry + 20, "Wi-Fi", COL_TEXT, TEXT_PX_BODY, FB_W - 140);
-        draw_toggle_switch_h(fb, ry, on, ROW_H);
+        draw_text_clip(fb, 24, ry + 20, "Wi-Fi", COL_TEXT, TEXT_PX_BODY, FB_W - 140, CONTENT_Y, clip_bot);
+        draw_toggle_switch_h_clip(fb, ry, on, ROW_H, CONTENT_Y, clip_bot);
         ry += ROW_H;
-        fill_rect(fb, 0, ry - 1, FB_W, 1, COL_LINE);
+        fill_rect_clip(fb, 0, ry - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
 
         char nm[64] = "";
         if (on) st_wifi_ssid(nm, sizeof(nm));
-        draw_text(fb, 24, ry + 20, "Status", COL_TEXT, TEXT_PX_BODY, FB_W - 24);
-        draw_text(fb, 24, ry + 46, on ? (nm[0] ? nm : "not connected") : "off",
-                  COL_DIM, TEXT_PX_SMALL, FB_W - 48);
+        draw_text_clip(fb, 24, ry + 20, "Status", COL_TEXT, TEXT_PX_BODY, FB_W - 24, CONTENT_Y, clip_bot);
+        draw_text_clip(fb, 24, ry + 46, on ? (nm[0] ? nm : "not connected") : "off",
+                      COL_DIM, TEXT_PX_SMALL, FB_W - 48, CONTENT_Y, clip_bot);
         ry += ROW_H;
-        fill_rect(fb, 0, ry - 1, FB_W, 1, COL_LINE);
+        fill_rect_clip(fb, 0, ry - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
 
         /* RP2: scan-and-select, the same shape Bluetooth's own settings
          * screen already has. Manual entry stays alongside it, not
          * replaced -- a hidden network never shows up in any scan, so it
          * remains the only way to join one. */
-        draw_text(fb, 24, ry + 20, "Scan for networks", COL_ACCENT, TEXT_PX_BODY, FB_W - 48);
+        draw_text_clip(fb, 24, ry + 20, "Scan for networks", COL_ACCENT, TEXT_PX_BODY, FB_W - 48, CONTENT_Y, clip_bot);
         ry += ROW_H;
-        fill_rect(fb, 0, ry - 1, FB_W, 1, COL_LINE);
+        fill_rect_clip(fb, 0, ry - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
 
-        draw_text(fb, 24, ry + 20, "Add network manually", COL_ACCENT, TEXT_PX_BODY, FB_W - 48);
+        draw_text_clip(fb, 24, ry + 20, "Add network manually", COL_ACCENT, TEXT_PX_BODY, FB_W - 48, CONTENT_Y, clip_bot);
         ry += ROW_H;
-        fill_rect(fb, 0, ry - 1, FB_W, 1, COL_LINE);
+        fill_rect_clip(fb, 0, ry - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
 
         /* Same 2s refresh cadence as SC_SETTINGS_BT's own scan list, and
          * the same reasoning: this screen rides the once-a-second clock-tick
          * redraw, and a wpa_cli round trip on every one of those would be
          * wasted work for a list a scan-in-progress is still trying to grow. */
-        static wifi_found_net_t nets[10];
-        static int net_n;
-        static time_t last_refresh;
         time_t now = time(NULL);
-        if (now - last_refresh >= 2) {
-            net_n = wifi_scan_results(nets, 10);
-            last_refresh = now;
+        if (now - wifi_nets_refresh_at >= 2) {
+            wifi_net_n = wifi_scan_results(wifi_nets, 10);
+            wifi_nets_refresh_at = now;
         }
-        if (net_n == 0) {
-            draw_text(fb, 24, ry + 20, "No networks found yet", COL_DIM, TEXT_PX_SMALL, FB_W - 48);
+        if (wifi_net_n == 0) {
+            draw_text_clip(fb, 24, ry + 20, "No networks found yet", COL_DIM, TEXT_PX_SMALL, FB_W - 48, CONTENT_Y, clip_bot);
         } else {
-            int wifi_max_visible = wifi_scan_max_visible();
-            for (int i = 0; i < net_n && i < wifi_max_visible; i++) {
-                draw_text_clip(fb, 24, ry + 20, nets[i].ssid,
-                              COL_TEXT, TEXT_PX_BODY, FB_W - 90, CONTENT_Y, FB_H);
-                draw_right_clip(fb, ry + 20, nets[i].open ? "open" : "secured", CONTENT_Y, FB_H);
+            for (int i = 0; i < wifi_net_n; i++) {
+                draw_text_clip(fb, 24, ry + 20, wifi_nets[i].ssid,
+                              COL_TEXT, TEXT_PX_BODY, FB_W - 90, CONTENT_Y, clip_bot);
+                draw_right_clip(fb, ry + 20, wifi_nets[i].open ? "open" : "secured", CONTENT_Y, clip_bot);
                 ry += ROW_H;
-                fill_rect(fb, 0, ry - 1, FB_W, 1, COL_LINE);
+                fill_rect_clip(fb, 0, ry - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
             }
         }
+        if (mini_visible()) draw_mini(fb);
         return;
     }
 
@@ -9273,7 +9309,15 @@ int music_entry(void *a0, void *a1) {
                     if (system("/sbin/poweroff") == -1) { }
                 }
             } else if (screen == SC_SETTINGS_WIFI) {
-                int row = (y - CONTENT_Y) / ROW_H;
+                /* R75: scroll-aware row math, same off/content_y shape
+                 * SC_SETTINGS' own longer list uses -- this screen scrolls
+                 * now, so a plain (y - CONTENT_Y) / ROW_H would resolve to
+                 * whatever row happened to be at that screen position
+                 * *before* scrolling, not the row actually drawn under the
+                 * finger. */
+                int off = scroll * ROW_H + scroll_px;
+                int content_y = y + off;
+                int row = (content_y - CONTENT_Y) / ROW_H;
                 if (row == 0) {
                     int on = !st_wifi_on();
                     st_wifi_set(on);
@@ -9286,11 +9330,14 @@ int music_entry(void *a0, void *a1) {
                 } else if (row >= 4) {
                     /* Re-queried fresh, same reasoning bt_pair()'s own tap
                      * handler gives for doing the same -- a tap is rare and
-                     * deliberate, not a redraw-rate concern. */
+                     * deliberate, not a redraw-rate concern. No separate
+                     * visibility cap needed any more (R75) -- a row that's
+                     * scrolled off-screen simply has no on-screen y for a
+                     * touch to land on in the first place. */
                     wifi_found_net_t nets[10];
                     int n = wifi_scan_results(nets, 10);
                     int idx = row - 4;
-                    if (idx >= 0 && idx < n && idx < wifi_scan_max_visible()) {
+                    if (idx >= 0 && idx < n) {
                         if (nets[idx].open) {
                             wifi_connect(nets[idx].ssid, "");
                         } else {
@@ -9435,6 +9482,21 @@ int music_entry(void *a0, void *a1) {
                  * same class of bug BG2/BG61 already fixed for scroll_px. */
                 int idx = (y - CONTENT_Y - (screen == SC_QUEUE ? QUEUE_SUMMARY_H : 0)) / ROW_H;
                 if (screen == SC_QUEUE && y < CONTENT_Y + QUEUE_SUMMARY_H) idx = -1;
+                /* R76: `idx` above stays exactly as it was -- SC_MENU/
+                 * SC_MUSIC_MENU/SC_TRACKS's own ab_list/pod_list flat path
+                 * still draw the old paged way and still need it unchanged.
+                 * smooth_row is the same formula solved with `off` folded
+                 * in, for the screens converted to off-based smooth-scroll
+                 * drawing (SC_ARTISTS/SC_ALBUMS/SC_PLAYLISTS/SC_RADIO/
+                 * SC_QUEUE) -- see those screens' own draw-side comments for
+                 * the matching y = base + absolute*ROW_H - off formula this
+                 * inverts. Already an absolute index, not scroll-relative,
+                 * so these screens use it directly rather than `scroll +
+                 * idx`. */
+                int off_row_base = CONTENT_Y + (screen == SC_QUEUE ? QUEUE_SUMMARY_H : 0);
+                int off = scroll * ROW_H + scroll_px;
+                int smooth_row = (y - off_row_base + off) / ROW_H;
+                if (screen == SC_QUEUE && y < CONTENT_Y + QUEUE_SUMMARY_H) smooth_row = -1;
                 if (screen == SC_MENU) {
                     if (idx >= TOP_N) { /* nothing there */ }
                     else if (idx == TOP_MUSIC) {
@@ -9573,15 +9635,15 @@ int music_entry(void *a0, void *a1) {
                         screen = SC_PLAYING;
                         ab_play_chapter(scroll + idx);
                     }
-                } else if (screen == SC_PLAYLISTS && scroll + idx == 0) {
+                } else if (screen == SC_PLAYLISTS && smooth_row == 0) {
                     /* R71: row 0, the "New Playlist" action -- no track to
                      * add on this path (see kb_new_playlist_add_track's own
                      * comment), just create an empty one and land back
                      * here with it in the list. */
                     kb_new_playlist_add_track = -1;
                     kb_open("Playlist name", KB_PURPOSE_NEW_PLAYLIST_NAME, "");
-                } else if (screen == SC_PLAYLISTS && scroll + idx - 1 < playlist_n) {
-                    int pi = scroll + idx - 1;   /* R71: row 0 is "New Playlist", not playlists[0] */
+                } else if (screen == SC_PLAYLISTS && smooth_row - 1 < playlist_n) {
+                    int pi = smooth_row - 1;   /* R71: row 0 is "New Playlist", not playlists[0] */
                     static char paths[PAGE_MAX * 8][LIB_PATH_LEN];
                     int want = (int)(sizeof(paths) / sizeof(paths[0]));
                     int got = pl_read(playlists[pi].path, paths, want);
@@ -9599,12 +9661,12 @@ int music_entry(void *a0, void *a1) {
                     pod_list = 0;
                     mlog("[music] playlist %s: %d of %d found\n",
                          playlists[pi].name, track_n, got);
-                } else if (screen == SC_RADIO && scroll + idx < station_n) {
-                    play_station(scroll + idx);
+                } else if (screen == SC_RADIO && smooth_row >= 0 && smooth_row < station_n) {
+                    play_station(smooth_row);
                     if (audio_is_active()) screen = SC_PLAYING;
                     else if (!radio_msg[0])
                         snprintf(radio_msg, sizeof(radio_msg), "Could not reach that station");
-                } else if (screen == SC_QUEUE && idx >= 0 && scroll + idx < queue_n &&
+                } else if (screen == SC_QUEUE && smooth_row >= 0 && smooth_row < queue_n &&
                            !queue_drag_active && !queue_swipe_active) {
                     /* R70: queue_drag_active/queue_swipe_active are still true
                      * here on the exact tick a drag or swipe ends -- they only
@@ -9617,7 +9679,7 @@ int music_entry(void *a0, void *a1) {
                      * whatever track was under the finger and started
                      * playing it, which is not what letting go of either
                      * gesture means. */
-                    int qidx = queue_display_index(scroll + idx);
+                    int qidx = queue_display_index(smooth_row);
                     if (qidx >= 0) {
                         audio_set_speed(1000);
                         screen = SC_PLAYING;
@@ -9718,17 +9780,17 @@ int music_entry(void *a0, void *a1) {
                     ab_list = 0;
                     pod_list = 1;
                     mlog("[music] %s -> %d episodes\n", cur_feed, pod_ep_n);
-                } else if (screen == SC_EQ_BANDS && scroll + idx < eq_cur.band_n) {
+                } else if (screen == SC_EQ_BANDS && smooth_row >= 0 && smooth_row < eq_cur.band_n) {
                     /* The toggle's own strip (matching where it's drawn)
                      * flips the band without leaving the list; anywhere else
                      * on the row opens the full editor. */
                     if (x > FB_W - 100) {
-                        eq_band_t *b = &eq_cur.band[scroll + idx];
+                        eq_band_t *b = &eq_cur.band[smooth_row];
                         b->on = !b->on;
-                        eq_set_band(scroll + idx, b);
+                        eq_set_band(smooth_row, b);
                         eq_save_current();
                     } else {
-                        eq_editing_band = scroll + idx;
+                        eq_editing_band = smooth_row;
                         screen = SC_EQ_BAND; reset_scroll();
                     }
                 }
@@ -9995,7 +10057,13 @@ int music_entry(void *a0, void *a1) {
         if (screen == SC_QUEUE) {
             int grip_x0 = FB_W - 24 - (index_visible() ? INDEX_W : 0) - 32;
             int list_top = CONTENT_Y + QUEUE_SUMMARY_H;
-            int press_display_i = (touch_y - list_top) / ROW_H + scroll;
+            /* R76: off, not a bare `- scroll`, now that the draw side scrolls
+             * smoothly (y = list_top + display_i*ROW_H - off) -- this is
+             * that same formula solved for display_i, so hit-testing always
+             * agrees with whatever's actually drawn, mid-drag scroll_px
+             * included, not just at whole-row rest. */
+            int off = scroll * ROW_H + scroll_px;
+            int press_display_i = (touch_y - list_top + off) / ROW_H;
             int valid_row = touch_y >= list_top &&
                             press_display_i >= 0 && press_display_i < queue_n;
             int grip_hit = valid_row && touch_x >= grip_x0;
@@ -10003,13 +10071,13 @@ int music_entry(void *a0, void *a1) {
             queue_drag_active = touch_down && grip_hit;
             if (queue_drag_active && !was_qdrag) {
                 queue_drag_display_i = press_display_i;
-                queue_drag_grab_dy = touch_y - (list_top + (press_display_i - scroll) * ROW_H);
+                queue_drag_grab_dy = touch_y - (list_top + press_display_i * ROW_H - off);
                 dirty = 1;
             } else if (!queue_drag_active && was_qdrag) {
                 dirty = 1;   /* release: clear the highlight */
             } else if (queue_drag_active) {
                 int ghost_top = live_y - queue_drag_grab_dy;
-                int slot_top  = list_top + (queue_drag_display_i - scroll) * ROW_H;
+                int slot_top  = list_top + queue_drag_display_i * ROW_H - off;
                 /* Only re-target once the finger has crossed into a new
                  * slot's own span, not merely nudged the current one --
                  * rounding to the nearest row would flip the target the
@@ -10179,6 +10247,7 @@ int music_entry(void *a0, void *a1) {
                              screen == SC_TRACKS || screen == SC_PLAYLISTS ||
                              screen == SC_RADIO || screen == SC_EQ_BANDS ||
                              screen == SC_SETTINGS || screen == SC_SETTINGS_TIMEZONE ||
+                             screen == SC_SETTINGS_WIFI ||   /* R75 */
                              screen == SC_QUEUE || screen == SC_ARTIST_PAGE;
             /* R46: the album-detail screen has no status bar to keep a drag
              * from starting under -- its cover runs from y=0, same as Now
@@ -10240,7 +10309,18 @@ int music_entry(void *a0, void *a1) {
                  * crossings read as chunky/laggy rather than smooth, reported
                  * live right after this screen shipped. Continuous redraw
                  * only for this one screen, not a blanket change. */
-                int continuous = (screen == SC_TRACKS && !ab_list && !pod_list) || screen == SC_ARTIST_PAGE;
+                /* R76: same continuous-redraw treatment extended to every
+                 * flat-list screen converted to off-based smooth scrolling
+                 * this round -- SC_ARTISTS/SC_ALBUMS deliberately excluded,
+                 * see their own row_at()/scroll_to_px() comment: they're
+                 * backed by a database-paged window, not a plain array, and
+                 * load_page() is only re-checked on a whole-row `changed`,
+                 * so forcing continuous redraw there risks a mid-drag frame
+                 * reading rows outside the currently loaded page. */
+                int continuous = (screen == SC_TRACKS && !ab_list && !pod_list) || screen == SC_ARTIST_PAGE ||
+                                  screen == SC_PLAYLISTS || screen == SC_RADIO || screen == SC_QUEUE ||
+                                  screen == SC_EQ_BANDS || screen == SC_SETTINGS ||
+                                  screen == SC_SETTINGS_WIFI || screen == SC_SETTINGS_TIMEZONE;
                 if (changed || continuous) dirty = 1;
                 unsigned dt = g_tick - list_last_tick;
                 if (dt > 0) {
@@ -10267,6 +10347,10 @@ int music_entry(void *a0, void *a1) {
             }
         }
         if (inertia_active && !list_dragging) {
+            /* Spring-pull physics below is only meaningful for the two
+             * true-pixel-bounded screens (tracks_max_px()/artist_page_max_px()
+             * are rubber-band bounds, not a row count) -- kept scoped to just
+             * those two, unlike the broader continuous-redraw forcing. */
             int continuous = (screen == SC_TRACKS && !ab_list && !pod_list) || screen == SC_ARTIST_PAGE;
             if (continuous) {
                 /* Spring pull toward whichever bound is exceeded, layered
@@ -10286,8 +10370,14 @@ int music_entry(void *a0, void *a1) {
             }
             int changed = scroll_to_px((int)(scroll * ROW_H + scroll_px + list_velocity));
             /* Same continuous-redraw reasoning as the drag tick above, for
-             * the coast after release. */
-            if (changed || continuous) dirty = 1;
+             * the coast after release -- `smooth_coast` covers the same
+             * R76 screens as the drag tick's `continuous`, kept separate
+             * from `continuous` itself so the spring-pull block above stays
+             * scoped to only the two true-pixel-bounded screens. */
+            int smooth_coast = continuous || screen == SC_PLAYLISTS || screen == SC_RADIO ||
+                                screen == SC_QUEUE || screen == SC_EQ_BANDS || screen == SC_SETTINGS ||
+                                screen == SC_SETTINGS_WIFI || screen == SC_SETTINGS_TIMEZONE;
+            if (changed || smooth_coast) dirty = 1;
             list_velocity *= 0.90f;     /* friction: dead within about a second */
             if (list_velocity < 0.6f && list_velocity > -0.6f) {
                 /* Still out of bounds with velocity spent -- keep the spring
