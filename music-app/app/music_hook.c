@@ -1916,13 +1916,23 @@ static int scrub_ms(int dur) {
     return dur > 0 ? (int)((long long)dur * px / span) : 0;
 }
 
-static int  sheet_open;                 /* 0 none, 1 actions, 2 pick a playlist */
+/* R74: 4 = a playlist's own long-press menu (Rename/Delete/Cancel), 5 = the
+ * Delete confirmation step -- both fixed 3-/2-row lists, same SHEET_N shape
+ * sheet_open == 1 already uses, not the playlist_n-sized lists sheet_open
+ * == 2/3 are. */
+static int  sheet_open;                 /* 0 none, 1 actions, 2 pick a playlist, 3 pick an EQ profile, 4 playlist menu, 5 confirm delete */
 static int  sheet_track;                /* index into tracks[] */
+static int  sheet_playlist;             /* index into playlists[], for sheet_open == 4/5 */
 static char sheet_note[64];             /* what the last action did */
 static const char *const sheet_items[] = {
     "Play next", "Add to queue", "Add to playlist", "Cancel"
 };
 #define SHEET_N ((int)(sizeof(sheet_items) / sizeof(sheet_items[0])))
+/* R74 */
+static const char *const playlist_menu_items[] = { "Rename", "Delete", "Cancel" };
+#define PLAYLIST_MENU_N ((int)(sizeof(playlist_menu_items) / sizeof(playlist_menu_items[0])))
+static const char *const playlist_delete_items[] = { "Delete", "Cancel" };
+#define PLAYLIST_DELETE_N ((int)(sizeof(playlist_delete_items) / sizeof(playlist_delete_items[0])))
 #define SHEET_ROW 72
 
 static pl_t playlists[PL_MAX];
@@ -2111,7 +2121,7 @@ static screen_t   kb_return_screen;
  * to mlog() and safe across a screen redraw, rather than a pointer that has
  * to be re-armed correctly on every kb_open() call site. */
 typedef enum { KB_PURPOSE_NONE = 0, KB_PURPOSE_WIFI_PASSWORD, KB_PURPOSE_WIFI_SSID_MANUAL,
-               KB_PURPOSE_NEW_PLAYLIST_NAME } kb_purpose_t;
+               KB_PURPOSE_NEW_PLAYLIST_NAME, KB_PURPOSE_RENAME_PLAYLIST } kb_purpose_t;
 static kb_purpose_t kb_purpose;
 /* Three modes, not two. The original pair had the mode key labelled "123"
  * while actually switching to *symbols* -- reported as exactly that
@@ -2125,6 +2135,27 @@ typedef enum { KB_MODE_LETTERS = 0, KB_MODE_NUMBERS, KB_MODE_SYMBOLS, KB_MODE_N 
 static int         kb_mode;           /* kb_mode_t */
 static int         kb_last_key = -1;  /* which key the pending char came from, -1 = none pending */
 static int         kb_cycle_pos;      /* position within that key's own cycle string */
+/* R73: requested live ("the T9 keyboard needs capital letters"). Capitals
+ * already existed, technically -- KB_LETTERS' own cycle strings end in
+ * "ABC" -- but reaching one meant multi-tapping all the way past a/b/c and
+ * the bare digit first, which is not what anyone means by "the keyboard
+ * needs capitals". Same three-state cycle real T9 phones already use on
+ * their own shift/"*" key: off, shift-once (capitalizes the next letter
+ * typed, then reverts on its own), caps-lock (stays on). Deliberately
+ * layered UNDER the existing cycle rather than replacing it: which
+ * character a key cycles to (a vs b vs c) and whether it comes out
+ * capitalized are orthogonal, so shift just uppercases whatever kb_apply_
+ * key() would have inserted anyway -- KB_LETTERS' own "ABC" tail is still
+ * there and still reachable, just redundant now, not worth ripping out for
+ * a table only this function reads. */
+typedef enum { KB_SHIFT_OFF = 0, KB_SHIFT_ONCE, KB_SHIFT_LOCK } kb_shift_t;
+static int         kb_shift;          /* kb_shift_t */
+/* Whether the character *currently being cycled* is capitalized -- snapshot
+ * once when that character starts (see kb_apply_key()'s own comment on why
+ * this can't just re-read kb_shift every keystroke: shift-once has to stay
+ * applied through every tap of a multi-tap cycle for the one character it
+ * was meant for, not just the first tap that started it). */
+static int         kb_char_shifted;
 static int         kb_cursor;         /* insertion point: 0..kb_len, index into kb_buf */
 static struct timespec kb_last_tap_at;
 #define KB_CYCLE_MS 600   /* same tap-timing feel as HOLD_MS elsewhere -- long enough to
@@ -2191,6 +2222,8 @@ static void kb_open(const char *title, kb_purpose_t purpose, const char *init_te
     kb_mode = KB_MODE_LETTERS;
     kb_last_key = -1;
     kb_cycle_pos = 0;
+    kb_shift = KB_SHIFT_OFF;
+    kb_char_shifted = 0;
     /* kb_commit() re-opens the keyboard for a second step (SSID then
      * password) while `screen` is still SC_KEYBOARD from the first step --
      * capturing that here would make Cancel-from-the-password-step land
@@ -2226,10 +2259,24 @@ static void kb_apply_key(int key) {
                    && kb_cursor > 0;
     if (same_key) {
         kb_cycle_pos = (kb_cycle_pos + 1) % cyclen;
-        kb_buf[kb_cursor - 1] = cyc[kb_cycle_pos];   /* in place: length unchanged */
+        char ch = cyc[kb_cycle_pos];
+        /* kb_char_shifted, not kb_shift -- this character's case was
+         * already decided when it started (see the else branch below and
+         * this function's own top-level comment); cycling a/b/c/etc. must
+         * not re-read a shift-once that already reverted after the first
+         * tap. */
+        if (kb_char_shifted) ch = (char)toupper((unsigned char)ch);
+        kb_buf[kb_cursor - 1] = ch;   /* in place: length unchanged */
     } else {
         kb_cycle_pos = 0;
-        kb_insert_at_cursor(cyc[0]);
+        kb_char_shifted = (kb_mode == KB_MODE_LETTERS) && (kb_shift != KB_SHIFT_OFF);
+        char ch = cyc[0];
+        if (kb_char_shifted) ch = (char)toupper((unsigned char)ch);
+        kb_insert_at_cursor(ch);
+        /* Shift-once is consumed by the character it just capitalized, win
+         * or lose which letter cycling eventually lands on; caps-lock keeps
+         * going. */
+        if (kb_shift == KB_SHIFT_ONCE) kb_shift = KB_SHIFT_OFF;
     }
     kb_last_key = key;
     clock_gettime(CLOCK_MONOTONIC, &kb_last_tap_at);
@@ -2285,6 +2332,15 @@ static char kb_wifi_target_ssid[64];
  * there is no specific track in play and creating an empty playlist is the
  * whole point. */
 static int kb_new_playlist_add_track = -1;
+
+/* R74: which playlist a KB_PURPOSE_RENAME_PLAYLIST session is renaming --
+ * kb_buf only ever holds the new name being typed, same reasoning
+ * kb_wifi_target_ssid's own comment gives for the SSID during a password
+ * session. The path, not an index into playlists[]: a rescan between
+ * opening the keyboard and committing (unlikely in the couple of seconds
+ * typing takes, but not impossible) could reshuffle indices, while the
+ * path itself stays a stable identifier either way. */
+static char kb_rename_playlist_path[LIB_PATH_LEN];
 
 /* SSIDs and passphrases can contain nearly any byte a shell or a plain
  * "key = value" line would treat as a control character (spaces, '=',
@@ -2418,6 +2474,12 @@ static void kb_commit(void) {
                 }
             }
             kb_new_playlist_add_track = -1;
+            break;
+        }
+        case KB_PURPOSE_RENAME_PLAYLIST: {
+            char path[LIB_PATH_LEN];
+            if (pl_rename(kb_rename_playlist_path, kb_buf, path, sizeof(path)) == 0)
+                playlist_n = pl_list(playlists, PL_MAX);
             break;
         }
         case KB_PURPOSE_NONE:
@@ -4257,6 +4319,21 @@ static void pod_draw_notes(uint16_t *fb, int x, int y, int w, int h) {
     }
 }
 
+/* R73: the shift toggle -- letters-mode only, so it lives in the gap
+ * between the text field (ends at fy+70 = 170) and the key grid (starts
+ * at KB_GRID_Y), rather than competing with backspace/mode/space for one
+ * of the 12 grid slots, which are already exactly full (10 digits + mode
+ * + backspace). Shared x/y/w/h between draw and tap for the usual reason. */
+#define KB_SHIFT_X 24
+#define KB_SHIFT_Y 178
+#define KB_SHIFT_W 100
+#define KB_SHIFT_H 34
+
+static const char *kb_shift_label(void) {
+    return kb_shift == KB_SHIFT_LOCK ? "ABC"
+         : kb_shift == KB_SHIFT_ONCE ? "Abc" : "abc";
+}
+
 /* T9 keyboard's own key geometry -- shared between the draw side and the
  * tap handler below so the two can never disagree about where a key is,
  * the same reasoning every other hit-zone pair in this file already
@@ -4322,6 +4399,25 @@ static void draw_keyboard(uint16_t *fb) {
         int cx = kb_caret_x(kb_cursor);
         if (cx > FB_W - 28) cx = FB_W - 28;   /* keep it inside the field on overflow */
         fill_rect(fb, cx, fy + 16, 2, TEXT_PX_BODY + 10, COL_ACCENT);
+    }
+
+    /* R73: shift toggle, letters mode only -- dimmed and inert rather than
+     * hidden in numbers/symbols mode, so the grid below doesn't jump up
+     * and down as the mode key is tapped. */
+    if (kb_mode == KB_MODE_LETTERS) {
+        fill_rect(fb, KB_SHIFT_X, KB_SHIFT_Y, KB_SHIFT_W, KB_SHIFT_H, COL_ROW);
+        const char *slabel = kb_shift_label();
+        int slw = text_width(slabel, TEXT_PX_SMALL);
+        draw_text(fb, KB_SHIFT_X + (KB_SHIFT_W - slw) / 2,
+                  KB_SHIFT_Y + (KB_SHIFT_H - TEXT_PX_SMALL) / 2,
+                  slabel, kb_shift != KB_SHIFT_OFF ? COL_ACCENT : COL_DIM,
+                  TEXT_PX_SMALL, KB_SHIFT_X + KB_SHIFT_W);
+    } else {
+        const char *slabel = kb_shift_label();
+        int slw = text_width(slabel, TEXT_PX_SMALL);
+        draw_text(fb, KB_SHIFT_X + (KB_SHIFT_W - slw) / 2,
+                  KB_SHIFT_Y + (KB_SHIFT_H - TEXT_PX_SMALL) / 2,
+                  slabel, COL_LINE, TEXT_PX_SMALL, KB_SHIFT_X + KB_SHIFT_W);
     }
 
     for (int row = 0; row < 4; row++) {
@@ -6750,7 +6846,9 @@ static int sheet_rows(void) {
     /* R71: +2 for "New Playlist..." and "Cancel", not just +1 -- see
      * draw_sheet()'s own row labelling just below. */
     return sheet_open == 2 ? playlist_n + 2 :
-           sheet_open == 3 ? eq_profile_n + 1 : SHEET_N;
+           sheet_open == 3 ? eq_profile_n + 1 :
+           sheet_open == 4 ? PLAYLIST_MENU_N :
+           sheet_open == 5 ? PLAYLIST_DELETE_N : SHEET_N;
 }
 static int sheet_top(void) { return FB_H - sheet_rows() * SHEET_ROW - SHEET_HEAD; }
 
@@ -6772,6 +6870,8 @@ static void draw_sheet(uint16_t *fb) {
     /* The caption belongs inside the panel: drawn above it, it landed on top of
      * whichever list row happened to be there. */
     const char *cap = sheet_open == 3 ? "Choose profile"
+                    : (sheet_open == 4 || sheet_open == 5)
+                    ? (sheet_playlist >= 0 && sheet_playlist < playlist_n ? playlists[sheet_playlist].name : "")
                     : (sheet_track >= 0 && sheet_track < track_n)
                     ? tracks[sheet_track].name : "";
     draw_text(fb, 24, top + 14, cap, COL_DIM, TEXT_PX_SMALL, FB_W - 48);
@@ -6781,21 +6881,27 @@ static void draw_sheet(uint16_t *fb) {
         int ry = top + SHEET_HEAD + i * SHEET_ROW;
         const char *label;
         int last;
+        int is_action = 0;   /* R71/R74: reads as an action, not a plain name/Cancel */
         if (sheet_open == 2) {
             last = (i == playlist_n + 1);
             label = last ? "Cancel" : (i == playlist_n) ? "New Playlist..." : playlists[i].name;
+            is_action = (i == playlist_n);
         } else if (sheet_open == 3) {
             last = (i == eq_profile_n);
             label = last ? "Cancel" : eq_profiles[i].name;
+        } else if (sheet_open == 4) {
+            last = (i == PLAYLIST_MENU_N - 1);
+            label = playlist_menu_items[i];
+            is_action = !last;
+        } else if (sheet_open == 5) {
+            last = (i == PLAYLIST_DELETE_N - 1);
+            label = playlist_delete_items[i];
+            is_action = !last;
         } else {
             last = (i == SHEET_N - 1);
             label = sheet_items[i];
         }
-        /* R71: "New Playlist..." reads as an action, same accent style
-         * "Scan for networks"/"Scan for devices" already use elsewhere,
-         * not as just another name in the list above it. */
-        int is_new_playlist = (sheet_open == 2 && i == playlist_n);
-        draw_text(fb, 24, ry + 16, label, last ? COL_DIM : is_new_playlist ? COL_ACCENT : COL_TEXT,
+        draw_text(fb, 24, ry + 16, label, last ? COL_DIM : is_action ? COL_ACCENT : COL_TEXT,
                   TEXT_PX_BODY, FB_W - 48);
         if (!last) fill_rect(fb, 24, ry + SHEET_ROW - 1, FB_W - 48, 1, COL_LINE);
     }
@@ -8179,25 +8285,67 @@ static int handle_keys(int fd, key_src_t src) {
 /* Open the fixed nodes plus anything that looks like a media remote. The
  * AVRCP device is a proper remote — its PLAYPAUSE means play/pause — unlike
  * this unit's own buttons, whose labels and keycodes disagree. */
+/* Resolve an input device to its eventN node by name.
+ *
+ * The node numbers are not stable: they depend on the order the input drivers
+ * register, which changes if any of them is loaded at a different point in
+ * boot. Backgrounding the touchscreen module -- worth ~0.9s of boot time,
+ * measured -- moves hyn_ts from event1 to event2 and shifts "jz adc keyboard"
+ * down into event1, which silently swapped touch and the side buttons here
+ * and left the screen unresponsive. Resolving by name makes that reordering a
+ * non-event. scan_inputs() already did exactly this for AVRCP devices; this
+ * just factors it out so the board's own devices get the same treatment.
+ *
+ * Returns 1 and fills `out` with e.g. "event2", or 0 if the name is absent. */
+static int input_node_by_name(const char *want, char *out, size_t outsz) {
+    FILE *f = fopen("/proc/bus/input/devices", "r");
+    if (!f) return 0;
+    char line[256], name[128] = "";
+    int found = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (!strncmp(line, "N: Name=", 8)) {
+            snprintf(name, sizeof(name), "%s", line + 8);
+        } else if (!strncmp(line, "H: Handlers=", 12) && strstr(name, want)) {
+            char *ev = strstr(line, "event");
+            if (!ev) continue;
+            unsigned n = 0;
+            while (n + 1 < outsz && ev[n] && ev[n] != ' ' && ev[n] != '\n') {
+                out[n] = ev[n]; n++;
+            }
+            out[n] = '\0';
+            found = 1;
+            break;
+        }
+    }
+    fclose(f);
+    return found;
+}
+
 static void scan_inputs(void) {
-    static const struct { const char *node; int src; } fixed[] = {
-        { "event0", KEYS_BUTTONS },   /* power, next */
-        { "event2", KEYS_BUTTONS },   /* side buttons */
-        { "event3", KEYS_REMOTE  },   /* inline remote */
+    /* Named, with the historical node as a fallback purely in case
+     * /proc/bus/input/devices is unreadable -- the names are what this board
+     * actually reports, confirmed on device. */
+    static const struct { const char *name; const char *fallback; int src; } fixed[] = {
+        { "md-gpio-keys",    "event0", KEYS_BUTTONS },   /* power, next */
+        { "jz adc keyboard", "event2", KEYS_BUTTONS },   /* side buttons */
+        { "earpods_adc",     "event3", KEYS_REMOTE  },   /* inline remote */
     };
     for (unsigned i = 0; i < sizeof(fixed) / sizeof(fixed[0]); i++) {
+        char node[32];
+        if (!input_node_by_name(fixed[i].name, node, sizeof(node)))
+            snprintf(node, sizeof(node), "%s", fixed[i].fallback);
         int have = 0;
         for (int k = 0; k < kfd_n; k++)
-            if (!strcmp(kfd_name[k], fixed[i].node)) { have = 1; break; }
+            if (!strcmp(kfd_name[k], node)) { have = 1; break; }
         if (have || kfd_n >= KFD_MAX) continue;
-        char path[32];
-        snprintf(path, sizeof(path), "/dev/input/%s", fixed[i].node);
+        char path[48];
+        snprintf(path, sizeof(path), "/dev/input/%s", node);
         int fd = open(path, O_RDONLY | O_NONBLOCK);
         if (fd < 0) continue;
         ioctl(fd, EVIOCGRAB, 1);
         kfd[kfd_n] = fd;
         kfd_src[kfd_n] = fixed[i].src;
-        snprintf(kfd_name[kfd_n], sizeof(kfd_name[0]), "%s", fixed[i].node);
+        snprintf(kfd_name[kfd_n], sizeof(kfd_name[0]), "%s", node);
         kfd_n++;
     }
 
@@ -8294,7 +8442,14 @@ int music_entry(void *a0, void *a1) {
     if (lib_open() != 0) mlog("[music] library open failed\n");
     if (resuming) resume_try_restore();
 
-    int tfd = open("/dev/input/event1", O_RDONLY | O_NONBLOCK);
+    /* Touch, by name for the same reason as scan_inputs()'s table above. */
+    char tnode[32];
+    if (!input_node_by_name("hyn_ts", tnode, sizeof(tnode)))
+        snprintf(tnode, sizeof(tnode), "event1");
+    char tpath[48];
+    snprintf(tpath, sizeof(tpath), "/dev/input/%s", tnode);
+    mlog("[music] touch on %s\n", tnode);
+    int tfd = open(tpath, O_RDONLY | O_NONBLOCK);
     if (tfd >= 0 && ioctl(tfd, EVIOCGRAB, 1) < 0)
         mlog("[music] touch grab failed: %s\n", strerror(errno));
 
@@ -8615,6 +8770,32 @@ int music_entry(void *a0, void *a1) {
                 if (i >= 0 && i < eq_profile_n) {
                     eq_switch_to(eq_profiles[i].path);
                     save_conf();          /* BG38 */
+                }
+                sheet_open = 0;
+            } else if (sheet_open == 4) {
+                /* R74: Rename/Delete/Cancel. Rename hands off to the T9
+                 * keyboard pre-filled with the current name, same "clear
+                 * sheet_open before kb_open()" shape R71's own create-and-add
+                 * row already uses. Delete is a separate confirm step
+                 * (sheet_open = 5), not immediate -- unlike a single track's
+                 * swipe-to-remove (R70), this deletes a whole named,
+                 * deliberately-curated list in one action, not one row a
+                 * fresh listen could accidentally repeat. */
+                if (i == 0 && sheet_playlist >= 0 && sheet_playlist < playlist_n) {
+                    snprintf(kb_rename_playlist_path, sizeof(kb_rename_playlist_path),
+                            "%s", playlists[sheet_playlist].path);
+                    sheet_open = 0;
+                    kb_open("Playlist name", KB_PURPOSE_RENAME_PLAYLIST,
+                           playlists[sheet_playlist].name);
+                } else if (i == 1 && sheet_playlist >= 0 && sheet_playlist < playlist_n) {
+                    sheet_open = 5;
+                } else {
+                    sheet_open = 0;
+                }
+            } else if (sheet_open == 5) {
+                if (i == 0 && sheet_playlist >= 0 && sheet_playlist < playlist_n) {
+                    pl_delete(playlists[sheet_playlist].path);
+                    playlist_n = pl_list(playlists, PL_MAX);
                 }
                 sheet_open = 0;
             } else if (i == 0) {
@@ -9002,6 +9183,13 @@ int music_entry(void *a0, void *a1) {
                     else kb_commit();                              /* Done */
                 } else if (y >= 100 && y < 170) {
                     kb_set_cursor_from_x(x);   /* tap in the field to place the caret */
+                } else if (kb_mode == KB_MODE_LETTERS && y >= KB_SHIFT_Y && y < KB_SHIFT_Y + KB_SHIFT_H &&
+                           x >= KB_SHIFT_X && x < KB_SHIFT_X + KB_SHIFT_W) {
+                    /* R73: off -> shift-once -> caps-lock -> off, the same
+                     * cycle a real T9 phone's own shift/"*" key already
+                     * uses. Inert in numbers/symbols mode -- see the button's
+                     * own dimmed drawing just above. */
+                    kb_shift = (kb_shift + 1) % 3;
                 } else if (y >= KB_GRID_Y && y < KB_GRID_Y + 4 * KB_KEY_H) {
                     int row = (y - KB_GRID_Y) / KB_KEY_H;
                     int col = x / KB_KEY_W;
@@ -10274,6 +10462,29 @@ int music_entry(void *a0, void *a1) {
                 if (idx >= 0 && idx < track_n) {
                     sheet_open = 1;
                     sheet_track = idx;
+                    dirty = 1; idle = 0;
+                }
+            }
+        }
+
+        /* R74: press-and-hold on a playlist -- Rename/Delete. Row 0 is
+         * "New Playlist" (R71), not a real entry, so it's excluded the same
+         * way the tap handler already excludes it from playlists[]. Flat
+         * CONTENT_Y/ROW_H math, same as this screen's own tap dispatch --
+         * SC_PLAYLISTS has no header/disc-banner concerns track_index_at()
+         * exists for. */
+        if (touch_down && !touch_moved && !edge_active && !hold_fired && !sheet_open &&
+            screen == SC_PLAYLISTS) {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            long held = (now.tv_sec - touch_at.tv_sec) * 1000L +
+                        (now.tv_nsec - touch_at.tv_nsec) / 1000000L;
+            if (held >= HOLD_MS) {
+                int idx = scroll + (touch_y - CONTENT_Y) / ROW_H;
+                hold_fired = 1;
+                if (idx >= 1 && idx - 1 < playlist_n) {
+                    sheet_open = 4;
+                    sheet_playlist = idx - 1;
                     dirty = 1; idle = 0;
                 }
             }

@@ -27,4 +27,15 @@ int  pl_write(const char *file, char (*paths)[LIB_PATH_LEN], int n);
  * etc., rather than silently overwriting or refusing. Returns 0 on
  * success, -1 on failure (out_path is untouched). */
 int  pl_create(const char *name, char *out_path, size_t out_sz);
+
+/* R74: renames an existing playlist, same sanitize+de-dup rules as
+ * pl_create() -- except a collision with old_path itself is not really a
+ * collision (see pl_rename()'s own comment). Writes the file's new real
+ * path to out_path (which may equal old_path if the sanitized name landed
+ * back on it). Returns 0 on success, -1 on failure. */
+int  pl_rename(const char *old_path, const char *new_name, char *out_path, size_t out_sz);
+/* R74: deletes a playlist file outright -- the tracks it named are
+ * untouched, only the curation (the list itself) is gone. Returns 0 on
+ * success, -1 on failure. */
+int  pl_delete(const char *path);
 #endif

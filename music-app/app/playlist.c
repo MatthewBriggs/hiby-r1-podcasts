@@ -136,6 +136,38 @@ int pl_create(const char *name, char *out_path, size_t out_sz) {
     return 0;
 }
 
+/* R74. Same sanitize+de-dup shape as pl_create(), except a collision with
+ * the file's OWN current path isn't really a collision -- confirming a
+ * rename with no real change (or one that only touches case/whitespace
+ * sanitizing back to the same filename) would otherwise immediately turn
+ * into "Name (2)" against itself. */
+int pl_rename(const char *old_path, const char *new_name, char *out_path, size_t out_sz) {
+    char safe[LIB_NAME_LEN];
+    sanitize_filename(new_name, safe, sizeof(safe));
+    if (!safe[0]) snprintf(safe, sizeof(safe), "New Playlist");
+
+    char path[LIB_PATH_LEN];
+    struct stat st;
+    for (int suffix = 1; suffix < 1000; suffix++) {
+        if (suffix == 1) snprintf(path, sizeof(path), "%s/%s.m3u", PL_DIR, safe);
+        else             snprintf(path, sizeof(path), "%s/%s (%d).m3u", PL_DIR, safe, suffix);
+        if (strcmp(path, old_path) == 0) break;
+        if (stat(path, &st) != 0) break;
+    }
+
+    if (strcmp(path, old_path) == 0) {
+        snprintf(out_path, out_sz, "%s", path);
+        return 0;   /* sanitized name landed back on the file's own path */
+    }
+    if (rename(old_path, path) != 0) return -1;
+    snprintf(out_path, out_sz, "%s", path);
+    return 0;
+}
+
+int pl_delete(const char *path) {
+    return unlink(path) == 0 ? 0 : -1;
+}
+
 int pl_append(const char *file, const char *track_path) {
     /* Silently adding a second copy is worse than doing nothing visible. */
     char (*have)[LIB_PATH_LEN] = malloc(sizeof(*have) * 512);
