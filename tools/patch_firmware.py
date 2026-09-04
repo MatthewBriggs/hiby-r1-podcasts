@@ -1236,6 +1236,89 @@ def bt_mac_before_rfkill_wait(root):
     return True
 
 
+
+def bt_gpio_power_test(root):
+    """EXPERIMENT: power the BT radio from userspace, without cywdhd.
+
+    Today bt_init reaches BT_REG_ON only via cywdhd: wait for it to register
+    rfkill0 (1.67s), then write rfkill0/state, which costs a further 0.86s
+    inside the driver. That is ~2.5s spent to raise one GPIO before patchram
+    can even start.
+
+    cywdhd itself names the pin: gpio_bt_reg_on=PB04, i.e. gpio 36 (bank B
+    starts at 32). Driving it directly from /sys/class/gpio should let
+    patchram start at ~1.05s instead of 2.52s -- worth ~1.5s, which is the
+    difference between ~8.6s and ~7.0s to bt_init_ok.
+
+    The open question this build exists to answer: does the BT side need the
+    32kHz LPO clock enabled by cywdhd? If the LPO comes from the SoC or PMIC
+    instead, patchram will succeed with cywdhd not yet loaded and the idea is
+    live. If hci0 never appears, it is dead and the seam is closed.
+
+    To keep that question clean, cywdhd is deferred to the END of the module
+    script here, so it cannot drive PB04 low mid-download. That is a test
+    configuration only -- it delays WiFi and may leave cywdhd unable to claim
+    the pin we are holding, which would take rfkill0 (and so the app's BT
+    toggle, bt_suspend and bt_resume) with it.
+
+    The firmware blob is hardcoded to the AP6212 one. Its usual selector
+    reads chipvendor from an SDIO path that will not exist this early, and
+    that path's else-branch picks the aw-nb372sm blob -- wrong for this board.
+    """
+    path = os.path.join(root, BT_INIT)
+    if not os.path.exists(path):
+        return False
+    with open(path) as fh:
+        t = fh.read()
+
+    # Anchor on the bare rfkill write: present in stock and in every patched
+    # form. This runs before patch_bt_init_timing(), so the bt_wait variant
+    # does not exist yet.
+    old_power = "echo 1 > /sys/class/rfkill/rfkill0/state"
+    if old_power not in t:
+        return False
+    t = t.replace("sleep 1 # if invoke this script in c with system(), "
+                  "must sleep for a while!!!!!\n", "", 1)
+    t = t.replace("bt_wait 10 \'[ -e /sys/class/rfkill/rfkill0/state ]\'\n", "", 1)
+    new_power = """# EXPERIMENT: raise BT_REG_ON (PB04 = gpio 36) directly, rather than
+# waiting for cywdhd to register rfkill0 and then writing to it.
+# Both rails, not just BT. On these combo parts WL_REG_ON (PB03, gpio 35)\n# gates the chip's internal supply, and the BT core does not run without it:\n# raising BT_REG_ON alone attached the UART line discipline and created hci0,\n# but every HCI command then timed out (0x1003/0x1001/0x1009, repeatedly) on\n# the BT_GPIO_TEST build.\nWL_GPIO=35\nBT_GPIO=36\nBTLOG=/usr/data/btboot.log\nfor g in $WL_GPIO $BT_GPIO; do\n    [ -d /sys/class/gpio/gpio$g ] || echo $g > /sys/class/gpio/export 2>/dev/null\n    echo out > /sys/class/gpio/gpio$g/direction 2>/dev/null\n    echo 1   > /sys/class/gpio/gpio$g/value     2>/dev/null\ndone
+if [ ! -d /sys/class/gpio/gpio$BT_GPIO ]; then
+    echo $BT_GPIO > /sys/class/gpio/export 2>/dev/null \
+        && echo "$(cat /proc/uptime | cut -d\" \" -f1) gpio exported" >> $BTLOG \\
+        || echo "$(cat /proc/uptime | cut -d\" \" -f1) gpio EXPORT FAILED" >> $BTLOG
+fi
+echo out  > /sys/class/gpio/gpio$BT_GPIO/direction 2>/dev/null
+echo 1    > /sys/class/gpio/gpio$BT_GPIO/value     2>/dev/null
+echo "$(cat /proc/uptime | cut -d\" \" -f1) BT_REG_ON=$(cat /sys/class/gpio/gpio$BT_GPIO/value 2>/dev/null)" >> $BTLOG
+"""
+    t = t.replace(old_power, new_power, 1)
+
+    # Hardcode the AP6212 blob: the chipvendor path needs SDIO, which has not
+    # enumerated yet at this point in boot.
+    import re
+    t = re.sub(r"CHIPVENDOR_PATH=.*?\nfi\n",
+               'firmware=BCM4343A1_001.002.009.1010.1030.hcd   # AP6212, hardcoded for the test\n',
+               t, count=1, flags=re.S)
+
+    with open(path, "w") as fh:
+        fh.write(t)
+
+    # cywdhd to the very end, so it cannot touch PB04 during the download
+    mpath = os.path.join(root, MODULE_INIT_SCRIPT)
+    if os.path.exists(mpath):
+        with open(mpath) as fh:
+            lines = fh.read().splitlines()
+        cyw = [l for l in lines if l.strip().rstrip("&").strip() == "sh cywdhd.sh"]
+        if cyw:
+            rest = [l for l in lines if l.strip().rstrip("&").strip() != "sh cywdhd.sh"]
+            rest += ["# TEST BUILD: deferred to the end so it cannot drive PB04 low",
+                     "# while brcm_patchram_plus is mid-download.", cyw[0].strip()]
+            with open(mpath, "w") as fh:
+                fh.write("\n".join(rest) + "\n")
+    return True
+
+
 def hasten_bt_init(root):
     """Move bt_init from S80 to S22, so its fixed cost overlaps the rest of boot.
 
@@ -1613,6 +1696,11 @@ def main():
                          "stamped alongside the embedded binary and compared "
                          "against /usr/data's own marker at boot to decide "
                          "whether to copy it in.")
+    ap.add_argument("--bt-gpio-test", action="store_true",
+                    help="EXPERIMENT: power the BT radio by driving PB04 from "
+                         "userspace instead of waiting for cywdhd's rfkill0, "
+                         "and defer cywdhd to the end of the module script. "
+                         "See bt_gpio_power_test().")
     ap.add_argument("--background-touch", action="store_true",
                     help="background the touchscreen module load (~0.3s off "
                          "boot). OFF by default: it reorders input device "
@@ -1819,6 +1907,10 @@ def main():
                       f"rfkill0 wait: ~0.8s)")
 
             nt = trace_bt_init(root)
+            if args.bt_gpio_test and bt_gpio_power_test(root):
+                print("EXPERIMENT: bt_init drives PB04 directly; cywdhd deferred "
+                      "to the end of the module script")
+
             if nt:
                 print(f"instrumented {BT_INIT} with {nt} boot-time stamps "
                       f"-> /usr/data/btboot.log")
