@@ -6457,6 +6457,23 @@ static int go_back(void) {
         case SC_EQ_BANDS:
             screen = SC_EQ; reset_scroll();
             break;
+        case SC_KEYBOARD:
+            /* BG107: reported live -- typing a new playlist's name and
+             * swiping back out (rather than tapping Done) landed on
+             * Albums with nothing created. No case existed for this
+             * screen at all, so it fell into the default: case below,
+             * built for SC_TRACKS/chapters/episodes -- none of that
+             * case's flags (tracks_from_artist_page/pod_list/ab_list/
+             * recent_mode) have anything to do with the keyboard, so it
+             * always fell through to that case's own final fallback,
+             * Albums, regardless of what screen actually opened the
+             * keyboard. Same behaviour as tapping Cancel (kb_commit() is
+             * deliberately not called here -- a back gesture reads as
+             * "never mind", not "confirm"), so this also fixes the
+             * identical gap for the Wi-Fi SSID/password keyboard, which
+             * had the same missing case. */
+            screen = kb_return_screen;
+            break;
         case SC_QUEUE:
             /* Reported live: reached via the queue button, "back" means
              * "close the queue", landing on Now Playing is right. Reached as
