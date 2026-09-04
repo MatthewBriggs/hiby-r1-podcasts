@@ -18,4 +18,13 @@ int  pl_append(const char *file, const char *track_path);
  * there's nothing richer to lose -- see pl_write()'s own comment before
  * pointing this at a playlist some other tool wrote. */
 int  pl_write(const char *file, char (*paths)[LIB_PATH_LEN], int n);
+
+/* R71: creates a new, empty playlist named `name` (whatever was typed on
+ * the T9 keyboard) and writes its real path to out_path. Sanitizes `name`
+ * into a safe filename the same way it's shown -- see pl_create()'s own
+ * comment for exactly what changes and why -- and de-duplicates against an
+ * existing file of the same sanitized name by appending " (2)", " (3)",
+ * etc., rather than silently overwriting or refusing. Returns 0 on
+ * success, -1 on failure (out_path is untouched). */
+int  pl_create(const char *name, char *out_path, size_t out_sz);
 #endif

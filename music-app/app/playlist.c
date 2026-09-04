@@ -96,6 +96,46 @@ int pl_write(const char *file, char (*paths)[LIB_PATH_LEN], int n) {
     return 0;
 }
 
+/* R71: FAT32/exFAT (what the SD card actually is) forbids `/ \ : * ? " < >
+ * |` and control characters in a filename, and Windows tools (this app's
+ * playlists are plain .m3u specifically so they're readable elsewhere)
+ * additionally choke on a trailing dot or space. Replaced with '_' rather
+ * than dropped outright -- "AC/DC" collapsing to "ACDC" reads as a typo an
+ * unrelated playlist, "AC_DC" still reads as the name that was actually
+ * typed. Trailing dots/spaces are trimmed instead, since a trailing
+ * underscore for those would look stranger than just not being there. */
+static void sanitize_filename(const char *in, char *out, size_t outsz) {
+    size_t o = 0;
+    for (const char *p = in; *p && o + 1 < outsz; p++) {
+        unsigned char c = (unsigned char)*p;
+        out[o++] = (c < 0x20 || strchr("/\\:*?\"<>|", c)) ? '_' : (char)c;
+    }
+    out[o] = '\0';
+    while (o > 0 && (out[o - 1] == '.' || out[o - 1] == ' ')) out[--o] = '\0';
+}
+
+int pl_create(const char *name, char *out_path, size_t out_sz) {
+    ensure_dir();
+    char safe[LIB_NAME_LEN];
+    sanitize_filename(name, safe, sizeof(safe));
+    if (!safe[0]) snprintf(safe, sizeof(safe), "New Playlist");
+
+    char path[LIB_PATH_LEN];
+    struct stat st;
+    for (int suffix = 1; suffix < 1000; suffix++) {
+        if (suffix == 1) snprintf(path, sizeof(path), "%s/%s.m3u", PL_DIR, safe);
+        else             snprintf(path, sizeof(path), "%s/%s (%d).m3u", PL_DIR, safe, suffix);
+        if (stat(path, &st) != 0) break;   /* first name not already taken */
+    }
+
+    FILE *f = fopen(path, "w");
+    if (!f) return -1;
+    fputs("#EXTM3U\n", f);
+    fclose(f);
+    snprintf(out_path, out_sz, "%s", path);
+    return 0;
+}
+
 int pl_append(const char *file, const char *track_path) {
     /* Silently adding a second copy is worse than doing nothing visible. */
     char (*have)[LIB_PATH_LEN] = malloc(sizeof(*have) * 512);

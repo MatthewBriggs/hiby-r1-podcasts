@@ -2087,7 +2087,8 @@ static screen_t   kb_return_screen;
  * pointer so kb_buf's lifetime and the action are both plain state, visible
  * to mlog() and safe across a screen redraw, rather than a pointer that has
  * to be re-armed correctly on every kb_open() call site. */
-typedef enum { KB_PURPOSE_NONE = 0, KB_PURPOSE_WIFI_PASSWORD, KB_PURPOSE_WIFI_SSID_MANUAL } kb_purpose_t;
+typedef enum { KB_PURPOSE_NONE = 0, KB_PURPOSE_WIFI_PASSWORD, KB_PURPOSE_WIFI_SSID_MANUAL,
+               KB_PURPOSE_NEW_PLAYLIST_NAME } kb_purpose_t;
 static kb_purpose_t kb_purpose;
 /* Three modes, not two. The original pair had the mode key labelled "123"
  * while actually switching to *symbols* -- reported as exactly that
@@ -2254,6 +2255,14 @@ static void kb_set_cursor_from_x(int tx) {
  * somewhere else, set by whichever screen called kb_open(). */
 static char kb_wifi_target_ssid[64];
 
+/* R71: which track (if any) a KB_PURPOSE_NEW_PLAYLIST_NAME session should
+ * add to the playlist once it's created -- set when the keyboard is opened
+ * from the "Add to Playlist" sheet's own "New Playlist..." row, left at -1
+ * when opened from SC_PLAYLISTS' own "New Playlist" row instead, where
+ * there is no specific track in play and creating an empty playlist is the
+ * whole point. */
+static int kb_new_playlist_add_track = -1;
+
 /* SSIDs and passphrases can contain nearly any byte a shell or a plain
  * "key = value" line would treat as a control character (spaces, '=',
  * '#', quotes, even raw newlines are technically legal in a passphrase).
@@ -2360,6 +2369,34 @@ static void kb_commit(void) {
             snprintf(kb_wifi_target_ssid, sizeof(kb_wifi_target_ssid), "%s", kb_buf);
             kb_open("Password for this network", KB_PURPOSE_WIFI_PASSWORD, "");
             return;   /* stays on SC_KEYBOARD -- do not fall through to the pop below */
+        case KB_PURPOSE_NEW_PLAYLIST_NAME: {
+            /* R71. An empty kb_buf still creates one -- pl_create() itself
+             * falls back to "New Playlist" rather than this needing its own
+             * empty-name guard, same reasoning kb_buf's other purposes trust
+             * their own callee with an edge case rather than duplicating the
+             * check here. */
+            char path[LIB_PATH_LEN];
+            if (pl_create(kb_buf, path, sizeof(path)) == 0) {
+                playlist_n = pl_list(playlists, PL_MAX);
+                if (kb_new_playlist_add_track >= 0 && kb_new_playlist_add_track < track_n) {
+                    pl_append(path, tracks[kb_new_playlist_add_track].path);
+                    /* pl_create() may have de-duplicated the typed name (an
+                     * existing "Road Trip" leaves this one "Road Trip (2)")
+                     * -- the note should say what actually got created, not
+                     * what was typed, so this reads path's own filename
+                     * rather than kb_buf. */
+                    const char *base = strrchr(path, '/');
+                    base = base ? base + 1 : path;
+                    char name[LIB_NAME_LEN];
+                    snprintf(name, sizeof(name), "%s", base);
+                    char *ext = strrchr(name, '.');
+                    if (ext && !strcasecmp(ext, ".m3u")) *ext = '\0';
+                    snprintf(sheet_note, sizeof(sheet_note), "Added to %s", name);
+                }
+            }
+            kb_new_playlist_add_track = -1;
+            break;
+        }
         case KB_PURPOSE_NONE:
         default:
             break;
@@ -3229,7 +3266,7 @@ static int scroll_to_px(int total_px) {
     int limit = (screen == SC_TRACKS) ? track_n :
                 (screen == SC_QUEUE)  ? queue_n :
                 (screen == SC_RADIO)  ? station_n :
-                (screen == SC_PLAYLISTS) ? playlist_n :
+                (screen == SC_PLAYLISTS) ? playlist_n + 1 :   /* +1: R71's own "New Playlist" row */
                 (screen == SC_SETTINGS) ? settings_content_rows() :
                 (screen == SC_SETTINGS_TIMEZONE) ? TZ_N : total;
     int max_top = limit - vis_rows();
@@ -4447,18 +4484,22 @@ static void draw_screen(uint16_t *fb) {
 
     if (screen == SC_PLAYLISTS) {
         /* Clipped top and bottom so a row locked to a letter (index_lock_end)
-         * never paints over the header above or the mini player below. */
+         * never paints over the header above or the mini player below.
+         * R71: row 0 is "New Playlist" (an action, not a playlist), so
+         * every real entry's index is shifted by one -- idx - 1, not idx,
+         * into playlists[]. */
         for (int i = 0; i < vis_rows(); i++) {
             int idx = scroll + i;
-            if (idx >= playlist_n) break;
-            draw_text_clip(fb, 24, y + 20, playlists[idx].name, COL_TEXT, TEXT_PX_BODY,
-                           FB_W - 40, CONTENT_Y, clip_bot);
+            if (idx > playlist_n) break;
+            if (idx == 0) {
+                draw_text(fb, 24, y + 20, "New Playlist", COL_ACCENT, TEXT_PX_BODY, FB_W - 40);
+            } else {
+                draw_text_clip(fb, 24, y + 20, playlists[idx - 1].name, COL_TEXT, TEXT_PX_BODY,
+                               FB_W - 40, CONTENT_Y, clip_bot);
+            }
             fill_rect_clip(fb, 0, y + ROW_H - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
             y += ROW_H;
         }
-        if (playlist_n == 0)
-            draw_text(fb, 24, y + 20, "No playlists on the card", COL_DIM,
-                      TEXT_PX_BODY, FB_W - 40);
         if (mini_visible()) draw_mini(fb);
         return;
     }
@@ -6659,7 +6700,9 @@ static void draw_back_hint(uint16_t *fb) {
 #define SHEET_HEAD 46
 
 static int sheet_rows(void) {
-    return sheet_open == 2 ? playlist_n + 1 :
+    /* R71: +2 for "New Playlist..." and "Cancel", not just +1 -- see
+     * draw_sheet()'s own row labelling just below. */
+    return sheet_open == 2 ? playlist_n + 2 :
            sheet_open == 3 ? eq_profile_n + 1 : SHEET_N;
 }
 static int sheet_top(void) { return FB_H - sheet_rows() * SHEET_ROW - SHEET_HEAD; }
@@ -6692,8 +6735,8 @@ static void draw_sheet(uint16_t *fb) {
         const char *label;
         int last;
         if (sheet_open == 2) {
-            last = (i == playlist_n);
-            label = last ? "Cancel" : playlists[i].name;
+            last = (i == playlist_n + 1);
+            label = last ? "Cancel" : (i == playlist_n) ? "New Playlist..." : playlists[i].name;
         } else if (sheet_open == 3) {
             last = (i == eq_profile_n);
             label = last ? "Cancel" : eq_profiles[i].name;
@@ -6701,7 +6744,11 @@ static void draw_sheet(uint16_t *fb) {
             last = (i == SHEET_N - 1);
             label = sheet_items[i];
         }
-        draw_text(fb, 24, ry + 16, label, last ? COL_DIM : COL_TEXT,
+        /* R71: "New Playlist..." reads as an action, same accent style
+         * "Scan for networks"/"Scan for devices" already use elsewhere,
+         * not as just another name in the list above it. */
+        int is_new_playlist = (sheet_open == 2 && i == playlist_n);
+        draw_text(fb, 24, ry + 16, label, last ? COL_DIM : is_new_playlist ? COL_ACCENT : COL_TEXT,
                   TEXT_PX_BODY, FB_W - 48);
         if (!last) fill_rect(fb, 24, ry + SHEET_ROW - 1, FB_W - 48, 1, COL_LINE);
     }
@@ -8498,12 +8545,22 @@ int music_entry(void *a0, void *a1) {
             int top = sheet_top();
             int i = (y >= top + SHEET_HEAD) ? (y - top - SHEET_HEAD) / SHEET_ROW : -1;
             if (sheet_open == 2) {
-                if (i >= 0 && i < playlist_n && sheet_track < track_n) {
-                    int rc = pl_append(playlists[i].path, tracks[sheet_track].path);
-                    snprintf(sheet_note, sizeof(sheet_note), "%s %s",
-                             rc == 1 ? "Added to" : "Already in", playlists[i].name);
+                if (i == playlist_n) {
+                    /* R71: create-and-add in one step, rather than needing
+                     * a separate trip to SC_PLAYLISTS first. sheet_open is
+                     * cleared here (kb_open() only ever changes `screen`),
+                     * so the sheet doesn't also draw underneath the keyboard. */
+                    kb_new_playlist_add_track = sheet_track;
+                    sheet_open = 0;
+                    kb_open("Playlist name", KB_PURPOSE_NEW_PLAYLIST_NAME, "");
+                } else {
+                    if (i >= 0 && i < playlist_n && sheet_track < track_n) {
+                        int rc = pl_append(playlists[i].path, tracks[sheet_track].path);
+                        snprintf(sheet_note, sizeof(sheet_note), "%s %s",
+                                rc == 1 ? "Added to" : "Already in", playlists[i].name);
+                    }
+                    sheet_open = 0;
                 }
-                sheet_open = 0;
             } else if (sheet_open == 3) {
                 /* No save-on-the-way-out here either, for the same reason as
                  * go_back()'s SC_EQ_BAND case: switching profiles without
@@ -9259,16 +9316,24 @@ int music_entry(void *a0, void *a1) {
                         screen = SC_PLAYING;
                         ab_play_chapter(scroll + idx);
                     }
-                } else if (screen == SC_PLAYLISTS && scroll + idx < playlist_n) {
+                } else if (screen == SC_PLAYLISTS && scroll + idx == 0) {
+                    /* R71: row 0, the "New Playlist" action -- no track to
+                     * add on this path (see kb_new_playlist_add_track's own
+                     * comment), just create an empty one and land back
+                     * here with it in the list. */
+                    kb_new_playlist_add_track = -1;
+                    kb_open("Playlist name", KB_PURPOSE_NEW_PLAYLIST_NAME, "");
+                } else if (screen == SC_PLAYLISTS && scroll + idx - 1 < playlist_n) {
+                    int pi = scroll + idx - 1;   /* R71: row 0 is "New Playlist", not playlists[0] */
                     static char paths[PAGE_MAX * 8][LIB_PATH_LEN];
                     int want = (int)(sizeof(paths) / sizeof(paths[0]));
-                    int got = pl_read(playlists[scroll + idx].path, paths, want);
+                    int got = pl_read(playlists[pi].path, paths, want);
                     track_n = 0;
                     for (int k = 0; k < got; k++)
                         if (lib_track_by_path(paths[k], &tracks[track_n]) == 0)
                             track_n++;
                     /* A playlist is an order someone chose; leave it alone. */
-                    snprintf(cur_album, sizeof(cur_album), "%s", playlists[scroll + idx].name);
+                    snprintf(cur_album, sizeof(cur_album), "%s", playlists[pi].name);
                     cur_artist[0] = '\0';
                     browsing_is_playlist = 1;   /* BG73 */
                     tracks_from_artist_page = 0;
@@ -9276,7 +9341,7 @@ int music_entry(void *a0, void *a1) {
                     ab_list = 0;
                     pod_list = 0;
                     mlog("[music] playlist %s: %d of %d found\n",
-                         playlists[scroll + idx].name, track_n, got);
+                         playlists[pi].name, track_n, got);
                 } else if (screen == SC_RADIO && scroll + idx < station_n) {
                     play_station(scroll + idx);
                     if (audio_is_active()) screen = SC_PLAYING;
