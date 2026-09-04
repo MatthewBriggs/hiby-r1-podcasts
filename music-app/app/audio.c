@@ -862,6 +862,79 @@ static int mp3_probe(const char *path, int *rate_out, int *bitrate_bps_out) {
     return -1;
 }
 
+/* BG106: reported live -- a VBR MP3 (a Martha Wainwright "Special Edition"
+ * track) showed a flat "128 kbps" as if it were CBR. mp3_probe() above is
+ * working as designed (its own comment already says a VBR file "gives
+ * whatever the first frame happened to be" as a deliberate, cheap
+ * approximation for a list row's duration estimate) -- the actual bug is
+ * that nothing anywhere checks whether that number means anything before
+ * showing it labelled as if it were the file's one true bitrate.
+ *
+ * A VBR encoder conventionally writes a "Xing" (or Fraunhofer's own
+ * "VBRI") tag into the first frame announcing exactly that -- LAME
+ * deliberately writes "Info" instead for a CBR/ABR file it also tags, so
+ * "Info" is excluded here on purpose, not just an oversight. Same ID3v2-
+ * skip and frame-sync scan as mp3_probe(), reused rather than shared code
+ * because the two return genuinely different things (a number vs a yes/no)
+ * and mp3_probe() already has three call sites depending on its exact
+ * signature. The tag sits right after the frame header's own side-info
+ * bytes, whose length depends on MPEG version and channel mode -- a fixed,
+ * well-known table, not something derived here. Returns 1 if a VBR tag is
+ * found, 0 for CBR/ABR/unreadable/non-MP3 alike -- there is no reliable
+ * third answer to give a caller from a single frame. */
+int audio_mp3_is_vbr(const char *path) {
+    unsigned char hdr[10];
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    size_t hn = fread(hdr, 1, sizeof(hdr), f);
+    if (hn < 10) { fclose(f); return 0; }
+
+    size_t start = 0;
+    if (!memcmp(hdr, "ID3", 3)) {
+        uint32_t sz = ((uint32_t)(hdr[6] & 0x7F) << 21) | ((uint32_t)(hdr[7] & 0x7F) << 14) |
+                     ((uint32_t)(hdr[8] & 0x7F) << 7) | (hdr[9] & 0x7F);
+        start = 10 + sz;
+    }
+    if (fseek(f, (long)start, SEEK_SET) != 0) { fclose(f); return 0; }
+
+    unsigned char buf[8192];
+    size_t n = fread(buf, 1, sizeof(buf), f);
+    fclose(f);
+
+    for (size_t i = 0; i + 4 <= n; i++) {
+        if (buf[i] != 0xFF || (buf[i + 1] & 0xE0) != 0xE0) continue;
+        int ver_bits = (buf[i + 1] >> 3) & 0x03;    /* 00=v2.5, 10=v2, 11=v1 */
+        int layer_bits = (buf[i + 1] >> 1) & 0x03;   /* 01=Layer III */
+        if (layer_bits != 0x01 || ver_bits == 0x01) continue;
+        int br_idx = (buf[i + 2] >> 4) & 0x0F;
+        int sr_idx = (buf[i + 2] >> 2) & 0x03;
+        if (br_idx == 0 || br_idx == 15 || sr_idx == 3) continue;
+
+        /* A real frame header -- this is the one mp3_probe() would also
+         * have picked. The Xing/Info tag sits after the side-info bytes:
+         * 32 for MPEG1 stereo/joint/dual, 17 for MPEG1 mono, 17 for
+         * MPEG2/2.5 stereo/joint/dual, 9 for MPEG2/2.5 mono. */
+        int mono = ((buf[i + 3] >> 6) & 0x03) == 0x03;
+        int side_info = (ver_bits == 0x03) ? (mono ? 17 : 32) : (mono ? 9 : 17);
+        size_t tag_off = i + 4 + (size_t)side_info;
+        if (tag_off + 4 <= n &&
+            (!memcmp(buf + tag_off, "Xing", 4) || !memcmp(buf + tag_off, "VBRI", 4)))
+            return 1;
+        /* VBRI is Fraunhofer's own tag and, unlike Xing/Info, always sits
+         * at a fixed offset of 4 + 32 bytes regardless of channel mode --
+         * it doesn't share Xing/Info's side-info-relative convention. Only
+         * worth a second check when that differs from the one just tried. */
+        size_t vbri_off = i + 4 + 32;
+        if (vbri_off != tag_off && vbri_off + 4 <= n &&
+            !memcmp(buf + vbri_off, "VBRI", 4))
+            return 1;
+        return 0;   /* a real frame with neither tag -- CBR, ABR, or a
+                      * plain "Info"-tagged file; nothing further up this
+                      * file scans past the first frame either. */
+    }
+    return 0;
+}
+
 /* Scanner-facing probe: what a database row needs, none of it decoded PCM.
  * FLAC/WAV/AIFF/Vorbis/Opus/M4A all state bits and (except MP3-adjacent
  * concerns don't apply here) an exact frame count via dec_open() alone, so

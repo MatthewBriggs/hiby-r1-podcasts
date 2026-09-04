@@ -3789,6 +3789,22 @@ static int ab_file_bitrate_kbps(const char *path, int64_t file_dur_ms) {
     return ab_bitrate_kbps;
 }
 
+/* BG106: same cache-on-path shape as ab_file_bitrate_kbps() just above --
+ * audio_mp3_is_vbr() is cheap, but the Now Playing screen redraws often
+ * enough (the once-a-second clock tick alone) that there is no reason to
+ * re-read the file every time when it hasn't changed. */
+static char track_vbr_path[LIB_PATH_LEN];
+static int  track_vbr_cached;
+
+static int track_is_vbr_mp3(const char *path) {
+    if (strcmp(path, track_vbr_path) != 0) {
+        const char *dot = strrchr(path, '.');
+        track_vbr_cached = (dot && !strcasecmp(dot, ".mp3")) ? audio_mp3_is_vbr(path) : 0;
+        snprintf(track_vbr_path, sizeof(track_vbr_path), "%s", path);
+    }
+    return track_vbr_cached;
+}
+
 /* Which chapter the playing position is now inside. Derived rather than
  * remembered, so simply listening across a boundary moves the display on
  * without anything having to notice the crossing. */
@@ -5020,6 +5036,15 @@ static void draw_screen(uint16_t *fb) {
             int kbps = ab_file_bitrate_kbps(t->path, dur);
             if (kbps > 0) snprintf(buf, sizeof(buf), "%s  %d kbps", ext, kbps);
             else          snprintf(buf, sizeof(buf), "%s", ext);
+        } else if (track_is_vbr_mp3(t->path)) {
+            /* BG106: t->bitrate is either the stock scanner's own number or
+             * this app's mp3_probe() fallback -- both, by design, are just
+             * whatever the first frame happened to carry (see mp3_probe()'s
+             * own comment), which is not a real answer for a VBR file and
+             * reads as a plainly wrong CBR-style number instead of not
+             * knowing at all. */
+            snprintf(buf, sizeof(buf), "%s  %d/%g kHz  VBR",
+                     track_format_name(t), t->bits, t->rate / 1000.0);
         } else {
             snprintf(buf, sizeof(buf), "%s  %d/%g kHz  %d kbps",
                      track_format_name(t), t->bits, t->rate / 1000.0,

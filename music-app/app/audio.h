@@ -90,4 +90,12 @@ const char *audio_output(void);   /* "3.5 mm", "USB" or "Bluetooth" */
  * as an MP3/VBR fallback; pass 0 if unknown. Safe to call from any thread,
  * including while something else is playing. Returns 0 on failure. */
 int audio_probe_dur_ms(const char *path, int bitrate_bps);
+
+/* BG106: 1 if path's first MPEG frame carries a Xing/VBRI VBR tag, 0 for
+ * CBR/ABR/unreadable/non-MP3 alike -- see audio.c's own comment on why
+ * LAME's "Info" tag (CBR/ABR) is deliberately excluded. Cheap (reads at
+ * most 8202 bytes), but callers showing this in a UI should still cache
+ * it per path rather than re-probe every redraw -- see music_hook.c's own
+ * cached wrapper. */
+int audio_mp3_is_vbr(const char *path);
 #endif
