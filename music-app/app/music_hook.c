@@ -8796,8 +8796,24 @@ int music_entry(void *a0, void *a1) {
                     }
                 }
                 }
-            } else if (y < CONTENT_Y) {
-                /* mseb_reset_x()/pod_sync_x()'s own on-screen position sits
+            } else if (y < CONTENT_Y && screen != SC_KEYBOARD) {
+                /* BG108: SC_KEYBOARD draws its own header (Cancel top-left,
+                 * Done top-right, both at y=20 -- see draw_keyboard()) rather
+                 * than the generic title+BACK bar every other screen has,
+                 * but nothing here excluded it from this generic zone, whose
+                 * own BACK check just below (`x > FB_W - 120`) fires on
+                 * every screen except SC_MENU. Done sits at that exact same
+                 * top-right position BACK always does, so tapping it landed
+                 * here first and called go_back() -- Cancel's behaviour, not
+                 * Done's -- before SC_KEYBOARD's own dedicated handler further
+                 * down ever got a turn. Reported live: "'done' is in the same
+                 * spot as 'back'... I definitely, 100% hit 'done'" -- true on
+                 * both counts, the input landed correctly, it just resolved
+                 * to the wrong action, not the "user error" it initially
+                 * looked like against BG107's own build (which fixed go_back()
+                 * itself to no longer make this specific case dump to Albums,
+                 * but didn't stop go_back() from being reached at all here).
+                 * mseb_reset_x()/pod_sync_x()'s own on-screen position sits
                  * well left of the old fixed "FB_W - 120" boundary these
                  * zones used to end at, which left a dead strip between the
                  * end of "Reset"/"Sync" and where that boundary began --
