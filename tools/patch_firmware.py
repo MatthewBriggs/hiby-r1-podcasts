@@ -1067,6 +1067,175 @@ def protect_sd_during_storage(root):
     return done or None
 
 
+
+def start_patchram_earlier(root):
+    """Get brcm_patchram_plus started before the module script, not after it.
+
+    patchram costs 4.26s and cannot be shortened -- strace showed 4.188s of it
+    blocked in read() on the UART, 191 HCI commands at ~22ms of chip-side
+    processing each. But it is *idle* waiting, so overlapping it with the
+    module loads is a genuine win on this single-core device, unlike
+    backgrounding CPU-bound work (see background_touch_module(), which
+    measured flat over three boots for exactly that reason).
+
+    Today bt_init cannot start until S21 mounts /usr/data, purely to read
+    bt_macaddr.txt, and S21 runs after S11module_driver_default. So patchram
+    begins around 2.8s. ubifs needs no vendor module -- mtd/NAND is built into
+    the kernel -- so the mount can move ahead of the module script:
+
+        S11amount_ubifs   (was S21mount_ubifs)
+        S11b_bt_init      (was S22_bt_init) -- already backgrounded by its own
+                          init script, so it returns at once and waits on
+                          rfkill0 while the modules load
+        S11module_driver_default
+
+    and cywdhd moves up within the module script so rfkill0 appears sooner.
+    It cannot go first: lsmod shows it depends on soc_msc (SDIO) and
+    soc_utils, so straight after soc_msc.sh is the earliest slot.
+
+    Returns a list of what changed, or None.
+    """
+    initd = os.path.join(root, "etc/init.d")
+    done = []
+    for old, new in (("S21mount_ubifs", "S11amount_ubifs"),
+                     ("S22_bt_init", "S11b_bt_init"),
+                     ("S80_bt_init", "S11b_bt_init")):
+        src, dst = os.path.join(initd, old), os.path.join(initd, new)
+        if os.path.exists(src) and not os.path.exists(dst):
+            os.rename(src, dst)
+            done.append("%s -> %s" % (old, new))
+
+    path = os.path.join(root, MODULE_INIT_SCRIPT)
+    if os.path.exists(path):
+        with open(path) as fh:
+            lines = fh.read().splitlines()
+        cyw = [l for l in lines if l.strip().rstrip("&").strip() == "sh cywdhd.sh"]
+        if cyw and any(l.strip() == "sh soc_msc.sh" for l in lines) \
+               and any(l.strip() == "sh soc_gpio.sh" for l in lines):
+            # Pull soc_msc up too, not just cywdhd: measured on LEAN_4h, moving
+            # cywdhd alone only bought 0.19s because it still had to wait for
+            # soc_msc sitting 14 modules deep. Placed straight after soc_gpio so
+            # utils/soc_utils/soc_i2c/axp2101 (power) and soc_gpio (pins) still
+            # precede it; only the display/audio stack (soc_pwm, pwm_backlight,
+            # soc_fb, soc_aic) is skipped, which SDIO does not need.
+            drop = ("sh cywdhd.sh", "sh soc_msc.sh")
+            rest = [l for l in lines if l.strip().rstrip("&").strip() not in drop]
+            out = []
+            for l in rest:
+                out.append(l)
+                if l.strip() == "sh soc_gpio.sh":
+                    out += ["# soc_msc + cywdhd moved up from positions 14 and 20:",
+                            "# cywdhd registers md_bcmdhd_bt_power (and so rfkill0) at the",
+                            "# start of dhd_module_init, and bt_init is now waiting on it",
+                            "# from S11b. cywdhd depends on soc_msc and soc_utils, so this",
+                            "# is the earliest either can go.",
+                            "sh soc_msc.sh",
+                            cyw[0].strip()]
+            with open(path, "w") as fh:
+                fh.write("\n".join(out) + "\n")
+            done.append("soc_msc + cywdhd moved up to follow soc_gpio")
+    return done or None
+
+
+
+BT_TRACE_HELPER = """
+# Boot-time tracing. Each stage appends uptime to /usr/data/btboot.log, so the
+# ~1s gap between rfkill0 appearing and patchram actually starting can be
+# attributed instead of guessed at. One echo per stage; negligible against a
+# 4.26s patchram.
+bt_t() { echo "$(cut -d' ' -f1 /proc/uptime) $*" >> /usr/data/btboot.log; }
+rm -f /usr/data/btboot.log
+bt_t "script start"
+"""
+
+
+def trace_bt_init(root):
+    """Add per-stage uptime stamps to bt_init. Runs after the timing patch."""
+    path = os.path.join(root, BT_INIT)
+    if not os.path.exists(path):
+        return None
+    with open(path) as fh:
+        t = fh.read()
+    if "bt_t()" in t:
+        return None
+    marks = (
+        ("bt_wait 10 '[ -e /sys/class/rfkill/rfkill0/state ]'", "rfkill0 present", True),
+        ('echo "BT_MACADDR $bt_addr"', "mac resolved", True),
+        ('echo "Selected firmware: $firmware"', "firmware chosen", True),
+        ("bt_wait 15 '[ -d /sys/class/bluetooth/hci0 ]'", "hci0 present", True),
+        ("hciconfig hci0 up", "hci0 up issued", False),
+        ("/usr/libexec/bluetooth/bluetoothd -E -C &", "bluetoothd started", True),
+        ("hciconfig hci0 reset", "reset issued", False),
+        ("bt-agent -c NoInputNoOutput &", "bt-agent started", True),
+        ("/usr/bin/bluealsa -p a2dp-source", "bluealsa started", True),
+        ("sdptool add HIBYLINK_SP", "sdptool done", True),
+        ("echo   > /tmp/bt_init_ok", "done", False),
+    )
+    n = 0
+    for anchor, label, after in marks:
+        if t.count(anchor) != 1:
+            continue
+        stamp = 'bt_t "%s"\n' % label
+        t = t.replace(anchor, (anchor + "\n" + stamp) if after else (stamp + anchor), 1)
+        n += 1
+    # helper goes right after the shebang
+    t = t.replace("#!/bin/sh\n", "#!/bin/sh\n" + BT_TRACE_HELPER, 1)
+    with open(path, "w") as fh:
+        fh.write(t)
+    return n
+
+
+
+def bt_mac_before_rfkill_wait(root):
+    """Do the MAC lookup while bt_init is waiting for rfkill0, not after it.
+
+    Boot trace (LEAN_4trace, /usr/data/btboot.log) against dmesg:
+
+        1.04  script start
+        1.67  rfkill0 appears (dhd_module_init)      0.63s of idle waiting
+        2.50  mac resolved                           0.83s to read one file
+        2.54  firmware chosen                        (+0.04s)
+        6.90  hci0                                   4.36s of patchram
+
+    That 0.83s is a $(cat) on a 17-byte file plus a couple of tests, and it
+    is slow only because the module script is saturating the single core at
+    that moment -- SDIO enumerates at 2.08s, right in the middle of it. The
+    work has no dependency on rfkill0, so it can happen during the 0.63s the
+    script is already blocked, instead of after.
+
+    The firmware selection deliberately stays where it is: it reads
+    chipvendor from an SDIO sysfs path that does not exist until the card
+    enumerates, and its else-branch picks the aw-nb372sm blob rather than
+    this board's AP6212 one -- so running it early would silently load the
+    wrong firmware.
+    """
+    path = os.path.join(root, BT_INIT)
+    if not os.path.exists(path):
+        return False
+    with open(path) as fh:
+        t = fh.read()
+    # Anchor on text present both before and after patch_bt_init_timing(),
+    # since this runs earlier in the pass than that does.
+    marker = "# bluetooth power on\n"
+    if marker not in t:
+        return False
+    m = re.search(r"# Delete the previous Bluetooth address storage file\.\n"
+                  r".*?echo \"BT_MACADDR \$bt_addr\"\n", t, re.S)
+    if not m:
+        return False
+    block = m.group(0)
+    if t.index(block) < t.index(marker):
+        return False                     # already ahead of the radio bring-up
+    t = t.replace(block, "", 1)
+    t = t.replace(marker,
+                  "# MAC first: it needs nothing from the radio, and doing it here\n"
+                  "# overlaps it with the rfkill0 wait instead of paying for it after.\n"
+                  + block + "\n" + marker, 1)
+    with open(path, "w") as fh:
+        fh.write(t)
+    return True
+
+
 def hasten_bt_init(root):
     """Move bt_init from S80 to S22, so its fixed cost overlaps the rest of boot.
 
@@ -1644,6 +1813,20 @@ def main():
             else:
                 print(f"note: {ADB_INIT_SCRIPT} not patched — already fixed, "
                       f"missing, or the anchors have moved")
+
+            if bt_mac_before_rfkill_wait(root):
+                print(f"patched {BT_INIT} (MAC lookup moved ahead of the "
+                      f"rfkill0 wait: ~0.8s)")
+
+            nt = trace_bt_init(root)
+            if nt:
+                print(f"instrumented {BT_INIT} with {nt} boot-time stamps "
+                      f"-> /usr/data/btboot.log")
+
+            early = start_patchram_earlier(root)
+            if early:
+                print("reordered init so patchram starts before the module "
+                      "script: " + "; ".join(early))
 
             hb = hasten_bt_init(root)
             if hb:
