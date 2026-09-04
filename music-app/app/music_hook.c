@@ -1561,12 +1561,35 @@ static int eq_row_bands_y(void)   { return eq_curve_y() + 66; }
 static int mseb_row_enabled_y(void) { return CONTENT_Y; }
 static int mseb_band_row_y(int i) { return mseb_row_enabled_y() + ROW_H + i * MSEB_ROW_H; }
 
-/* Left edge of "BACK" itself -- shared by both header actions below so their
- * tap zones can run right up to where BACK's own zone actually starts,
- * rather than guessing at a fixed offset that drifts out of sync with the
- * text the moment either label changes. */
+/* R72: kept as the reserved right-margin boundary mseb_reset_x()/pod_sync_x()/
+ * queue_clear_x() below still measure themselves against, even though "BACK"
+ * itself moved to a leading arrow next to the title and nothing is actually
+ * drawn at this position any more -- repositioning those three as well was
+ * not asked for, so they keep the exact layout they already had. */
 static int header_back_x(void) {
     return FB_W - 24 - text_width("BACK", TEXT_PX_SMALL);
+}
+
+/* R72: back moved from top-right "BACK" text to a leading accent arrow next
+ * to the title -- the convention this app's transport screens already use
+ * for "this is a direction" (BG97's rotate-arrow skip icons), just a plain
+ * chevron rather than a rotate-and-seek glyph. g_header_show_back is set
+ * once per drawn frame, in draw_screen()'s own title/header block, and read
+ * from here by the tap handler -- same "compute once, every reader this
+ * frame sees exactly what's on screen" shape g_view_art_gone_frame already
+ * uses, rather than duplicating draw_screen()'s whole per-screen title/
+ * show_back if-chain a second time just to answer "is there a back arrow
+ * right now". */
+static int  g_header_show_back;
+#define BACK_ARROW_X  18
+#define BACK_ARROW_W  16
+#define BACK_ARROW_H  22
+#define BACK_ARROW_TAP_W 120   /* generous zone, not a tight box -- same
+                                 * reasoning the mini player's own zones use */
+
+static void draw_back_arrow(uint16_t *fb, int x, int cy, uint16_t c) {
+    fill_tri3(fb, x, cy, x + BACK_ARROW_W, cy - BACK_ARROW_H / 2,
+              x + BACK_ARROW_W, cy + BACK_ARROW_H / 2, c);
 }
 
 /* Left edge of the "Reset" header action, shared between the header's own
@@ -4361,42 +4384,47 @@ static void draw_screen(uint16_t *fb) {
      * did nothing but restart the app -- see g_is_standalone's own comment.
      * A button that either duplicates the swipe or does nothing isn't worth
      * the screen space in either build. */
-    const char *right = "";
-    if (screen == SC_ARTISTS) { title = cur_facet_label; right = "BACK"; }
+    /* R72: back moved from top-right "BACK" text to a leading accent arrow
+     * next to the title (see the draw site below) -- there is no longer a
+     * generic right-hand header label at all, only the three screen-
+     * specific extra actions (Reset/Sync/Clear) drawn further down, each
+     * already positioned by its own dedicated x-function. */
+    int show_back = 0;
+    if (screen == SC_ARTISTS) { title = cur_facet_label; show_back = 1; }
     else if (screen == SC_ALBUMS)  {
         title = recent_mode == RECENT_ADDED ? "Recently added"
               : recent_mode == RECENT_HEARD ? "Recently heard"
               : !cur_artist[0] ? "Albums"
               : cur_artist[0] == LIB_UNKNOWN_MARK[0] ? "Unknown" : cur_artist;
-        right = "BACK";
+        show_back = 1;
     }
-    else if (screen == SC_TRACKS)  { title = cur_album;  right = "BACK"; }
+    else if (screen == SC_TRACKS)  { title = cur_album;  show_back = 1; }
     /* The album being played is the queue, so "QUEUE" goes back to the track
      * list — the same list, with the playing row marked. */
 
-    else if (screen == SC_RADIO)   { title = "Radio"; right = "BACK"; }
-    else if (screen == SC_PLAYLISTS) { title = "Playlists"; right = "BACK"; }
-    else if (screen == SC_AUDIOBOOKS) { title = "Audiobooks"; right = "BACK"; }
-    else if (screen == SC_PODCASTS)   { title = "Podcasts"; right = "BACK"; }
-    else if (screen == SC_POD_SYNC)   { title = "Updating feeds"; right = "BACK"; }
-    else if (screen == SC_EQ)         { title = "Parametric EQ"; right = "BACK"; }
-    else if (screen == SC_EQ_BANDS)   { title = "Bands"; right = "BACK"; }
-    else if (screen == SC_MSEB)       { title = "MSEB"; right = "BACK"; }
+    else if (screen == SC_RADIO)   { title = "Radio"; show_back = 1; }
+    else if (screen == SC_PLAYLISTS) { title = "Playlists"; show_back = 1; }
+    else if (screen == SC_AUDIOBOOKS) { title = "Audiobooks"; show_back = 1; }
+    else if (screen == SC_PODCASTS)   { title = "Podcasts"; show_back = 1; }
+    else if (screen == SC_POD_SYNC)   { title = "Updating feeds"; show_back = 1; }
+    else if (screen == SC_EQ)         { title = "Parametric EQ"; show_back = 1; }
+    else if (screen == SC_EQ_BANDS)   { title = "Bands"; show_back = 1; }
+    else if (screen == SC_MSEB)       { title = "MSEB"; show_back = 1; }
     else if (screen == SC_EQ_BAND) {
         static char band_title[16];   /* draw_screen's own `buf` isn't declared this early */
         snprintf(band_title, sizeof(band_title), "Band %d", eq_editing_band + 1);
-        title = band_title; right = "BACK";
+        title = band_title; show_back = 1;
     }
-    else if (screen == SC_SETTINGS)       { title = "Settings"; right = "BACK"; }
-    else if (screen == SC_SETTINGS_THEME) { title = "Accent colour"; right = "BACK"; }
-    else if (screen == SC_SETTINGS_ABOUT) { title = "About"; right = "BACK"; }
-    else if (screen == SC_SETTINGS_TIMEZONE) { title = "Timezone"; right = "BACK"; }
-    else if (screen == SC_SETTINGS_THEMEMODE) { title = "Theme"; right = "BACK"; }
-    else if (screen == SC_SETTINGS_WIFI) { title = "Wi-Fi"; right = "BACK"; }
-    else if (screen == SC_SETTINGS_BT)   { title = "Bluetooth"; right = "BACK"; }
-    else if (screen == SC_SETTINGS_USB)  { title = "USB working mode"; right = "BACK"; }
-    else if (screen == SC_QUEUE) { title = "Queue"; right = "BACK"; }
-    else if (screen == SC_MUSIC_MENU)     { title = "Music"; right = "BACK"; }
+    else if (screen == SC_SETTINGS)       { title = "Settings"; show_back = 1; }
+    else if (screen == SC_SETTINGS_THEME) { title = "Accent colour"; show_back = 1; }
+    else if (screen == SC_SETTINGS_ABOUT) { title = "About"; show_back = 1; }
+    else if (screen == SC_SETTINGS_TIMEZONE) { title = "Timezone"; show_back = 1; }
+    else if (screen == SC_SETTINGS_THEMEMODE) { title = "Theme"; show_back = 1; }
+    else if (screen == SC_SETTINGS_WIFI) { title = "Wi-Fi"; show_back = 1; }
+    else if (screen == SC_SETTINGS_BT)   { title = "Bluetooth"; show_back = 1; }
+    else if (screen == SC_SETTINGS_USB)  { title = "USB working mode"; show_back = 1; }
+    else if (screen == SC_QUEUE) { title = "Queue"; show_back = 1; }
+    else if (screen == SC_MUSIC_MENU)     { title = "Music"; show_back = 1; }
 
     /* The player has no title bar. Drawn unconditionally, it sat behind the
      * artwork with the ends of "Music" and "EXIT" poking out either side of
@@ -4406,9 +4434,11 @@ static void draw_screen(uint16_t *fb) {
      * edge-to-edge from y=0, and there's no room left for either. Back is
      * the swipe gesture everywhere else already relies on. */
     if (screen != SC_PLAYING && screen != SC_ARTIST_PAGE && !(screen == SC_TRACKS && !ab_list && !pod_list)) {
-        int rw = text_width(right, TEXT_PX_SMALL);
-        draw_text(fb, 18, STATUS_H + 14, title, COL_TEXT, TEXT_PX_TITLE, FB_W - rw - 40);
-        draw_text(fb, FB_W - 24 - rw, STATUS_H + 20, right, COL_DIM, TEXT_PX_SMALL, FB_W);
+        g_header_show_back = show_back;
+        int title_x = show_back ? BACK_ARROW_X + BACK_ARROW_W + 14 : 18;
+        if (show_back)
+            draw_back_arrow(fb, BACK_ARROW_X, STATUS_H + 14 + TEXT_PX_TITLE / 2, COL_ACCENT);
+        draw_text(fb, title_x, STATUS_H + 14, title, COL_TEXT, TEXT_PX_TITLE, FB_W - 40 - (title_x - 18));
         /* MSEB's one extra header action: zero every band back to 0 dB.
          * Doesn't touch Enabled -- "reset" clears the tuning, not the
          * on/off state, which the user didn't ask to lose. */
@@ -8799,18 +8829,24 @@ int music_entry(void *a0, void *a1) {
             } else if (y < CONTENT_Y && screen != SC_KEYBOARD) {
                 /* BG108: SC_KEYBOARD draws its own header (Cancel top-left,
                  * Done top-right, both at y=20 -- see draw_keyboard()) rather
-                 * than the generic title+BACK bar every other screen has,
-                 * but nothing here excluded it from this generic zone, whose
-                 * own BACK check just below (`x > FB_W - 120`) fires on
-                 * every screen except SC_MENU. Done sits at that exact same
-                 * top-right position BACK always does, so tapping it landed
-                 * here first and called go_back() -- Cancel's behaviour, not
-                 * Done's -- before SC_KEYBOARD's own dedicated handler further
-                 * down ever got a turn. Reported live: "'done' is in the same
-                 * spot as 'back'... I definitely, 100% hit 'done'" -- true on
-                 * both counts, the input landed correctly, it just resolved
-                 * to the wrong action, not the "user error" it initially
-                 * looked like against BG107's own build (which fixed go_back()
+                 * than the generic title+back-arrow bar every other screen
+                 * has, but nothing here excluded it from this generic zone,
+                 * whose own back check just below fired on every screen
+                 * except SC_MENU. At the time this was fixed, back was still
+                 * a top-right "BACK" label (R72 later moved it to a leading
+                 * arrow next to the title) and Done sat at that exact same
+                 * spot, so tapping it landed here first and called go_back()
+                 * -- Cancel's behaviour, not Done's -- before SC_KEYBOARD's
+                 * own dedicated handler further down ever got a turn. This
+                 * exclusion stays correct after R72's move regardless: Cancel
+                 * is top-left, which is exactly where the arrow's own tap
+                 * zone lives now, so SC_KEYBOARD still needs to stay out of
+                 * this whole block or Cancel would collide with *that*
+                 * instead. Reported live: "'done' is in the same spot as
+                 * 'back'... I definitely, 100% hit 'done'" -- true on both
+                 * counts, the input landed correctly, it just resolved to
+                 * the wrong action, not the "user error" it initially looked
+                 * like against BG107's own build (which fixed go_back()
                  * itself to no longer make this specific case dump to Albums,
                  * but didn't stop go_back() from being reached at all here).
                  * mseb_reset_x()/pod_sync_x()'s own on-screen position sits
@@ -8850,7 +8886,7 @@ int music_entry(void *a0, void *a1) {
                         if (!q_is_playlist) queue_mixed = 1;
                         queue_follower();
                     }
-                } else if (screen != SC_MENU && x > FB_W - 120) go_back();
+                } else if (g_header_show_back && x < BACK_ARROW_TAP_W) go_back();
             } else if (index_visible() && x >= FB_W - INDEX_TOUCH_W && y >= CONTENT_Y &&
                        y < index_bottom()) {
                 index_jump(y);
