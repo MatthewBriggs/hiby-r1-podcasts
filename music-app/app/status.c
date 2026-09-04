@@ -69,6 +69,27 @@ static void run_cmd(const char *cmd, char *out, unsigned n) {
     pclose(p);
 }
 
+/* R-scanwifi: wpa_cli escapes any non-printable/non-ASCII byte in an SSID
+ * as \xNN (confirmed live via st_wifi_ssid()'s own history) -- shared here
+ * since scan results carry the same escaping in the same shape. `in` need
+ * not be NUL-terminated at exactly `inlen`; the caller passes the field's
+ * own length from a larger tab/newline-delimited line. */
+static void wpa_unescape(const char *in, size_t inlen, char *out, size_t outsz) {
+    unsigned o = 0;
+    for (size_t i = 0; i < inlen && o + 1 < outsz; ) {
+        if (in[i] == '\\' && i + 3 < inlen && in[i + 1] == 'x') {
+            int hi = in[i + 2], lo = in[i + 3];
+            hi = (hi >= 'a') ? hi - 'a' + 10 : (hi >= 'A') ? hi - 'A' + 10 : hi - '0';
+            lo = (lo >= 'a') ? lo - 'a' + 10 : (lo >= 'A') ? lo - 'A' + 10 : lo - '0';
+            out[o++] = (char)((hi << 4) | lo);
+            i += 4;
+        } else {
+            out[o++] = in[i++];
+        }
+    }
+    out[o] = '\0';
+}
+
 /* The first BlueALSA sink path, which both queries need. */
 static int bt_pcm_path(char *out, unsigned n) {
     char buf[1024];
@@ -177,19 +198,7 @@ void st_wifi_ssid(char *out, unsigned n) {
         q += 6;
         char *e = strchr(q, '\n');
         size_t len = e ? (size_t)(e - q) : strlen(q);
-        unsigned o = 0;
-        for (size_t i = 0; i < len && o + 1 < sizeof(cached); ) {
-            if (q[i] == '\\' && i + 3 < len && q[i + 1] == 'x') {
-                int hi = q[i + 2], lo = q[i + 3];
-                hi = (hi >= 'a') ? hi - 'a' + 10 : (hi >= 'A') ? hi - 'A' + 10 : hi - '0';
-                lo = (lo >= 'a') ? lo - 'a' + 10 : (lo >= 'A') ? lo - 'A' + 10 : lo - '0';
-                cached[o++] = (char)((hi << 4) | lo);
-                i += 4;
-            } else {
-                cached[o++] = q[i++];
-            }
-        }
-        cached[o] = '\0';
+        wpa_unescape(q, len, cached, sizeof(cached));
     }
     snprintf(out, n, "%s", cached);
 }
@@ -314,6 +323,87 @@ void bt_pair(const char *mac) {
         "bluetoothctl >/dev/null 2>&1 &",
         mac, mac, mac);
     if (system(cmd) == -1) return;
+}
+
+/* ---- Wi-Fi scanning -------------------------------------------------------
+ * RP2 remaining scope: SC_SETTINGS_WIFI could join a network typed in by
+ * hand but not list nearby ones and tap to join, the one thing Bluetooth's
+ * own settings screen already did. Same wpa_cli this file's other Wi-Fi
+ * functions already rely on (st_wifi_ssid(), music_hook.c's wifi_connect()),
+ * not a new tool. */
+
+/* `wpa_cli scan` triggers an async scan and returns immediately ("OK") --
+ * unlike bt_scan_start(), nothing here needs backgrounding or a sleep to
+ * hold a session open, since the scan itself runs inside wpa_supplicant,
+ * not inside this command. Results trickle in over the next couple of
+ * seconds; the caller polls wifi_scan_results() same as the Bluetooth
+ * screen already polls bt_scan_devices(). */
+void wifi_scan_start(void) {
+    if (system("wpa_cli -i wlan0 scan >/dev/null 2>&1") == -1) return;
+}
+
+/* One row per SSID, strongest signal first -- `wpa_cli scan_results` lists
+ * one row per BSSID, so the same network reachable from two access points
+ * (or just re-broadcasting on overlapping channels) would otherwise show
+ * as duplicate rows for the same name. A blank SSID (a hidden network,
+ * broadcasting no name) is dropped -- nothing to tap it with; hidden
+ * networks still go through "Add network manually", same as before this
+ * existed. `open` is set when neither WPA1/2/3 marker is present in the
+ * flags field -- close enough for whether to skip straight to connecting
+ * or ask for a password first; WEP is treated as needing a password too
+ * (wpa_cli's own psk-only wifi_connect() can't join a WEP network anyway,
+ * so this at least won't silently mis-offer a one-tap connect that would
+ * fail). */
+int wifi_scan_results(wifi_found_net_t *out, int max) {
+    char buf[4096];
+    run_cmd("wpa_cli -i wlan0 scan_results 2>/dev/null", buf, sizeof(buf));
+    int n = 0;
+    char *line = strchr(buf, '\n');   /* skip the "bssid / frequency / ..." header */
+    line = line ? line + 1 : NULL;
+    while (line && *line && n < max) {
+        char *nl = strchr(line, '\n');
+        size_t linelen = nl ? (size_t)(nl - line) : strlen(line);
+        char *f1 = memchr(line, '\t', linelen);
+        char *f2 = f1 ? memchr(f1 + 1, '\t', linelen - (size_t)(f1 + 1 - line)) : NULL;
+        char *f3 = f2 ? memchr(f2 + 1, '\t', linelen - (size_t)(f2 + 1 - line)) : NULL;
+        char *f4 = f3 ? memchr(f3 + 1, '\t', linelen - (size_t)(f3 + 1 - line)) : NULL;
+        if (f1 && f2 && f3 && f4) {
+            int signal = atoi(f2 + 1);
+            size_t flags_len = (size_t)(f4 - (f3 + 1));
+            char flags[160];
+            if (flags_len >= sizeof(flags)) flags_len = sizeof(flags) - 1;
+            memcpy(flags, f3 + 1, flags_len);
+            flags[flags_len] = '\0';
+            const char *ssid_raw = f4 + 1;
+            size_t ssid_len = (size_t)((line + linelen) - ssid_raw);
+            char ssid[64];
+            wpa_unescape(ssid_raw, ssid_len, ssid, sizeof(ssid));
+            if (ssid[0]) {
+                int dup = -1;
+                for (int i = 0; i < n; i++)
+                    if (!strcmp(out[i].ssid, ssid)) { dup = i; break; }
+                int open = !strstr(flags, "WPA") && !strstr(flags, "WEP");
+                if (dup >= 0) {
+                    if (signal > out[dup].signal) { out[dup].signal = signal; out[dup].open = open; }
+                } else {
+                    snprintf(out[n].ssid, sizeof(out[n].ssid), "%s", ssid);
+                    out[n].signal = signal;
+                    out[n].open = open;
+                    n++;
+                }
+            }
+        }
+        line = nl ? nl + 1 : NULL;
+    }
+    /* Selection sort by signal, strongest first -- n is small (one screen's
+     * worth of nearby networks), same cost tradeoff prune_cache() already
+     * accepts elsewhere in this codebase for a short, infrequent list. */
+    for (int i = 0; i < n - 1; i++) {
+        int best = i;
+        for (int j = i + 1; j < n; j++) if (out[j].signal > out[best].signal) best = j;
+        if (best != i) { wifi_found_net_t t = out[i]; out[i] = out[best]; out[best] = t; }
+    }
+    return n;
 }
 
 /* ---- quick settings ------------------------------------------------------ */

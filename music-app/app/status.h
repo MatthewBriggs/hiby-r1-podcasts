@@ -22,6 +22,13 @@ void bt_scan_start(void);
 int  bt_scan_devices(bt_found_dev_t *out, int max);   /* returns count found, <= max */
 void bt_pair(const char *mac);
 
+/* RP2: Wi-Fi scan-and-select, the same shape as Bluetooth's just above.
+ * `open` is 1 for a network with no WPA/WEP marker in its flags -- the
+ * caller can connect straight away rather than asking for a password. */
+typedef struct { char ssid[64]; int signal; int open; } wifi_found_net_t;
+void wifi_scan_start(void);
+int  wifi_scan_results(wifi_found_net_t *out, int max);   /* returns count found, <= max, strongest first */
+
 /* Quick settings. The radios are driven through the firmware's own scripts
  * rather than by poking interfaces directly — wifi_on.sh restores the saved
  * network, which hand-rolled ifconfig would not. */

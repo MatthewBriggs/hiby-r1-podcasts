@@ -2712,6 +2712,17 @@ static int bt_scan_max_visible(void) {
     return avail > 0 ? avail / ROW_H : 0;
 }
 
+/* RP2: same "one boundary, not two copies" reasoning as bt_scan_max_visible()
+ * just above, for the Wi-Fi screen's own scan list. One row further down
+ * than Bluetooth's: toggle, status, "Scan for networks", "Add network
+ * manually", *then* the scanned list starts. */
+static int wifi_scan_max_visible(void) {
+    int bottom = mini_visible() ? FB_H - MINI_H : FB_H;
+    int list_top = CONTENT_Y + 4 * ROW_H;
+    int avail = bottom - list_top;
+    return avail > 0 ? avail / ROW_H : 0;
+}
+
 /* Only the two lists long enough to need it -- and not Recent, capped at
  * PAGE_MAX items and sorted by recency rather than alphabetically, where a
  * letter strip would have nothing meaningful to jump to. */
@@ -5825,16 +5836,42 @@ static void draw_screen(uint16_t *fb) {
         ry += ROW_H;
         fill_rect(fb, 0, ry - 1, FB_W, 1, COL_LINE);
 
-        /* R58-style scoping decision: scan-and-select (the normal path for
-         * a network in range) is the rest of this ticket's own remaining
-         * work. Manual entry is the one path that has to exist regardless
-         * -- a hidden network never shows up in a scan at all -- so it's
-         * what's wired all the way through this pass, exercising the full
-         * keyboard -> wpa_cli -> settings.txt pipeline end to end. */
-        draw_text(fb, 24, ry + 20, "Add network manually", COL_TEXT, TEXT_PX_BODY, FB_W - 48);
-        draw_text(fb, 24, ry + 46, "Network scanning coming soon", COL_DIM, TEXT_PX_SMALL, FB_W - 48);
+        /* RP2: scan-and-select, the same shape Bluetooth's own settings
+         * screen already has. Manual entry stays alongside it, not
+         * replaced -- a hidden network never shows up in any scan, so it
+         * remains the only way to join one. */
+        draw_text(fb, 24, ry + 20, "Scan for networks", COL_ACCENT, TEXT_PX_BODY, FB_W - 48);
         ry += ROW_H;
         fill_rect(fb, 0, ry - 1, FB_W, 1, COL_LINE);
+
+        draw_text(fb, 24, ry + 20, "Add network manually", COL_ACCENT, TEXT_PX_BODY, FB_W - 48);
+        ry += ROW_H;
+        fill_rect(fb, 0, ry - 1, FB_W, 1, COL_LINE);
+
+        /* Same 2s refresh cadence as SC_SETTINGS_BT's own scan list, and
+         * the same reasoning: this screen rides the once-a-second clock-tick
+         * redraw, and a wpa_cli round trip on every one of those would be
+         * wasted work for a list a scan-in-progress is still trying to grow. */
+        static wifi_found_net_t nets[10];
+        static int net_n;
+        static time_t last_refresh;
+        time_t now = time(NULL);
+        if (now - last_refresh >= 2) {
+            net_n = wifi_scan_results(nets, 10);
+            last_refresh = now;
+        }
+        if (net_n == 0) {
+            draw_text(fb, 24, ry + 20, "No networks found yet", COL_DIM, TEXT_PX_SMALL, FB_W - 48);
+        } else {
+            int wifi_max_visible = wifi_scan_max_visible();
+            for (int i = 0; i < net_n && i < wifi_max_visible; i++) {
+                draw_text_clip(fb, 24, ry + 20, nets[i].ssid,
+                              COL_TEXT, TEXT_PX_BODY, FB_W - 90, CONTENT_Y, FB_H);
+                draw_right_clip(fb, ry + 20, nets[i].open ? "open" : "secured", CONTENT_Y, FB_H);
+                ry += ROW_H;
+                fill_rect(fb, 0, ry - 1, FB_W, 1, COL_LINE);
+            }
+        }
         return;
     }
 
@@ -8929,7 +8966,25 @@ int music_entry(void *a0, void *a1) {
                     wifi_pref = on;
                     save_conf();          /* R64 */
                 } else if (row == 2) {
+                    wifi_scan_start();
+                } else if (row == 3) {
                     kb_open("Network name (SSID)", KB_PURPOSE_WIFI_SSID_MANUAL, "");
+                } else if (row >= 4) {
+                    /* Re-queried fresh, same reasoning bt_pair()'s own tap
+                     * handler gives for doing the same -- a tap is rare and
+                     * deliberate, not a redraw-rate concern. */
+                    wifi_found_net_t nets[10];
+                    int n = wifi_scan_results(nets, 10);
+                    int idx = row - 4;
+                    if (idx >= 0 && idx < n && idx < wifi_scan_max_visible()) {
+                        if (nets[idx].open) {
+                            wifi_connect(nets[idx].ssid, "");
+                        } else {
+                            snprintf(kb_wifi_target_ssid, sizeof(kb_wifi_target_ssid),
+                                    "%s", nets[idx].ssid);
+                            kb_open("Password for this network", KB_PURPOSE_WIFI_PASSWORD, "");
+                        }
+                    }
                 }
             } else if (screen == SC_SETTINGS_BT) {
                 int row = (y - CONTENT_Y) / ROW_H;
