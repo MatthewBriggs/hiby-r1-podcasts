@@ -5552,10 +5552,17 @@ static void draw_screen(uint16_t *fb) {
             if (pod_list && !pod_eps[idx].downloaded) {
                 if (pod_download_active() && pod_download_slot() == idx) {
                     long tot = pod_download_total();
-                    if (tot > 0)
-                        snprintf(buf, sizeof(buf), "%ld%%", pod_download_bytes() * 100 / tot);
+                    long got = pod_download_bytes();
+                    /* BG110: belt-and-suspenders alongside podcast.c's own
+                     * fix -- bytes should never exceed a correctly-parsed
+                     * total, but showing KB instead of a nonsense/overflowed
+                     * percent if it ever does (a still-wrong header, a
+                     * chunked response with no Content-Length at all) beats
+                     * a six-digit or negative number on screen either way. */
+                    if (tot > 0 && got >= 0 && got <= tot)
+                        snprintf(buf, sizeof(buf), "%ld%%", got * 100 / tot);
                     else
-                        snprintf(buf, sizeof(buf), "%ld KB", pod_download_bytes() / 1024);
+                        snprintf(buf, sizeof(buf), "%ld KB", got / 1024);
                 } else {
                     snprintf(buf, sizeof(buf), "Download");
                 }

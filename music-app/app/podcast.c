@@ -420,18 +420,35 @@ long pod_download_total(void) { return dl_total; }
 int pod_download_poll(void) {
     if (dl_pid <= 0) return -1;
 
-    if (dl_total <= 0) {
+    /* BG110: curl's -D dump-header file gets one header block per hop when
+     * a URL redirects (common for podcast enclosures, which are routinely
+     * fronted by a tracking-redirect host) -- all appended to the same
+     * file, in order. Grabbing the first "Content-Length" seen, as this
+     * used to, latches onto an early hop's own (often tiny, unrelated)
+     * length rather than the final audio file's, and -- gated on
+     * `dl_total <= 0` -- stayed wrong for the rest of the download once
+     * caught. Reported live as the on-screen percent climbing into six
+     * digits then going negative: the real byte count kept growing against
+     * that wrong small denominator, and `dl_bytes * 100` eventually
+     * overflowed this build's 32-bit `long`. Re-parsed every poll instead
+     * of once, resetting on each "HTTP/" status line so only the *last*
+     * block's Content-Length -- the actual response being downloaded --
+     * is kept; cheap (a small local file, a handful of redirects at most)
+     * and self-correcting as curl appends more of the chain. */
+    {
         FILE *hf = fopen(DL_HDR_PATH, "r");
         if (hf) {
             char line[256];
+            long v, cur = -1;
             while (fgets(line, sizeof(line), hf)) {
-                long v;
-                if (sscanf(line, "Content-Length: %ld", &v) == 1 ||
-                    sscanf(line, "content-length: %ld", &v) == 1) {
-                    dl_total = v;
-                    break;
+                if (!strncmp(line, "HTTP/", 5)) {
+                    cur = -1;
+                } else if (sscanf(line, "Content-Length: %ld", &v) == 1 ||
+                           sscanf(line, "content-length: %ld", &v) == 1) {
+                    cur = v;
                 }
             }
+            if (cur > 0) dl_total = cur;
             fclose(hf);
         }
     }
