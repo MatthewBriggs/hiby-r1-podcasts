@@ -1730,16 +1730,11 @@ static int set_row_usb_y(void)  { return set_row_bt_y() + ROW_H; }
  * see its own comment in scanner.c) but a user tapping "check for new
  * music" has one question, not two, and only ever needs the one number. */
 static int set_row_scan_y(void) { return set_row_usb_y() + ROW_H; }
-/* R66 follow-up: a user-triggered equivalent of what auto-shutdown already
- * does, minus the resume save -- for whenever a genuinely cold next boot is
- * wanted (about to put the device away, or just wanting a clean start)
- * rather than picking back up where this session left off. */
-static int set_row_shutdown_y(void) { return set_row_scan_y() + ROW_H; }
 /* R44: total content height, for the Settings screen's own scroll clamp --
  * ceil() so a last row that doesn't fill a whole ROW_H still gets fully
  * scrollable rather than clipped short. */
 static int settings_content_rows(void) {
-    int content_px = set_row_shutdown_y() + ROW_H - CONTENT_Y;
+    int content_px = set_row_scan_y() + ROW_H - CONTENT_Y;
     return (content_px + ROW_H - 1) / ROW_H;
 }
 
@@ -5964,11 +5959,6 @@ static void draw_screen(uint16_t *fb) {
         }
         fill_rect_clip(fb, 0, ry + ROW_H - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
 
-        ry = set_row_shutdown_y() - off;
-        draw_text_clip(fb, 24, ry + 20, "Full shutdown", COL_TEXT, TEXT_PX_BODY, FB_W - 48, CONTENT_Y, clip_bot);
-        draw_text_clip(fb, 24, ry + 46, "with no saved state", COL_DIM, TEXT_PX_SMALL, FB_W - 48, CONTENT_Y, clip_bot);
-        fill_rect_clip(fb, 0, ry + ROW_H - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
-
         if (mini_visible()) draw_mini(fb);
         return;
     }
@@ -9409,7 +9399,6 @@ int music_entry(void *a0, void *a1) {
                 int ry_wifi = set_row_wifi_y() - off, ry_bt = set_row_bt_y() - off;
                 int ry_usb = set_row_usb_y() - off;
                 int ry_scan = set_row_scan_y() - off;
-                int ry_shutdown = set_row_shutdown_y() - off;
                 /* RBR: these first three rows are taller than ROW_H -- each
                  * carries a two-line description underneath the label (see
                  * the draw side's own lock_h/usbbypass_h/autooff_h), and
@@ -9452,17 +9441,6 @@ int music_entry(void *a0, void *a1) {
                 } else if (y >= ry_scan && y < ry_scan + ROW_H) {
                     scanner_rescan_now();
                     dirty = 1;
-                } else if (y >= ry_shutdown && y < ry_shutdown + ROW_H) {
-                    /* R66 follow-up: same position-save auto-shutdown always
-                     * did (a book/episode's own progress is never "state" in
-                     * R66's sense, just its ordinary resume file, and losing
-                     * that on a deliberate shutdown would be a regression
-                     * users would notice immediately) but deliberately no
-                     * resume_save() call -- that's the entire difference
-                     * from auto-shutdown, and the one this row exists for. */
-                    ab_save_current_pos();
-                    pod_save_current_pos();
-                    if (system("/sbin/poweroff") == -1) { }
                 }
             } else if (screen == SC_SETTINGS_WIFI) {
                 /* R75: scroll-aware row math, same off/content_y shape
