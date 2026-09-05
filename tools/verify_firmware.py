@@ -423,10 +423,20 @@ def main():
                 expected_added = {"etc/init.d/S90adb", "usr/resource/kernel_build_id",
                                   "etc/init.d/S22_bt_init", EMBED_BINARY}
                 expected_added |= set(BRCMFMAC_FILES)
+                # start_patchram_earlier() runs before hasten_bt_init() and
+                # renames whichever of S80_bt_init/S22_bt_init it finds
+                # straight to S11b_bt_init (plus S21mount_ubifs ->
+                # S11amount_ubifs, unconditionally) -- so on a vanilla base
+                # S22_bt_init never actually survives to the final tree,
+                # despite still being listed above for whichever build
+                # order or code path leaves it as the last rename applied.
+                expected_added |= {"etc/init.d/S11amount_ubifs", "etc/init.d/S11b_bt_init"}
                 # hasten_bt_init() renames S80_bt_init -> S22_bt_init (the
                 # first slot after /usr/data is mounted) rather than editing
-                # it in place, so the old name legitimately disappears.
-                expected_removed = {"etc/init.d/S80_bt_init"}
+                # it in place, so the old name legitimately disappears --
+                # and start_patchram_earlier() above does the same to
+                # S21mount_ubifs on its way to S11amount_ubifs.
+                expected_removed = {"etc/init.d/S80_bt_init", "etc/init.d/S21mount_ubifs"}
                 if (set(changed) <= expected and set(added) <= expected_added
                         and set(removed) <= expected_removed):
                     print(f"    only expected files changed ({len(changed)}), "
