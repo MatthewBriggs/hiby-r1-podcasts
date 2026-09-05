@@ -7203,6 +7203,105 @@ static uint64_t us_now(void) {
 
 uint64_t g_prof_clear_us;       /* added to by fill_rect's full-screen path */
 
+/* R77: hold-to-power-off. Below POWER_HOLD_UI_MS a press is an ordinary tap
+ * (wake/lock, or the double-press button-lock toggle -- both entirely
+ * unchanged). At/after it, this reads as a deliberate hold: the countdown
+ * overlay appears, and the single-press wake/lock action that would
+ * otherwise have already fired is either done (if it was a wake -- see
+ * power_key_pending_lock's own comment) or cancelled (if it was a lock,
+ * which would have blanked the very screen this overlay needs to draw on).
+ *
+ * Release timing then decides the outcome: released before
+ * POWER_HOLD_SAFE_MS cancels outright (just a hold that didn't go anywhere);
+ * released between the two thresholds shuts down gracefully, saving
+ * everything a normal shutdown does; still held at POWER_HOLD_FORCE_MS
+ * fires on its own, with nothing saved -- an escape hatch for a shutdown
+ * that seems stuck, not something a release timing choice can reach.
+ *
+ * Timed with us_now() (CLOCK_MONOTONIC), not the input event's own kernel
+ * timestamp the way DOUBLE_PRESS_MS is (see have_last_power_press's own
+ * comment on why that one has to be) -- a few tens of ms of poll latency is
+ * real risk against a 400ms double-press window, but negligible against
+ * thresholds in the seconds. */
+#define POWER_HOLD_UI_MS     350
+#define POWER_HOLD_SAFE_MS  3000
+#define POWER_HOLD_FORCE_MS 5000
+static int      power_key_down;
+static uint64_t power_key_down_us;
+static int      power_key_pending_lock;   /* screen was lit at press time; lock deferred */
+static int      power_hold_ui_shown;
+static int      power_hard_fired;
+/* 0 = nothing pending, 1 = graceful shutdown to run once `base` (the real
+ * framebuffer, only in scope in the main loop) is reachable, set from
+ * handle_keys() on a qualifying release; read and cleared there. The force
+ * path needs no such handoff -- it never touches resume_save()/base at all. */
+static int      power_release_outcome;
+/* Set once either shutdown path actually calls poweroff, so the overlay
+ * keeps showing a final message instead of popping back to the ordinary
+ * screen while poweroff's own shutdown sequence (not instant) runs its
+ * course underneath it. */
+static int      power_shutdown_kind;   /* 0 = none, 1 = graceful, 2 = forced */
+
+/* Same visual language as draw_sheet()'s own modal: dim everything behind,
+ * a solid panel in front -- centered here rather than bottom-anchored,
+ * since this is a single status, not a list to pick from. No arc/ring
+ * primitive exists anywhere in this file (checked -- fill_circle only ever
+ * draws whole circles), so progress reads as a growing horizontal bar
+ * instead, the same shape draw_volume()'s own bar already uses. */
+static void draw_power_hold(uint16_t *fb) {
+    for (int yy = 0; yy < FB_H; yy++)
+        for (int xx = 0; xx < FB_W; xx++) {
+            uint16_t *px = fb + (size_t)yy * FB_W + xx;
+            *px = mix565(*px, COL_BG, 170);
+        }
+
+    int pw = FB_W - 96, ph = 220;
+    int px0 = (FB_W - pw) / 2, py0 = (FB_H - ph) / 2;
+    fill_rect(fb, px0, py0, pw, ph, COL_HEADER);
+    fill_rect(fb, px0, py0, pw, 1, COL_LINE);
+    fill_rect(fb, px0, py0 + ph - 1, pw, 1, COL_LINE);
+
+    long elapsed_ms = power_shutdown_kind ? 0
+                    : (long)((us_now() - power_key_down_us) / 1000);
+    int past_safe = power_shutdown_kind == 1 || elapsed_ms >= POWER_HOLD_SAFE_MS;
+
+    const char *title = power_shutdown_kind == 1 ? "Shutting down"
+                       : power_shutdown_kind == 2 ? "Forcing shutdown"
+                       : past_safe ? "Release to shut down"
+                       : "Hold to power off";
+    int tw = text_width(title, TEXT_PX_BODY);
+    draw_text(fb, px0 + (pw - tw) / 2, py0 + 36, title, COL_TEXT, TEXT_PX_BODY, pw - 40);
+
+    /* One bar spanning the full 0..POWER_HOLD_FORCE_MS hold, with a notch
+     * marking POWER_HOLD_SAFE_MS -- the point past which releasing is the
+     * good outcome, not the danger one, so the notch reads as "you're
+     * clear" rather than a threat. */
+    int bx = px0 + 40, bw = pw - 80, by = py0 + 100, bh = 14;
+    fill_rect(fb, bx, by, bw, bh, COL_LINE);
+    long clamped = power_shutdown_kind == 2 ? POWER_HOLD_FORCE_MS
+                 : power_shutdown_kind == 1 ? POWER_HOLD_SAFE_MS
+                 : elapsed_ms;
+    if (clamped > POWER_HOLD_FORCE_MS) clamped = POWER_HOLD_FORCE_MS;
+    int filled = (int)(bw * clamped / POWER_HOLD_FORCE_MS);
+    fill_rect(fb, bx, by, filled, bh, COL_ACCENT);
+    int notch = bx + (int)((long)bw * POWER_HOLD_SAFE_MS / POWER_HOLD_FORCE_MS);
+    fill_rect(fb, notch, by - 4, 2, bh + 8, COL_HEADER);
+
+    char sub[48];
+    if (power_shutdown_kind) {
+        sub[0] = '\0';
+    } else if (!past_safe) {
+        snprintf(sub, sizeof(sub), "%.1fs", (POWER_HOLD_SAFE_MS - elapsed_ms) / 1000.0);
+    } else {
+        snprintf(sub, sizeof(sub), "Forcing in %.1fs",
+                 (POWER_HOLD_FORCE_MS - elapsed_ms) / 1000.0);
+    }
+    if (sub[0]) {
+        int sw = text_width(sub, TEXT_PX_SMALL);
+        draw_text(fb, px0 + (pw - sw) / 2, by + 34, sub, COL_DIM, TEXT_PX_SMALL, pw - 40);
+    }
+}
+
 static void draw_ui(uint16_t *fb) {
     uint64_t t0 = us_now();
     uint64_t clear0 = g_prof_clear_us, text0 = g_prof_text_us;
@@ -7218,6 +7317,7 @@ static void draw_ui(uint16_t *fb) {
     else if (vol_ticks > 0) draw_volume(fb);
     else if (screen == SC_PLAYING && seek_toast_ticks > 0) draw_seek_toast(fb);
     if (edge_active) draw_back_hint(fb);
+    if (power_hold_ui_shown) draw_power_hold(fb);   /* R77: on top of everything else */
 
     uint64_t dt = us_now() - t0;
     prof_ui_us    += dt;
@@ -8111,7 +8211,40 @@ static int handle_keys(int fd, key_src_t src) {
     int acted = 0;
     ssize_t r;
     while (fd >= 0 && (r = read(fd, &ev, sizeof(ev))) == (ssize_t)sizeof(ev)) {
-        if (ev.type != EV_KEY || ev.value == 0) continue;   /* presses only */
+        if (ev.type != EV_KEY) continue;
+        /* R77: the one key this function needs a release event for at all --
+         * every other key here only ever means anything on the way down.
+         * Handled ahead of the generic "presses only" filter below, which
+         * still applies to everything else including this key's own press. */
+        if (ev.code == KEY_POWER_ && ev.value == 0) {
+            if (power_key_down) {
+                long elapsed_ms = (long)((us_now() - power_key_down_us) / 1000);
+                power_key_down = 0;
+                int graceful = 0;
+                if (!power_hard_fired) {
+                    if (elapsed_ms < POWER_HOLD_UI_MS) {
+                        if (power_key_pending_lock) set_locked(1);   /* the ordinary tap, just deferred */
+                    } else if (elapsed_ms >= POWER_HOLD_SAFE_MS && elapsed_ms < POWER_HOLD_FORCE_MS) {
+                        power_release_outcome = 1;   /* graceful: main loop has `base` for resume_save() */
+                        graceful = 1;
+                    }
+                    /* Between POWER_HOLD_UI_MS and POWER_HOLD_SAFE_MS: a hold
+                     * that didn't go anywhere -- cancel outright, no action. */
+                }
+                /* Left showing when the outcome is graceful -- the main loop
+                 * flips it to the "Shutting down" message once it processes
+                 * power_release_outcome, and poweroff itself is not instant
+                 * (see its own call site's comment); popping the overlay now
+                 * would leave a bare instant of the ordinary screen showing
+                 * again in between. */
+                if (!graceful && !power_hard_fired) power_hold_ui_shown = 0;
+                power_key_pending_lock = 0;
+                mlog("[music] power released after %ldms\n", elapsed_ms);
+                acted = 1;
+            }
+            continue;
+        }
+        if (ev.value == 0) continue;   /* presses only, for everything else */
         mlog("[music] key %d\n", ev.code);
         /* Power is the lock key, and the only one that wakes the screen. A
          * double press (within DOUBLE_PRESS_MS) toggles the stronger
@@ -8156,7 +8289,20 @@ static int handle_keys(int fd, key_src_t src) {
                 mlog("[music] button lock %s\n", button_locked ? "on" : "off");
                 acted = 1; continue;
             }
-            if (button_locked) { acted = 1; continue; }   /* single press: swallowed */
+            /* R77: hold-tracking starts on every qualifying press (i.e. one
+             * that wasn't just consumed as the second half of a double
+             * press above), button_locked included -- a hold-to-shutdown
+             * has to work as a safety action regardless of the UI lock, even
+             * though the ordinary tap action beneath it stays swallowed
+             * exactly as before while locked. */
+            power_key_down = 1;
+            power_key_down_us = us_now();
+            power_hard_fired = 0;
+
+            if (button_locked) {
+                power_key_pending_lock = 0;   /* nothing to defer; swallowed either way */
+                acted = 1; continue;
+            }
 
             /* set_locked(on) is a no-op when on == locked, which is right
              * for a double press but wrong here: the stock player can blank
@@ -8188,8 +8334,18 @@ static int handle_keys(int fd, key_src_t src) {
                 g_wake_t0 = us_now();   /* BG98: this call is the wake */
                 locked = 1; set_locked(0);
                 g_wake_setlocked_us = us_now() - g_wake_t0;
+                /* R77: wake already happened -- nothing left to defer, and a
+                 * dark screen is exactly the case the countdown overlay
+                 * most needs to have already woken by the time it appears. */
+                power_key_pending_lock = 0;
+            } else {
+                /* R77: locking here -- unlike waking above -- blanks the
+                 * panel outright (set_locked(1) powers the LCD down, see
+                 * its own comment), which would hide the very countdown
+                 * overlay a hold needs to draw on. Deferred until release
+                 * proves this was just a tap, not the start of a hold. */
+                power_key_pending_lock = 1;
             }
-            else set_locked(1);
             acted = 1; continue;
         }
 
@@ -9817,6 +9973,56 @@ int music_entry(void *a0, void *a1) {
             keyed |= r;
         }
         if (keyed) { dirty = 1; idle = 0; }
+
+        /* R77: hold-to-power-off, the two halves handle_keys() itself can't
+         * finish on its own -- the countdown overlay needs to redraw every
+         * tick with no new key event to drive it (the physical button sends
+         * exactly one down event and, eventually, one up event -- nothing in
+         * between), and the graceful path needs `base`, only ever in scope
+         * here in the main loop, for resume_save(). One check regardless of
+         * which fd handle_keys() happened to see the events on, not one per
+         * fd the way the read loop itself is. */
+        if (power_key_down && !power_hard_fired) {
+            long elapsed_ms = (long)((us_now() - power_key_down_us) / 1000);
+            if (!power_hold_ui_shown && elapsed_ms >= POWER_HOLD_UI_MS) {
+                power_hold_ui_shown = 1;
+                power_key_pending_lock = 0;   /* becoming a hold, not a tap -- the deferred lock never fires */
+                /* button_locked's whole point is that a stray pocket press
+                 * does nothing at all, screen included (BG20) -- so this
+                 * can't wake on the press itself the way an ordinary press
+                 * does, only once a real sustained hold is confirmed here,
+                 * by which point an accidental brush is not what's
+                 * happening. Without it the countdown would draw onto a
+                 * powered-down panel, invisible until release. */
+                if (button_locked && read_int_file(BACKLIGHT) <= 0) {
+                    if (last_lit_bright > 0) saved_brightness = last_lit_bright;
+                    locked = 1; set_locked(0);
+                }
+            }
+            if (power_hold_ui_shown) dirty = 1;   /* redraw every tick so the bar animates */
+            if (elapsed_ms >= POWER_HOLD_FORCE_MS) {
+                mlog("[music] power held %ldms -- forcing shutdown, nothing saved\n", elapsed_ms);
+                power_hard_fired = 1;
+                power_shutdown_kind = 2;
+                dirty = 1;
+                if (system("/sbin/poweroff") == -1) { }
+            }
+        }
+        if (power_release_outcome == 1) {
+            power_release_outcome = 0;
+            mlog("[music] power held -- graceful shutdown, saving first\n");
+            ab_save_current_pos();
+            pod_save_current_pos();
+            /* Same "either page holds the last drawn frame" reasoning as
+             * the auto-shutdown path's own identical call -- nothing has
+             * been drawn since dirty last cleared, and the mirror below the
+             * main draw block keeps both pages identical whenever a drag
+             * isn't in progress. */
+            resume_save(base + (size_t)(page ^ 1) * page_px);
+            power_shutdown_kind = 1;
+            dirty = 1;
+            if (system("/sbin/poweroff") == -1) { }
+        }
 
         /* A headset connecting brings its AVRCP device with it. */
         if (++rescan_tick >= 90) { rescan_tick = 0; scan_inputs(); }
