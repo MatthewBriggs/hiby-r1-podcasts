@@ -2812,43 +2812,31 @@ static int vis_rows(void) {
     return h / ROW_H;
 }
 
-/* Same reasoning as vis_rows()'s own comment on the mini player, for the
- * one list on this screen that predates vis_rows()/off-based scrolling and
- * never got folded into it: SC_SETTINGS_BT's scan results are a small,
- * bespoke, non-scrolling draw loop, so a mini player showing underneath
- * playback in progress (very much the common case -- pairing a new
- * headset while something's already playing over the old one) could draw
- * device rows into the same screen area the mini player owns. The mini
- * player's own tap zone takes priority globally over every screen's own
- * content (checked earlier in the tap-dispatch chain), so those rows drew
- * as if tappable but silently went to the mini player instead -- reported
- * live as "I can't tap to select a bluetooth device... it's like the tap
- * doesn't get picked up on". Shared by the draw loop and the tap handler,
- * same "one boundary, not two copies of it" reasoning as MINI_BTN_R's own
- * comment (BG21) and track_index_at()'s (BG2/BG61) -- a device that isn't
- * actually visible must never be reachable to tap, and vice versa. */
-static int bt_scan_max_visible(void) {
-    int bottom = mini_visible() ? FB_H - MINI_H : FB_H;
-    int list_top = CONTENT_Y + 3 * ROW_H;   /* toggle, status, "Scan for devices" */
-    int avail = bottom - list_top;
-    return avail > 0 ? avail / ROW_H : 0;
-}
-
-/* R75: requested live ("the wifi scan list should be scrollable"). Unlike
- * SC_SETTINGS_BT (still capped to whatever fits above the mini player,
- * BG102's own documented remaining limit), this screen now scrolls like
- * SC_SETTINGS' own longer list does -- scan results can run well past a
- * screenful on a dense apartment building or office, where Bluetooth
- * devices in range rarely do. wifi_nets/wifi_net_n/wifi_nets_refresh_at
- * moved to file scope (were function-local statics in the draw block)
- * since the scroll-limit calculation and the tap handler both need to
- * read the current result count too, not just the draw call that
- * refreshes it -- same "compute/refresh once, every reader this frame
- * sees the same thing" shape g_header_show_back already established for
- * the back arrow. */
+/* R75: requested live ("the wifi scan list should be scrollable"). This
+ * screen now scrolls like SC_SETTINGS' own longer list does -- scan
+ * results can run well past a screenful on a dense apartment building or
+ * office. wifi_nets/wifi_net_n/wifi_nets_refresh_at moved to file scope
+ * (were function-local statics in the draw block) since the scroll-limit
+ * calculation and the tap handler both need to read the current result
+ * count too, not just the draw call that refreshes it -- same
+ * "compute/refresh once, every reader this frame sees the same thing"
+ * shape g_header_show_back already established for the back arrow. */
 static wifi_found_net_t wifi_nets[10];
 static int              wifi_net_n;
 static time_t           wifi_nets_refresh_at;
+
+/* BG109 follow-up ("we also need scrolling on wifi and bluetooth device
+ * lists"): same treatment, same reasons, for SC_SETTINGS_BT's device
+ * list. Previously a small, bespoke, non-scrolling draw loop capped by
+ * bt_scan_max_visible() (removed -- no longer needed once a row that's
+ * scrolled off-screen has no on-screen y for a tap to land on in the
+ * first place, same as R75's own wifi tap handler already reasons).
+ * devs/dev_n/last_refresh hoisted to file scope for the same reason
+ * wifi_nets/wifi_net_n were. */
+static bt_found_dev_t bt_devs[8];
+static int             bt_dev_n;
+static time_t          bt_devs_refresh_at;
+static int bt_row_n(void) { return 3 + bt_dev_n; }   /* toggle, status, "Scan for devices" */
 
 /* 4 fixed rows (toggle, status, "Scan for networks", "Add network
  * manually") plus however many results are currently cached -- the
@@ -3364,6 +3352,7 @@ static int scroll_to_px(int total_px) {
                 (screen == SC_PLAYLISTS) ? playlist_n + 1 :   /* +1: R71's own "New Playlist" row */
                 (screen == SC_SETTINGS) ? settings_content_rows() :
                 (screen == SC_SETTINGS_WIFI) ? wifi_row_n() :   /* R75 */
+                (screen == SC_SETTINGS_BT) ? bt_row_n() :       /* BG109 */
                 (screen == SC_SETTINGS_TIMEZONE) ? TZ_N : total;
     int max_top = limit - vis_rows();
     if (max_top < 0) max_top = 0;
@@ -6079,24 +6068,29 @@ static void draw_screen(uint16_t *fb) {
     }
 
     if (screen == SC_SETTINGS_BT) {
-        int ry = CONTENT_Y;
+        /* BG109: off-based/_clip scrolling, same shape as SC_SETTINGS_WIFI
+         * (R75) just above. */
+        int clip_bot = mini_visible() ? FB_H - MINI_H : FB_H;
+        int off = scroll * ROW_H + scroll_px;
         int on = st_bt_on();
-        draw_text(fb, 24, ry + 20, "Bluetooth", COL_TEXT, TEXT_PX_BODY, FB_W - 140);
-        draw_toggle_switch_h(fb, ry, on, ROW_H);
-        ry += ROW_H;
-        fill_rect(fb, 0, ry - 1, FB_W, 1, COL_LINE);
+        int ry;
+
+        ry = CONTENT_Y - off;
+        draw_text_clip(fb, 24, ry + 20, "Bluetooth", COL_TEXT, TEXT_PX_BODY, FB_W - 140, CONTENT_Y, clip_bot);
+        draw_toggle_switch_h_clip(fb, ry, on, ROW_H, CONTENT_Y, clip_bot);
+        fill_rect_clip(fb, 0, ry + ROW_H - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
 
         char nm[64] = "";
         if (on) st_bt_name(nm, sizeof(nm));
-        draw_text(fb, 24, ry + 20, "Status", COL_TEXT, TEXT_PX_BODY, FB_W - 24);
-        draw_text(fb, 24, ry + 46, on ? (nm[0] ? nm : "not connected") : "off",
-                  COL_DIM, TEXT_PX_SMALL, FB_W - 48);
-        ry += ROW_H;
-        fill_rect(fb, 0, ry - 1, FB_W, 1, COL_LINE);
+        ry = CONTENT_Y + ROW_H - off;
+        draw_text_clip(fb, 24, ry + 20, "Status", COL_TEXT, TEXT_PX_BODY, FB_W - 24, CONTENT_Y, clip_bot);
+        draw_text_clip(fb, 24, ry + 46, on ? (nm[0] ? nm : "not connected") : "off",
+                  COL_DIM, TEXT_PX_SMALL, FB_W - 48, CONTENT_Y, clip_bot);
+        fill_rect_clip(fb, 0, ry + ROW_H - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
 
-        draw_text(fb, 24, ry + 20, "Scan for devices", COL_ACCENT, TEXT_PX_BODY, FB_W - 48);
-        ry += ROW_H;
-        fill_rect(fb, 0, ry - 1, FB_W, 1, COL_LINE);
+        ry = CONTENT_Y + 2 * ROW_H - off;
+        draw_text_clip(fb, 24, ry + 20, "Scan for devices", COL_ACCENT, TEXT_PX_BODY, FB_W - 48, CONTENT_Y, clip_bot);
+        fill_rect_clip(fb, 0, ry + ROW_H - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
 
         /* Refreshed at most every 2s, not on every redraw -- this screen
          * gets pulled into the once-a-second clock-tick redraw the same as
@@ -6105,24 +6099,23 @@ static void draw_screen(uint16_t *fb) {
          * work for a list that hasn't changed. Same shape as st_bt_name()'s
          * own 10s cache, just a shorter window since this list is what a
          * scan-in-progress is actively trying to grow. */
-        static bt_found_dev_t devs[8];
-        static int dev_n;
-        static time_t last_refresh;
         time_t now = time(NULL);
-        if (now - last_refresh >= 2) {
-            dev_n = bt_scan_devices(devs, 8);
-            last_refresh = now;
+        if (now - bt_devs_refresh_at >= 2) {
+            bt_dev_n = bt_scan_devices(bt_devs, 8);
+            bt_devs_refresh_at = now;
         }
-        if (dev_n == 0) {
-            draw_text(fb, 24, ry + 20, "No devices found yet", COL_DIM, TEXT_PX_SMALL, FB_W - 48);
+        if (bt_dev_n == 0) {
+            ry = CONTENT_Y + 3 * ROW_H - off;
+            draw_text_clip(fb, 24, ry + 20, "No devices found yet", COL_DIM, TEXT_PX_SMALL, FB_W - 48, CONTENT_Y, clip_bot);
         } else {
-            int bt_max_visible = bt_scan_max_visible();
-            for (int i = 0; i < dev_n && i < bt_max_visible; i++) {
-                draw_text_clip(fb, 24, ry + 20, devs[i].name[0] ? devs[i].name : devs[i].mac,
-                              COL_TEXT, TEXT_PX_BODY, FB_W - 48, CONTENT_Y, FB_H);
-                draw_right_clip(fb, ry + 20, devs[i].mac, CONTENT_Y, FB_H);
-                ry += ROW_H;
-                fill_rect(fb, 0, ry - 1, FB_W, 1, COL_LINE);
+            for (int i = 0; i < bt_dev_n; i++) {
+                ry = CONTENT_Y + (3 + i) * ROW_H - off;
+                if (ry + ROW_H < CONTENT_Y) continue;
+                if (ry > clip_bot) break;
+                draw_text_clip(fb, 24, ry + 20, bt_devs[i].name[0] ? bt_devs[i].name : bt_devs[i].mac,
+                              COL_TEXT, TEXT_PX_BODY, FB_W - 48, CONTENT_Y, clip_bot);
+                draw_right_clip(fb, ry + 20, bt_devs[i].mac, CONTENT_Y, clip_bot);
+                fill_rect_clip(fb, 0, ry + ROW_H - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
             }
         }
         if (mini_visible()) draw_mini(fb);
@@ -9348,7 +9341,11 @@ int music_entry(void *a0, void *a1) {
                     }
                 }
             } else if (screen == SC_SETTINGS_BT) {
-                int row = (y - CONTENT_Y) / ROW_H;
+                /* BG109: scroll-aware row math, same shape as
+                 * SC_SETTINGS_WIFI's own tap handler just above. */
+                int off = scroll * ROW_H + scroll_px;
+                int content_y = y + off;
+                int row = (content_y - CONTENT_Y) / ROW_H;
                 if (row == 0) {
                     int on = !st_bt_on();
                     st_bt_set(on);
@@ -9357,21 +9354,16 @@ int music_entry(void *a0, void *a1) {
                 } else if (row == 2) {
                     bt_scan_start();
                 } else if (row >= 3) {
-                    /* Re-queried fresh rather than sharing the draw block's
-                     * own cached list (a function-local static, out of
-                     * scope here) -- a tap is a rare, deliberate action,
-                     * not a redraw-rate concern, so the extra bluetoothctl
-                     * call costs nothing worth avoiding. */
+                    /* Re-queried fresh, same reasoning R75's own wifi tap
+                     * handler gives for doing the same -- a tap is rare and
+                     * deliberate, not a redraw-rate concern. No separate
+                     * visibility cap needed any more -- a row that's
+                     * scrolled off-screen simply has no on-screen y for a
+                     * touch to land on in the first place. */
                     bt_found_dev_t devs[8];
                     int n = bt_scan_devices(devs, 8);
                     int idx = row - 3;
-                    /* bt_scan_max_visible(), not just idx < n -- see its own
-                     * comment. A device past the mini player's own reserved
-                     * area was never actually reachable to look at, so a tap
-                     * landing there belongs to the mini player instead
-                     * (checked earlier in this same chain), not to a device
-                     * that only looks tappable. */
-                    if (idx >= 0 && idx < n && idx < bt_scan_max_visible())
+                    if (idx >= 0 && idx < n)
                         bt_pair(devs[idx].mac);
                 }
             } else if (screen == SC_SETTINGS_THEME) {
@@ -10247,7 +10239,8 @@ int music_entry(void *a0, void *a1) {
                              screen == SC_TRACKS || screen == SC_PLAYLISTS ||
                              screen == SC_RADIO || screen == SC_EQ_BANDS ||
                              screen == SC_SETTINGS || screen == SC_SETTINGS_TIMEZONE ||
-                             screen == SC_SETTINGS_WIFI ||   /* R75 */
+                             screen == SC_SETTINGS_WIFI || screen == SC_SETTINGS_BT ||   /* R75/BG109 */
+                             screen == SC_PODCASTS || screen == SC_AUDIOBOOKS ||   /* BG109 */
                              screen == SC_QUEUE || screen == SC_ARTIST_PAGE;
             /* R46: the album-detail screen has no status bar to keep a drag
              * from starting under -- its cover runs from y=0, same as Now
@@ -10320,7 +10313,7 @@ int music_entry(void *a0, void *a1) {
                 int continuous = (screen == SC_TRACKS && !ab_list && !pod_list) || screen == SC_ARTIST_PAGE ||
                                   screen == SC_PLAYLISTS || screen == SC_RADIO || screen == SC_QUEUE ||
                                   screen == SC_EQ_BANDS || screen == SC_SETTINGS ||
-                                  screen == SC_SETTINGS_WIFI || screen == SC_SETTINGS_TIMEZONE;
+                                  screen == SC_SETTINGS_WIFI || screen == SC_SETTINGS_BT || screen == SC_SETTINGS_TIMEZONE;
                 if (changed || continuous) dirty = 1;
                 unsigned dt = g_tick - list_last_tick;
                 if (dt > 0) {
@@ -10376,7 +10369,7 @@ int music_entry(void *a0, void *a1) {
              * scoped to only the two true-pixel-bounded screens. */
             int smooth_coast = continuous || screen == SC_PLAYLISTS || screen == SC_RADIO ||
                                 screen == SC_QUEUE || screen == SC_EQ_BANDS || screen == SC_SETTINGS ||
-                                screen == SC_SETTINGS_WIFI || screen == SC_SETTINGS_TIMEZONE;
+                                screen == SC_SETTINGS_WIFI || screen == SC_SETTINGS_BT || screen == SC_SETTINGS_TIMEZONE;
             if (changed || smooth_coast) dirty = 1;
             list_velocity *= 0.90f;     /* friction: dead within about a second */
             if (list_velocity < 0.6f && list_velocity > -0.6f) {
