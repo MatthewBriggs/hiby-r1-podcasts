@@ -4442,6 +4442,20 @@ static void *radio_art_worker(void *arg) {
             radio_art_bits = bits;
             snprintf(radio_art_title, sizeof(radio_art_title), "%s", title);
             snprintf(radio_art_for_station, sizeof(radio_art_for_station), "%s", station);
+            /* R111: the "cover colours" setting applies to NRK art exactly
+             * the way it already does to a local track's -- same np_bg/
+             * np_accent/np_fg globals np_col_fg() & co. read, just fed from
+             * this art instead of compute_cover_palette()'s (mutually
+             * exclusive: that call site now excludes radio_mode). Computed
+             * here rather than on the UI thread since derive_palette_from_
+             * bits() is already made safe to call off it (cover_prewarm_
+             * worker() does the same for local art) and RADIO_ART_PX ==
+             * ART_PX makes the histogram pass exactly as expensive as the
+             * one that function already does per track. */
+            if (cover_palette_enabled) {
+                derive_palette_from_bits(bits, &np_bg, &np_accent, &np_fg);
+                np_palette_valid = 1;
+            }
             pthread_mutex_unlock(&radio_art_lock);
         } else {
             free(bits);
@@ -5595,7 +5609,13 @@ static void draw_screen(uint16_t *fb) {
      * a plain seq-number check (see compute_cover_palette()'s own
      * comment) that's a no-op on every frame but the one where art_bits
      * genuinely just changed. */
-    if (cover_palette_enabled && screen == SC_PLAYING && !audiobook_mode)
+    /* R111: radio_mode/recording_playback_mode excluded too, now that NRK
+     * program art drives np_bg/np_accent/np_fg on its own (radio_art_
+     * worker(), below) -- this call is keyed off art_bits/art_seq(), which
+     * play_station() explicitly clears (art_request("", "", "", "")), and
+     * would otherwise fight over the same three globals every frame. */
+    if (cover_palette_enabled && screen == SC_PLAYING && !audiobook_mode &&
+        !radio_mode && !recording_playback_mode)
         compute_cover_palette();
     fill_rect(fb, 0, 0, FB_W, FB_H,
               (screen == SC_PLAYING && !audiobook_mode) ? np_col_bg() : COL_BG);
@@ -6150,9 +6170,9 @@ static void draw_screen(uint16_t *fb) {
             pthread_mutex_unlock(&radio_art_lock);
 
             int ty = title_y();
-            draw_scroll_title(fb, ty, radio_name, COL_TEXT, COL_BG);
+            draw_scroll_title(fb, ty, radio_name, np_col_fg(), np_col_bg());
             draw_text(fb, 24, ty + 44, art_title[0] ? art_title : "Internet radio",
-                     COL_DIM, TEXT_PX_BODY, FB_W - 24);
+                     np_col_dim(), TEXT_PX_BODY, FB_W - 24);
 
             /* R111: how far behind live, not elapsed-since-play -- once
              * rewind exists, "elapsed" and "how far from live" are two
@@ -6164,18 +6184,18 @@ static void draw_screen(uint16_t *fb) {
             long behind_ms = audio_radio_offset_ms();
             if (behind_ms > 0) {
                 snprintf(buf, sizeof(buf), "-%ld:%02ld", behind_ms / 60000, (behind_ms / 1000) % 60);
-                draw_right_col(fb, ty + 82, buf, COL_DIM);
+                draw_right_col(fb, ty + 82, buf, np_col_dim());
             } else {
-                draw_right_col(fb, ty + 82, audio_is_active() ? "LIVE" : "stopped", COL_DIM);
+                draw_right_col(fb, ty + 82, audio_is_active() ? "LIVE" : "stopped", np_col_dim());
             }
 
             int by = bar_y();
             int cyy = by + 70 + CTRL_NUDGE_PX, mid = FB_W / 2;
-            fill_circle(fb, mid, cyy, 42, COL_ACCENT);
-            if (audio_is_paused()) fill_triangle(fb, mid + 4, cyy, 36, +1, COL_BG);
+            fill_circle(fb, mid, cyy, 42, np_col_accent());
+            if (audio_is_paused()) fill_triangle(fb, mid + 4, cyy, 36, +1, np_col_bg());
             else {
-                fill_rect(fb, mid - 15, cyy - 18, 10, 36, COL_BG);
-                fill_rect(fb, mid + 5,  cyy - 18, 10, 36, COL_BG);
+                fill_rect(fb, mid - 15, cyy - 18, 10, 36, np_col_bg());
+                fill_rect(fb, mid + 5,  cyy - 18, 10, 36, np_col_bg());
             }
 
             /* R111: rewind/fast-forward, same -10s/+10s icon and placement
