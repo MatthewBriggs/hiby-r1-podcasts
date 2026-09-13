@@ -43,6 +43,7 @@
 #include "audio.h"
 #include "wsola.h"
 #include "eq.h"
+#include "radio_buffer.h"
 
 /* Bound the log. Four writers (alog here, mlog in music_hook.c, ilog in index.c,
  * slog in scanner.c) all append to this one file and nothing ever trimmed
@@ -204,22 +205,19 @@ static dec_kind_t sniff(const char *path) {
     return DEC_NONE;
 }
 
-/* A radio stream is an endless MP3 arriving down a pipe: no file to open, no
- * length, and no seeking.
+/* A radio stream is an endless MP3, read from radio_buffer's chunk files
+ * rather than a live pipe directly -- see radio_buffer.c for why (the
+ * time-shift buffer this enables) and g_radio_cursor below.
  *
  * drmp3_init is the obvious entry point and it does not work here. It seeks
- * backwards while it hunts for the first frame, and a pipe cannot rewind, so
- * it fails outright on a perfectly good stream. The low-level frame decoder
- * exists for exactly this: hand it bytes, it hands back one frame and says how
- * many bytes it consumed, and the buffer is ours to refill.
- *
- * TLS is why this shells out to the static curl on the card rather than
- * opening a socket: the device's own wget is too old to complete a modern
- * handshake.
+ * backwards while it hunts for the first frame, and even a buffered read
+ * cursor is not guaranteed to land on a frame boundary after a seek, so it
+ * fails outright. The low-level frame decoder exists for exactly this: hand
+ * it bytes, it hands back one frame and says how many bytes it consumed
+ * (scanning forward to resync if it didn't start on a boundary), and the
+ * buffer is ours to refill.
  */
 #define STREAM_BUF   (32 * 1024)
-#define CURL_PATH    "/data/mnt/sd_0/.podsync/curl"
-#define CA_BUNDLE    "/data/mnt/sd_0/.podsync/cacert.pem"
 
 /* HLS: segments are fetched whole, demuxed to ADTS, and handed to the decoder
  * a frame at a time. Unlike a plain MP3 stream there is no continuous socket —
@@ -238,6 +236,13 @@ typedef struct {
 
 static hls_src_t g_hls;
 
+/* Moved up from its previous spot further down this file (still the same
+ * single lock guarding all cross-thread audio state) so radio_apply_pending_
+ * seek() below -- called from dec_read(), which several radio-adjacent
+ * functions ahead of the old declaration already needed to reach -- has it
+ * in scope. */
+static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+
 typedef struct {
     FILE          *pipe;
     drmp3dec       dec;
@@ -250,10 +255,53 @@ typedef struct {
 
 static stream_t g_stream;
 
+/* Radio time-shift: both stream_fill() and hls_refill() now read from
+ * radio_buffer's chunk files at this cursor rather than pulling the live
+ * source directly -- the background thread in radio_buffer.c owns the
+ * actual fetch and keeps advancing regardless of where this cursor sits.
+ * At the live edge this trails the writer by a hair, same as before; behind
+ * it, this is rewind. See audio_radio_*() below for the public seek API. */
+static uint64_t g_radio_cursor;
+
+/* Set by audio_radio_seek_relative_ms(), consumed by the worker thread at
+ * the top of dec_read() -- same pending-request idiom audio_seek_ms() uses
+ * for local files, so a UI-thread write and a worker-thread read never race
+ * on a multi-step operation. Negative = rewind, positive = forward. */
+static volatile long g_radio_seek_delta_ms;
+
+/* When the decoder is re-pointed at a new cursor position, whatever partial
+ * frame bytes stream_t/hls_src_t were holding belong to the OLD position and
+ * must not be prepended to bytes read from the new one. drmp3dec/aac both
+ * resync on their own from arbitrary bytes (that's the whole reason the
+ * low-level frame API is used for radio at all -- see stream_fill()'s own
+ * comment), so discarding held bytes and letting the next fill scan for the
+ * next valid frame header is all a seek needs on the decode side. */
+static void radio_apply_pending_seek(void) {
+    pthread_mutex_lock(&g_lock);
+    long delta_ms = g_radio_seek_delta_ms;
+    g_radio_seek_delta_ms = 0;
+    pthread_mutex_unlock(&g_lock);
+    if (delta_ms == 0) return;
+
+    double bps = rb_bytes_per_sec();
+    if (bps <= 0) return;   /* not enough data yet to know the rate -- ignore rather than guess */
+    int64_t delta_bytes = (int64_t)((double)delta_ms / 1000.0 * bps);
+
+    uint64_t lo = rb_oldest_pos(), hi = rb_live_pos();
+    int64_t pos = (int64_t)g_radio_cursor + delta_bytes;
+    if (pos < (int64_t)lo) pos = (int64_t)lo;
+    if (pos > (int64_t)hi) pos = (int64_t)hi;
+    g_radio_cursor = (uint64_t)pos;
+
+    g_stream.len = 0;
+    g_hls.adts_len = g_hls.adts_used = 0;
+}
+
 static int stream_fill(stream_t *s) {
     if (!s->pipe || s->len >= STREAM_BUF) return 0;
-    size_t got = fread(s->buf + s->len, 1, (size_t)(STREAM_BUF - s->len), s->pipe);
+    size_t got = rb_read_at(g_radio_cursor, s->buf + s->len, (size_t)(STREAM_BUF - s->len));
     s->len += (int)got;
+    g_radio_cursor += got;
     return (int)got;
 }
 
@@ -285,28 +333,41 @@ static int stream_decode_frame(stream_t *s) {
     return 0;
 }
 
-/* Pull in another segment and demux it. 0 means nothing new was available. */
+/* Pull the next chunk of already-demuxed ADTS from radio_buffer. 0 means
+ * nothing new was available yet (radio_buffer's background thread demuxes
+ * TS segments to ADTS as they arrive -- see radio_buffer.c's HLS worker --
+ * so this reads a clean self-describing AAC bytestream, not raw TS). */
 static int hls_refill(hls_src_t *s) {
-    int n = hls_next(&s->hls, s->seg, (int)sizeof(s->seg));
-    if (n <= 0) return 0;
-    int a = ts_extract_audio(s->seg, n, s->adts, (int)sizeof(s->adts));
-    if (a <= 0) return 0;
-    s->adts_len = a;
+    size_t got = rb_read_at(g_radio_cursor, s->adts, sizeof(s->adts));
+    if (got == 0) return 0;
+    g_radio_cursor += got;
+    s->adts_len = (int)got;
     s->adts_used = 0;
-    return a;
+    return (int)got;
 }
 
 static int dec_open_hls(dec_t *d, const char *url) {
     memset(d, 0, sizeof(*d));
     memset(&g_hls, 0, sizeof(g_hls));
-    if (hls_open(&g_hls.hls, url) != 0) { alog("[audio] hls open failed\n"); return -1; }
+    g_radio_cursor = 0;
+    if (rb_start(url, RB_KIND_ADTS) != 0) { alog("[audio] hls open failed\n"); return -1; }
     g_hls.aac = aac_open(NULL, 0);           /* ADTS: self-describing */
-    if (!g_hls.aac) { alog("[audio] no AAC decoder\n"); return -1; }
+    if (!g_hls.aac) { rb_stop(); alog("[audio] no AAC decoder\n"); return -1; }
 
     /* Decode a little before reporting success, so the rate and channel count
-     * are known and a dead stream fails here rather than as silence. */
-    for (int tries = 0; tries < 6; tries++) {
-        if (g_hls.adts_used >= g_hls.adts_len && hls_refill(&g_hls) <= 0) continue;
+     * are known and a dead stream fails here rather than as silence. First
+     * bytes take a moment to arrive -- hls_open() itself now runs inside the
+     * background thread (master playlist, then the chosen variant playlist,
+     * two real HTTPS fetches on this device's TLS-heavy curl path) before
+     * the first segment is even requested, so this needs real patience: a
+     * live capture showed one open time out and immediately succeed on
+     * retry at the old, shorter budget. 10s, not the 3s first tried. */
+    for (int tries = 0; tries < 200; tries++) {
+        if (g_hls.adts_used >= g_hls.adts_len && hls_refill(&g_hls) <= 0) {
+            if (!rb_active()) break;   /* background fetch already gave up -- bad URL, no point waiting out the rest */
+            usleep(50 * 1000);
+            continue;
+        }
         int took = aac_fill(g_hls.aac, g_hls.adts + g_hls.adts_used,
                             (unsigned)(g_hls.adts_len - g_hls.adts_used));
         if (took > 0) g_hls.adts_used += took;
@@ -326,6 +387,7 @@ static int dec_open_hls(dec_t *d, const char *url) {
             return 0;
         }
     }
+    rb_stop();
     aac_close(g_hls.aac);
     g_hls.aac = NULL;
     alog("[audio] hls produced no audio\n");
@@ -335,28 +397,39 @@ static int dec_open_hls(dec_t *d, const char *url) {
 static int dec_open_stream(dec_t *d, const char *url) {
     memset(d, 0, sizeof(*d));
     memset(&g_stream, 0, sizeof(g_stream));
-    char cmd[1024];
-    /* -L because these stations answer with a redirect to a regional pop, and
-     * --no-buffer so playback does not wait on curl filling an output block. */
-    snprintf(cmd, sizeof(cmd),
-             "%s -sL --no-buffer --cacert %s '%s' 2>/dev/null",
-             CURL_PATH, CA_BUNDLE, url);
-    g_stream.pipe = popen(cmd, "r");
-    if (!g_stream.pipe) { alog("[audio] cannot start fetch\n"); return -1; }
+    g_radio_cursor = 0;
 
+    /* radio_buffer's own background thread now owns the actual fetch (see
+     * radio_buffer.c) so this and every other track change can pause/rewind
+     * it later. .pipe is repurposed as a plain "session active" flag -- the
+     * real FILE* lives inside radio_buffer.c, not here. */
+    if (rb_start(url, RB_KIND_MP3) != 0) { alog("[audio] cannot start fetch\n"); return -1; }
+    g_stream.pipe = (FILE *)1;
+
+    /* First bytes take a moment to arrive -- the background thread has only
+     * just started the real connection (TLS handshake, then a redirect to a
+     * regional pop for some stations). Same 10s budget as the HLS path, and
+     * for the same reason: a live capture showed the old, shorter timeout
+     * fail once and succeed moments later on retry. */
+    for (int tries = 0; tries < 200 && g_stream.len < 7; tries++) {
+        stream_fill(&g_stream);
+        if (g_stream.len < 7) {
+            if (!rb_active()) break;   /* background fetch already gave up -- bad URL, no point waiting out the rest */
+            usleep(50 * 1000);
+        }
+    }
     drmp3dec_init(&g_stream.dec);
-    stream_fill(&g_stream);
     /* A playlist handed to the MP3 path decodes as nothing at all, which is
      * indistinguishable from a dead station. Recognise it and say so, and the
      * caller can open it properly. */
     if (g_stream.len >= 7 && !memcmp(g_stream.buf, "#EXTM3U", 7)) {
-        pclose(g_stream.pipe);
+        rb_stop();
         g_stream.pipe = NULL;
         alog("[audio] that URL is a playlist, not a stream\n");
         return -2;
     }
     if (stream_decode_frame(&g_stream) <= 0) {
-        pclose(g_stream.pipe);
+        rb_stop();
         g_stream.pipe = NULL;
         alog("[audio] no MP3 frames in stream\n");
         return -1;
@@ -517,6 +590,7 @@ static uint64_t dec_read32(dec_t *d, int32_t *out, uint64_t want) {
 }
 
 static uint64_t dec_read(dec_t *d, short *out, uint64_t want) {
+    if (d->is_hls || d->is_stream) radio_apply_pending_seek();
     if (d->is_hls) {
         hls_src_t *s = &g_hls;
         uint64_t done = 0;
@@ -721,13 +795,14 @@ static void dec_seek(dec_t *d, uint64_t frame, const char *path,
 
 static void dec_close(dec_t *d) {
     if (d->is_hls) {
+        rb_stop();
         aac_close(g_hls.aac);
         g_hls.aac = NULL;
         d->kind = DEC_NONE;
         return;
     }
     if (d->is_stream) {
-        if (g_stream.pipe) { pclose(g_stream.pipe); g_stream.pipe = NULL; }
+        if (g_stream.pipe) { rb_stop(); g_stream.pipe = NULL; }
         d->kind = DEC_NONE;
         return;
     }
@@ -1056,7 +1131,6 @@ static int load_libs(void) {
 /* ---- state --------------------------------------------------------------- */
 static pthread_t       g_thread;
 static int             g_thread_valid;
-static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static int   g_running, g_active, g_paused;
 static int   g_pos_ms, g_dur_ms;
 static int   g_vol = 70;
@@ -2620,6 +2694,44 @@ void audio_seek_ms(int ms) {
     pthread_mutex_lock(&g_lock);
     g_seek_to_ms = ms;
     pthread_mutex_unlock(&g_lock);
+}
+
+/* Radio time-shift seeking. See g_radio_cursor / radio_apply_pending_seek()
+ * for how this reaches the worker thread, and radio_buffer.h for why byte
+ * position stands in for time. Negative ms rewinds, positive moves toward
+ * (and, past the live edge, is clamped at) live. */
+void audio_radio_seek_relative_ms(long ms) {
+    pthread_mutex_lock(&g_lock);
+    g_radio_seek_delta_ms += ms;
+    pthread_mutex_unlock(&g_lock);
+}
+
+/* How far behind live the radio cursor currently sits, in ms. 0 at the live
+ * edge. Also 0 (rather than unknown/negative) before enough data has
+ * arrived to estimate a byte rate -- nothing useful to seek relative to
+ * yet, same as there being nothing to rewind into. */
+long audio_radio_offset_ms(void) {
+    double bps = rb_bytes_per_sec();
+    if (bps <= 0) return 0;
+    pthread_mutex_lock(&g_lock);
+    uint64_t cursor = g_radio_cursor;
+    pthread_mutex_unlock(&g_lock);
+    uint64_t live = rb_live_pos();
+    if (cursor >= live) return 0;
+    return (long)((double)(live - cursor) / bps * 1000.0);
+}
+
+/* How far back rewinding can currently go, in ms -- the UI's basis for
+ * greying out further rewind, same idea as fast-forward greying out at the
+ * live edge (audio_radio_offset_ms() == 0). Grows as the session buffers
+ * more, caps out once the retained window (radio_buffer.h's 30 minutes) is
+ * full. */
+long audio_radio_max_rewind_ms(void) {
+    double bps = rb_bytes_per_sec();
+    if (bps <= 0) return 0;
+    uint64_t live = rb_live_pos(), oldest = rb_oldest_pos();
+    if (live <= oldest) return 0;
+    return (long)((double)(live - oldest) / bps * 1000.0);
 }
 
 void audio_set_speed(int permille) {

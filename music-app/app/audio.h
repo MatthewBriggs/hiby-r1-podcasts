@@ -53,6 +53,18 @@ int  audio_dur_ms(void);
  * same way every other live readout in this app is built from a poll
  * rather than a callback. */
 int32_t audio_current_peak(void);
+
+/* Radio time-shift seeking (radio streams only -- audio_dur_ms()/
+ * audio_pos_ms() do not apply to a live stream). See radio_buffer.h for the
+ * buffer these operate on. Negative ms rewinds, positive moves toward live
+ * and is clamped there; audio_radio_offset_ms() reaching 0 means fast-
+ * forward has nothing further to do (grey it out), audio_radio_max_rewind_
+ * ms() reaching audio_radio_offset_ms() means rewind has run out the same
+ * way. Both read 0 before enough data has arrived to estimate a byte rate,
+ * same as there being nothing yet to seek relative to. */
+void audio_radio_seek_relative_ms(long ms);
+long audio_radio_offset_ms(void);
+long audio_radio_max_rewind_ms(void);
 void audio_set_volume(int pct);
 int  audio_volume(void);
 void audio_volume_step(int delta);   /* routes to the BT mixer or software */
