@@ -80,6 +80,7 @@ typedef struct {
 #include "scanner.h"
 #include "status.h"
 #include "radio.h"
+#include "radio_buffer.h"
 #include "playlist.h"
 
 /* ---- device geometry ----------------------------------------------------- */
@@ -528,6 +529,22 @@ static uint16_t *cover_load_capped(const char *jpg, const char *key, int px,
 
 static pthread_mutex_t art_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint16_t *art_bits;            /* ART_PX * ART_PX, or NULL */
+
+/* NRK program artwork (R111) -- the same full edge-to-edge ART_PX square
+ * Music/Podcasts use (R111 follow-up: the whole radio layout was moved to
+ * line up with theirs, art box included, rather than radio keeping its own
+ * bespoke geometry). Own lock rather than reusing art_lock: unrelated art,
+ * unrelated lifetime (this one survives across the whole time a station
+ * plays, not per-track). Own #define, not a second use of ART_PX directly,
+ * so radio_art_worker()'s cover_load_fresh() call and NRK_ART_MIN_PX
+ * (radio.h) stay obviously in sync if this ever changes. */
+#define RADIO_ART_PX ART_PX
+static pthread_mutex_t radio_art_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint16_t *radio_art_bits;                 /* RADIO_ART_PX * RADIO_ART_PX, or NULL */
+static volatile int radio_art_done = 1;
+static char radio_art_title[160];
+static char radio_art_for_station[LIB_NAME_LEN]; /* which station radio_art_bits/title belong to */
+static int  radio_art_tick;                       /* periodic refresh, main loop */
 static char      art_want[512];       /* track the loader should be showing */
 /* R23: artist/album to search Last.fm with if no local art turns up for
  * art_want -- empty from any caller that shouldn't trigger that fallback
@@ -2005,7 +2022,8 @@ typedef enum { SC_MENU = 0, SC_MUSIC_MENU, SC_ARTISTS, SC_ALBUMS, SC_TRACKS, SC_
                SC_SETTINGS, SC_SETTINGS_THEME, SC_SETTINGS_ABOUT,
                SC_SETTINGS_TIMEZONE, SC_SETTINGS_THEMEMODE, SC_QUEUE,
                SC_ARTIST_PAGE,
-               SC_SETTINGS_WIFI, SC_SETTINGS_BT, SC_SETTINGS_USB, SC_KEYBOARD } screen_t;
+               SC_SETTINGS_WIFI, SC_SETTINGS_BT, SC_SETTINGS_USB, SC_KEYBOARD,
+               SC_RADIO_RECORDINGS } screen_t;
 
 /* L2: the top-level menu ("Main Menu", EXIT on the right) stays small on
  * purpose rather than listing every library-browsing facet alongside
@@ -2808,6 +2826,9 @@ static int track_n;
  * copy, with the artist and album it came from. */
 static radio_station_t stations[RADIO_MAX];
 static int  station_n;
+static radio_recording_t radio_recordings[RADIO_REC_MAX];
+static int  radio_recording_n;
+static char radio_recording_path_buf[700];   /* set right before recording starts, so stopping knows what it just wrote */
 /* A stream has no queue, no length and no artwork, so Now Playing has to know
  * it is showing one rather than a track. */
 static int  radio_mode;
@@ -2858,6 +2879,40 @@ static pod_episode_t pod_eps[POD_MAX_ITEMS]; /* parallel to tracks[] while pod_l
 static int        pod_ep_n;
 static char       cur_feed[POD_NAME_LEN];
 static int        podcast_mode;
+
+/* Playing back a finished radio recording. Deliberately minimal (name +
+ * play/pause, no seek bar) for both an MP3 recording (which really does
+ * have a seekable duration, via the normal DEC_MP3 path) and an AAC one
+ * (which does not -- see dec_open_adts_file()'s own comment in audio.c) --
+ * kept uniform rather than having seek work for one kind and not the other. */
+static int  recording_playback_mode;
+static char recording_playback_name[160];
+
+static void play_recording(int i) {
+    if (i < 0 || i >= radio_recording_n) return;
+    radio_mode = 0;
+    audiobook_mode = 0;
+    podcast_mode = 0;
+    recording_playback_mode = 1;
+    snprintf(recording_playback_name, sizeof(recording_playback_name), "%s", radio_recordings[i].name);
+    audio_play(radio_recordings[i].path);
+}
+
+/* R111: swipe-to-delete, same shape as pod_remove_download()'s own -- a
+ * playing recording is stopped first (deleting the file a decoder still has
+ * open would otherwise leave it playing from an unlinked inode until the
+ * fd closes, technically harmless here but confusing: the Recordings list
+ * would show it gone while it kept audibly playing). */
+static void radio_recording_delete(int i) {
+    if (i < 0 || i >= radio_recording_n) return;
+    if (recording_playback_mode && audio_is_active() &&
+        !strcmp(recording_playback_name, radio_recordings[i].name))
+        audio_stop();
+    remove(radio_recordings[i].path);
+    for (int k = i; k < radio_recording_n - 1; k++) radio_recordings[k] = radio_recordings[k + 1];
+    radio_recording_n--;
+}
+
 static int        pod_list;
 /* BG47: separate from ab_speed_permille on purpose -- persists across
  * episodes the same way ab_speed_permille persists across books, but a
@@ -3397,6 +3452,9 @@ static int  playlist_swipe_dx;
 static int  pod_swipe_active;
 static int  pod_swipe_idx;
 static int  pod_swipe_dx;
+static int  rec_swipe_active;
+static int  rec_swipe_idx;
+static int  rec_swipe_dx;
 static char cur_artist[LIB_NAME_LEN];
 static char cur_album[LIB_NAME_LEN];
 /* BG73: whether cur_artist/cur_album (whatever's currently loaded into
@@ -3934,6 +3992,7 @@ static void pod_play_episode(int idx) {
     if (idx < 0 || idx >= pod_ep_n || !pod_eps[idx].downloaded) return;
     pod_save_current_pos();
     radio_mode = 0;
+    recording_playback_mode = 0;
     audiobook_mode = 0;
     podcast_mode = 1;
     memcpy(&queue[0], &tracks[idx], sizeof(queue[0]));
@@ -4184,7 +4243,8 @@ static int scroll_to_px(int total_px) {
     }
     int limit = (screen == SC_TRACKS) ? track_n :
                 (screen == SC_QUEUE)  ? queue_n :
-                (screen == SC_RADIO)  ? station_n :
+                (screen == SC_RADIO)  ? station_n + 1 :   /* +1: R111's own "Recordings" row */
+                (screen == SC_RADIO_RECORDINGS) ? radio_recording_n :
                 (screen == SC_PLAYLISTS) ? playlist_n + 1 :   /* +1: R71's own "New Playlist" row */
                 (screen == SC_SETTINGS) ? settings_content_rows() :
                 (screen == SC_SETTINGS_WIFI) ? wifi_row_n() :   /* R75 */
@@ -4359,6 +4419,68 @@ static void queue_apply_pending(void) {
     q_pending_at = -1;
 }
 
+/* NRK program artwork (R111): see radio_fetch_nrk_art()'s own comment for
+ * the endpoint and what it does/doesn't give. Detached worker, same shape
+ * as mp3_seektable_worker() -- real network I/O has no business on the UI
+ * thread, and the fetch itself already retries/times out sanely inside
+ * curl, so nothing here needs its own cancellation path beyond just
+ * letting it finish and checking radio_art_for_station still matches by
+ * the time it's done (a station switch mid-fetch is not treated as an
+ * error, its result is just discarded). */
+static void *radio_art_worker(void *arg) {
+    char *station = arg;
+    char jpg[128];
+    snprintf(jpg, sizeof(jpg), "/tmp/.nrk_art_%d.jpg", (int)getpid());
+    char title[160];
+    int rc = radio_fetch_nrk_art(station, jpg, title, sizeof(title));
+    if (rc == 0) {
+        cover_downscale_max(jpg, FETCHED_COVER_MAX_DIM);
+        uint16_t *bits = cover_load_fresh(jpg, "radio:nrk", RADIO_ART_PX);
+        if (bits && !strcmp(station, radio_name)) {   /* still the station actually playing */
+            pthread_mutex_lock(&radio_art_lock);
+            free(radio_art_bits);
+            radio_art_bits = bits;
+            snprintf(radio_art_title, sizeof(radio_art_title), "%s", title);
+            snprintf(radio_art_for_station, sizeof(radio_art_for_station), "%s", station);
+            pthread_mutex_unlock(&radio_art_lock);
+        } else {
+            free(bits);
+        }
+        unlink(jpg);
+    }
+    free(station);
+    radio_art_done = 1;
+    return NULL;
+}
+
+/* Dispatches a fetch if station_name looks like an NRK channel and one
+ * isn't already in flight. Safe to call every tick -- radio_art_done gates
+ * it exactly the way art_request() gates art_worker() for local tracks. */
+static void radio_art_request(const char *station_name) {
+    if (strncmp(station_name, "NRK ", 4) != 0) return;
+    if (!radio_art_done) return;
+    char *copy = strdup(station_name);
+    if (!copy) return;
+    radio_art_done = 0;
+    pthread_t t;
+    int rc = pthread_create(&t, NULL, radio_art_worker, copy);
+    if (rc != 0) {
+        free(copy);
+        radio_art_done = 1;
+        return;
+    }
+    pthread_detach(t);
+}
+
+static void radio_art_clear(void) {
+    pthread_mutex_lock(&radio_art_lock);
+    free(radio_art_bits);
+    radio_art_bits = NULL;
+    radio_art_title[0] = '\0';
+    radio_art_for_station[0] = '\0';
+    pthread_mutex_unlock(&radio_art_lock);
+}
+
 static void play_station(int i) {
     if (i < 0 || i >= station_n) return;
     radio_msg[0] = '\0';
@@ -4373,9 +4495,12 @@ static void play_station(int i) {
     radio_mode = 1;
     audiobook_mode = 0;
     podcast_mode = 0;
+    recording_playback_mode = 0;
     audio_set_speed(1000);           /* a stream has no WSOLA use for it */
     snprintf(radio_name, sizeof(radio_name), "%s", stations[i].name);
     art_request("", "", "", "");         /* clears whatever art was showing */
+    radio_art_clear();
+    radio_art_request(radio_name);       /* R111: NRK program art, no-op for any other station */
     audio_play(stations[i].url);
     was_active = 1;
     mlog("[music] station %s\n", stations[i].name);
@@ -4714,6 +4839,7 @@ static void wave_track_changed(const char *path) {
 
 static void play_index(int i) {
     radio_mode = 0;
+    recording_playback_mode = 0;
     audiobook_mode = 0;
     /* R58: NOT podcast_mode = 0 here any more. This is the generic
      * "advance within queue[]" function -- Next/Prev, a tap in SC_QUEUE,
@@ -4821,6 +4947,7 @@ static void ab_play_chapter(int i) {
     if (i < 0 || i >= ab_book.chap_n || i >= track_n) return;
     audiobook_mode = 1;
     radio_mode = 0;
+    recording_playback_mode = 0;
     podcast_mode = 0;
     if (queue_n != track_n) {
         memcpy(queue, tracks, sizeof(queue[0]) * (size_t)track_n);
@@ -5515,6 +5642,7 @@ static void draw_screen(uint16_t *fb) {
      * list — the same list, with the playing row marked. */
 
     else if (screen == SC_RADIO)   { title = "Radio"; show_back = 1; }
+    else if (screen == SC_RADIO_RECORDINGS) { title = "Recordings"; show_back = 1; }
     else if (screen == SC_PLAYLISTS) { title = "Playlists"; show_back = 1; }
     else if (screen == SC_AUDIOBOOKS) { title = "Audiobooks"; show_back = 1; }
     else if (screen == SC_PODCASTS)   { title = "Podcasts"; show_back = 1; }
@@ -5677,12 +5805,25 @@ static void draw_screen(uint16_t *fb) {
     }
 
     if (screen == SC_RADIO) {
-        /* R76: smooth per-pixel scroll -- see SC_PLAYLISTS' own comment. */
+        /* R76: smooth per-pixel scroll -- see SC_PLAYLISTS' own comment.
+         * R111: one extra row appended after the real stations -- "Recordings"
+         * -- same +1-row idiom SC_PLAYLISTS' own "New Playlist" row uses,
+         * just at the end instead of the front (an action alongside the
+         * primary list reads more naturally following it than leading it,
+         * since it's secondary to picking a station rather than a peer of
+         * one). idx == station_n is that row; real stations are unaffected,
+         * still indexed 0..station_n-1. */
         int off = scroll * ROW_H + scroll_px;
-        for (int idx = 0; idx < station_n; idx++) {
+        for (int idx = 0; idx <= station_n; idx++) {
             int ry = CONTENT_Y + idx * ROW_H - off;
             if (ry + ROW_H < CONTENT_Y) continue;
             if (ry > clip_bot) break;
+            if (idx == station_n) {
+                draw_text_clip(fb, 24, ry + 20, "Recordings", COL_ACCENT, TEXT_PX_BODY,
+                              FB_W - 40, CONTENT_Y, clip_bot);
+                fill_rect_clip(fb, 0, ry + ROW_H - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
+                continue;
+            }
             int playing = radio_mode && audio_is_active() &&
                           !strcmp(stations[idx].name, radio_name);
             if (playing) {
@@ -5706,6 +5847,34 @@ static void draw_screen(uint16_t *fb) {
         else if (radio_msg[0])
             draw_text(fb, 24, FB_H - 34, radio_msg, RGB(230, 80, 70), TEXT_PX_SMALL, FB_W - 40);
         if (mini_visible()) draw_mini(fb);
+        return;
+    }
+
+    if (screen == SC_RADIO_RECORDINGS) {
+        int off = scroll * ROW_H + scroll_px;
+        for (int idx = 0; idx < radio_recording_n; idx++) {
+            int ry = CONTENT_Y + idx * ROW_H - off;
+            if (ry + ROW_H < CONTENT_Y) continue;
+            if (ry > clip_bot) break;
+            /* R111: swipe-to-delete, same shape as pod_swipe_dx's own --
+             * accent-tinted background and the row's own content shifted by
+             * dx0 while dragging, no separate "delete" label revealed
+             * underneath (the tint alone is what pod's own row already
+             * relies on). */
+            int swiping_this = rec_swipe_active && idx == rec_swipe_idx;
+            int dx0 = swiping_this ? rec_swipe_dx : 0;
+            if (swiping_this)
+                fill_rect_clip(fb, 0, ry, FB_W, ROW_H, COL_ACCENT, CONTENT_Y, clip_bot);
+            draw_text_clip(fb, 24 + dx0, ry + 12, radio_recordings[idx].name, COL_TEXT,
+                          TEXT_PX_BODY, FB_W - 40 + dx0, CONTENT_Y, clip_bot);
+            long mb10 = radio_recordings[idx].size_bytes / (1024L * 1024L / 10);   /* tenths of a MB */
+            snprintf(buf, sizeof(buf), "%ld.%ld MB", mb10 / 10, mb10 % 10);
+            draw_text_clip(fb, 24 + dx0, ry + 40, buf, COL_DIM, TEXT_PX_SMALL, FB_W - 40 + dx0, CONTENT_Y, clip_bot);
+            if (!swiping_this)
+                fill_rect_clip(fb, 0, ry + ROW_H - 1, FB_W, 1, COL_LINE, CONTENT_Y, clip_bot);
+        }
+        if (radio_recording_n == 0)
+            draw_text(fb, 24, CONTENT_Y + 20, "No recordings yet", COL_DIM, TEXT_PX_BODY, FB_W - 40);
         return;
     }
 
@@ -5959,27 +6128,49 @@ static void draw_screen(uint16_t *fb) {
             return;
         }
         if (radio_mode) {
-            /* A live stream has no length, no track number and no cover, so
-             * the layout drops the parts that would only ever be blank. */
-            int cy = 120;
-            draw_text(fb, 24, cy, radio_name, COL_TEXT, TEXT_PX_TITLE, FB_W - 48);
-            draw_text(fb, 24, cy + 52, "Internet radio", COL_DIM, TEXT_PX_BODY, FB_W - 48);
+            /* R111: title and transport row now sit at the exact same y as
+             * their equivalents on the Music/Podcast/Audiobook Now Playing
+             * screens (title_y()/bar_y()-derived), per explicit request --
+             * previously this screen used its own bespoke, much higher
+             * layout (justified when there was never any art to reserve
+             * room for; no longer true for an NRK station, and the
+             * inconsistency was jarring regardless). The art box is the
+             * same full-width ART_PX square Music uses, COL_ROW-filled
+             * placeholder when there's nothing to show in it (no art yet,
+             * or a non-NRK station) -- same as a track with no cover. */
+            fill_rect(fb, 0, 0, ART_PX, ART_PX, COL_ROW);
+            pthread_mutex_lock(&radio_art_lock);
+            if (radio_art_bits) {
+                for (int r = 0; r < ART_PX; r++)
+                    memcpy(fb + (size_t)r * FB_W, radio_art_bits + (size_t)r * ART_PX,
+                           (size_t)ART_PX * sizeof(uint16_t));
+            }
+            char art_title[160];
+            snprintf(art_title, sizeof(art_title), "%s", radio_art_title);
+            pthread_mutex_unlock(&radio_art_lock);
+
+            int ty = title_y();
+            draw_scroll_title(fb, ty, radio_name, COL_TEXT, COL_BG);
+            draw_text(fb, 24, ty + 44, art_title[0] ? art_title : "Internet radio",
+                     COL_DIM, TEXT_PX_BODY, FB_W - 24);
 
             /* R111: how far behind live, not elapsed-since-play -- once
              * rewind exists, "elapsed" and "how far from live" are two
              * different numbers, and the live-edge readout is the one a
              * rewound listener actually wants on screen. 0 offset still
              * reads "LIVE"; behind it, "-M:SS" the same way a remaining-time
-             * clock elsewhere in this app is signed. */
+             * clock elsewhere in this app is signed. Same ty+82 right-column
+             * position Music's own "N of M" occupies. */
             long behind_ms = audio_radio_offset_ms();
             if (behind_ms > 0) {
                 snprintf(buf, sizeof(buf), "-%ld:%02ld", behind_ms / 60000, (behind_ms / 1000) % 60);
-                draw_right(fb, cy + 110, buf);
+                draw_right_col(fb, ty + 82, buf, COL_DIM);
             } else {
-                draw_right(fb, cy + 110, audio_is_active() ? "LIVE" : "stopped");
+                draw_right_col(fb, ty + 82, audio_is_active() ? "LIVE" : "stopped", COL_DIM);
             }
 
-            int cyy = cy + 190, mid = FB_W / 2;
+            int by = bar_y();
+            int cyy = by + 70 + CTRL_NUDGE_PX, mid = FB_W / 2;
             fill_circle(fb, mid, cyy, 42, COL_ACCENT);
             if (audio_is_paused()) fill_triangle(fb, mid + 4, cyy, 36, +1, COL_BG);
             else {
@@ -6012,9 +6203,53 @@ static void draw_screen(uint16_t *fb) {
 
             /* Say which codec actually turned up: an HLS station is AAC, and
              * labelling everything MP3 was simply wrong. */
+            /* R111: record -- a solid circle within a wider circle, house
+             * style for a ring control (matches the speed ring's own two-
+             * fill shape), placed to the right of +10s at the same +70
+             * offset the audiobook player's speed ring uses on its own
+             * side, per explicit request to place it there rather than
+             * invent new spacing. Ring and dot both turn the same red
+             * "Wi-Fi is off"/error text already uses elsewhere on this
+             * screen while actually recording, with a "REC" label under it
+             * -- otherwise a plain outline ring with a dot, the universal
+             * "tap to record" affordance, in the ordinary text colour. */
+            {
+                int rec_x = mid + 96 + 70;
+                int recording = rb_is_recording();
+                uint16_t ring_col = recording ? RGB(230, 80, 70) : COL_LINE;
+                uint16_t dot_col  = recording ? RGB(230, 80, 70) : COL_TEXT;
+                fill_circle(fb, rec_x, cyy, 22, ring_col);
+                fill_circle(fb, rec_x, cyy, 20, COL_BG);
+                fill_circle(fb, rec_x, cyy, 10, dot_col);
+                if (recording)
+                    draw_text(fb, rec_x - text_width("REC", TEXT_PX_SMALL) / 2,
+                             cyy - TEXT_PX_SMALL / 2 + 2, "REC", ring_col, TEXT_PX_SMALL, FB_W);
+            }
+
             snprintf(buf, sizeof(buf), "%s stream  \xc2\xb7  %s",
                      audio_codec()[0] ? audio_codec() : "Live", audio_output());
             draw_text(fb, 24, FB_H - 34, buf, COL_ACCENT, TEXT_PX_SMALL, FB_W - 48);
+            return;
+        }
+
+        if (recording_playback_mode) {
+            /* Deliberately minimal -- see this mode's own comment by its
+             * state variables for why no seek bar. R111 follow-up: title
+             * and transport row still line up with Music's own positions,
+             * same as radio_mode's block above, just with a blank art box
+             * (a recording has no cover of its own to show). */
+            fill_rect(fb, 0, 0, ART_PX, ART_PX, COL_ROW);
+            int ty = title_y();
+            draw_text(fb, 24, ty, recording_playback_name, COL_TEXT, TEXT_PX_TITLE, FB_W - 48);
+            draw_text(fb, 24, ty + 44, "Recording", COL_DIM, TEXT_PX_BODY, FB_W - 48);
+
+            int cyy = bar_y() + 70 + CTRL_NUDGE_PX, mid = FB_W / 2;
+            fill_circle(fb, mid, cyy, 42, COL_ACCENT);
+            if (audio_is_paused()) fill_triangle(fb, mid + 4, cyy, 36, +1, COL_BG);
+            else {
+                fill_rect(fb, mid - 15, cyy - 18, 10, 36, COL_BG);
+                fill_rect(fb, mid + 5,  cyy - 18, 10, 36, COL_BG);
+            }
             return;
         }
 
@@ -7581,6 +7816,7 @@ static int go_back(void) {
             return g_is_standalone ? 1 : 0;
         case SC_PLAYING:
             if (radio_mode) { screen = SC_RADIO; reset_scroll(); break; }
+            if (recording_playback_mode) { screen = SC_RADIO_RECORDINGS; reset_scroll(); break; }
             /* BG73 follow-up: reported live -- once Play Next has spliced in
              * a track from a different album, this queue no longer
              * represents one browsable album, so presenting it as a single
@@ -7723,6 +7959,9 @@ static int go_back(void) {
                     view_art_request(tracks[a].path, cur_artist, cur_album);
                 }
             }
+            break;
+        case SC_RADIO_RECORDINGS:
+            screen = SC_RADIO; reset_scroll();
             break;
         case SC_RADIO:
         case SC_AUDIOBOOKS:
@@ -10574,12 +10813,23 @@ int music_entry(void *a0, void *a1) {
                 /* R111: real hit zones under the drawn icons, same idiom
                  * BG47 uses for podcast's -10s/+30s row -- midpoints between
                  * adjacent element centres (play at mid, skip icons at
-                 * mid +/- 96, so the boundary is +/- 48), not blind thirds. */
-                int cyy = 120 + 190, mid = FB_W / 2;
+                 * mid +/- 96, record at mid+96+70, so the boundaries are the
+                 * midpoints between each pair: +/- 48, and 96+35=131), not
+                 * blind thirds. */
+                int cyy = bar_y() + 70 + CTRL_NUDGE_PX, mid = FB_W / 2;
                 if (y > cyy - 48 && y < cyy + 48) {
                     if (x < mid - 48) {
                         if (audio_radio_offset_ms() < audio_radio_max_rewind_ms())
                             audio_radio_seek_relative_ms(-10000);
+                    } else if (x > mid + 131) {
+                        if (rb_is_recording()) {
+                            rb_recording_stop();
+                        } else {
+                            const char *ext = rb_current_kind() == RB_KIND_ADTS ? "aac" : "mp3";
+                            radio_recording_new_path(radio_name, ext, radio_recording_path_buf,
+                                                     sizeof(radio_recording_path_buf));
+                            rb_recording_start(radio_recording_path_buf);
+                        }
                     } else if (x > mid + 48) {
                         if (audio_radio_offset_ms() > 0)
                             audio_radio_seek_relative_ms(+10000);
@@ -10587,6 +10837,9 @@ int music_entry(void *a0, void *a1) {
                         audio_toggle();
                     }
                 }
+            } else if (screen == SC_PLAYING && recording_playback_mode && y >= STATUS_H) {
+                int cyy = bar_y() + 70 + CTRL_NUDGE_PX;
+                if (y > cyy - 48 && y < cyy + 48) audio_toggle();
             } else if (screen == SC_PLAYING && y >= STATUS_H) {
                 /* R93: the queue control used to sit in the corner the
                  * header once owned, hit-tested separately from everything
@@ -11352,11 +11605,18 @@ int music_entry(void *a0, void *a1) {
                     pod_list = 0;
                     mlog("[music] playlist %s: %d of %d found\n",
                          playlists[pi].name, track_n, got);
+                } else if (screen == SC_RADIO && smooth_row == station_n) {
+                    radio_recording_n = radio_recordings_load(radio_recordings, RADIO_REC_MAX);
+                    screen = SC_RADIO_RECORDINGS; reset_scroll();
                 } else if (screen == SC_RADIO && smooth_row >= 0 && smooth_row < station_n) {
                     play_station(smooth_row);
                     if (audio_is_active()) screen = SC_PLAYING;
                     else if (!radio_msg[0])
                         snprintf(radio_msg, sizeof(radio_msg), "Could not reach that station");
+                } else if (screen == SC_RADIO_RECORDINGS && smooth_row >= 0 && smooth_row < radio_recording_n &&
+                           !rec_swipe_active) {
+                    play_recording(smooth_row);
+                    if (audio_is_active()) screen = SC_PLAYING;
                 } else if (screen == SC_QUEUE && smooth_row >= 0 && smooth_row < queue_n &&
                            !queue_drag_active && !queue_swipe_active) {
                     /* R70: queue_drag_active/queue_swipe_active are still true
@@ -11571,6 +11831,17 @@ int music_entry(void *a0, void *a1) {
 
         /* A headset connecting brings its AVRCP device with it. */
         if (++rescan_tick >= 90) { rescan_tick = 0; scan_inputs(); }
+
+        /* R111: NRK program art refresh -- the program block backing it can
+         * change while a station keeps playing (it's a schedule, not a
+         * per-track thing), so a one-shot fetch at station-start alone would
+         * go stale over a long listen. Every ~2 minutes, radio_mode only;
+         * radio_art_request() itself no-ops for anything not named "NRK ". */
+        if (radio_mode) {
+            if (++radio_art_tick >= 3600) { radio_art_tick = 0; radio_art_request(radio_name); }
+        } else {
+            radio_art_tick = 0;
+        }
 
         /* Regardless of pause state, so putting the device down mid-chapter
          * and never touching it again still gets saved -- the alternative
@@ -12005,6 +12276,33 @@ int music_entry(void *a0, void *a1) {
         } else {
             pod_swipe_active = 0;
             pod_swipe_dx = 0;
+        }
+
+        if (screen == SC_RADIO_RECORDINGS) {
+            int press_idx = scroll + (touch_y - CONTENT_Y) / ROW_H;
+            int valid_row = touch_y >= CONTENT_Y && touch_y < FB_H &&
+                            press_idx >= 0 && press_idx < radio_recording_n;
+            if (!rec_swipe_active && touch_down && valid_row) {
+                int dx = live_x - touch_x, dy = live_y - touch_y;
+                if (abs(dx) > abs(dy) && abs(dx) > 10) {
+                    rec_swipe_active = 1;
+                    rec_swipe_idx = press_idx;
+                }
+            }
+            if (rec_swipe_active) {
+                if (!touch_down) {
+                    if (rec_swipe_dx <= -120 || rec_swipe_dx >= 120)
+                        radio_recording_delete(rec_swipe_idx);
+                    rec_swipe_active = 0;
+                    rec_swipe_dx = 0;
+                } else {
+                    rec_swipe_dx = live_x - touch_x;
+                }
+                dirty = 1;
+            }
+        } else {
+            rec_swipe_active = 0;
+            rec_swipe_dx = 0;
         }
 
         /* List scrolling: tracked live, one pixel at a time, rather than

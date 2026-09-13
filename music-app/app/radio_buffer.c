@@ -46,6 +46,11 @@ static rb_chunk_meta_t g_chunks[RB_MAX_CHUNKS];
 static uint64_t        g_live_pos;      /* total bytes ever written */
 static long long       g_cur_seq = -1;  /* chunk currently being written */
 
+/* Recording: a second, permanent sink for the exact same bytes rb_write_
+ * bytes() is already writing into chunk files, guarded by the same g_lock
+ * everything else here uses. -1 means not recording. */
+static int g_rec_fd = -1;
+
 /* Bytes/sec estimate: exponential moving average over ~4s windows of real
  * arrival, not a nominal bitrate the source is not obliged to honour. */
 static double   g_bps;
@@ -100,8 +105,16 @@ static void rb_write_bytes(int *fd, double *chunk_started, const unsigned char *
     pthread_mutex_lock(&g_lock);
     g_chunks[g_cur_seq % RB_MAX_CHUNKS].len += (size_t)w;
     g_live_pos += (uint64_t)w;
+    int rec_fd = g_rec_fd;
     pthread_mutex_unlock(&g_lock);
     rb_note_bytes((size_t)w);
+
+    /* Same bytes, verbatim, into the recording if one is active -- see
+     * rb_recording_start()'s own comment on why this is a second sink
+     * rather than reusing a chunk file after the fact. Written outside the
+     * lock (already released above) since this is real file I/O and
+     * nothing else here needs to wait on it. */
+    if (rec_fd >= 0 && w > 0) write(rec_fd, data, (size_t)w);
 
     if (now_mono() - *chunk_started >= RB_CHUNK_SECONDS) {
         close(*fd);
@@ -226,6 +239,7 @@ int rb_start(const char *url, rb_kind_t kind) {
 }
 
 void rb_stop(void) {
+    rb_recording_stop();   /* switching stations mid-recording should not leak the fd */
     if (!g_running && !g_active) return;
     g_running = 0;
     pthread_join(g_thread, NULL);
@@ -295,3 +309,29 @@ double rb_bytes_per_sec(void) {
 
 int rb_active(void) { return g_active; }
 rb_kind_t rb_current_kind(void) { return g_kind; }
+
+int rb_recording_start(const char *path) {
+    if (!g_active) return -1;
+    int fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    if (fd < 0) return -1;
+    pthread_mutex_lock(&g_lock);
+    if (g_rec_fd >= 0) close(g_rec_fd);   /* starting a new one abandons any previous, unclosed one */
+    g_rec_fd = fd;
+    pthread_mutex_unlock(&g_lock);
+    return 0;
+}
+
+void rb_recording_stop(void) {
+    pthread_mutex_lock(&g_lock);
+    int fd = g_rec_fd;
+    g_rec_fd = -1;
+    pthread_mutex_unlock(&g_lock);
+    if (fd >= 0) close(fd);
+}
+
+int rb_is_recording(void) {
+    pthread_mutex_lock(&g_lock);
+    int v = g_rec_fd >= 0;
+    pthread_mutex_unlock(&g_lock);
+    return v;
+}

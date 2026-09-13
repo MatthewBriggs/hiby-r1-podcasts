@@ -124,6 +124,7 @@ typedef struct {
     int        bits;        /* of the source; 16 unless the file says more */
     int        is_stream;
     int        is_hls;
+    int        is_adts_file;  /* a finished radio recording, saved as raw ADTS -- see dec_open_adts_file() */
     mp4_t       mp4;
     aac_dec_t  *aac;
     alac_dec_t *alac;   /* .m4a is either AAC or ALAC, never both; mp4.codec says which */
@@ -418,6 +419,73 @@ static int dec_open_hls(dec_t *d, const char *url) {
     return -1;
 }
 
+/* A finished radio recording from an HLS/AAC station, saved as raw ADTS
+ * (see radio_buffer.h's own comment on why -- no transcoding, exactly the
+ * bytes that arrived). This is deliberately NOT routed through sniff():
+ * ADTS's syncword is 12 bits (0xFFF) against MPEG audio's 11 (0xFFE), and
+ * with layer bits forced to 0 for ADTS, its second byte lands as one of
+ * {0xF0,0xF1,0xF8,0xF9} -- all of which also satisfy sniff()'s existing
+ * `(m[1] & 0xE0) == 0xE0` MP3 check. A real MP3 recording (from a direct-
+ * stream station) has no such ambiguity and plays back through the normal
+ * DEC_MP3 path unchanged; only the AAC/ADTS case needs this. Routed here by
+ * open_any() checking the .aac extension before sniff() ever runs. */
+typedef struct {
+    FILE          *fp;
+    unsigned char  buf[16384];
+    int            len, used;
+    short          pcm[2048 * 8];
+    int            pcm_frames, pcm_taken;
+    int            channels, rate;
+} adts_file_t;
+
+static adts_file_t g_adts_file;
+
+static int adts_file_refill(adts_file_t *s) {
+    if (s->used > 0) {
+        memmove(s->buf, s->buf + s->used, (size_t)(s->len - s->used));
+        s->len -= s->used;
+        s->used = 0;
+    }
+    size_t got = fread(s->buf + s->len, 1, sizeof(s->buf) - (size_t)s->len, s->fp);
+    s->len += (int)got;
+    return (int)got;
+}
+
+static int dec_open_adts_file(dec_t *d, const char *path) {
+    memset(d, 0, sizeof(*d));
+    memset(&g_adts_file, 0, sizeof(g_adts_file));
+    g_adts_file.fp = fopen(path, "rb");
+    if (!g_adts_file.fp) return -1;
+    g_hls.aac = aac_open(NULL, 0);   /* reuses g_hls.aac -- only one of the two is ever active */
+    if (!g_hls.aac) { fclose(g_adts_file.fp); g_adts_file.fp = NULL; return -1; }
+
+    for (int tries = 0; tries < 8; tries++) {
+        if (g_adts_file.used >= g_adts_file.len && adts_file_refill(&g_adts_file) <= 0) break;
+        int took = aac_fill(g_hls.aac, g_adts_file.buf + g_adts_file.used,
+                            (unsigned)(g_adts_file.len - g_adts_file.used));
+        if (took > 0) g_adts_file.used += took;
+        int fr = aac_frame(g_hls.aac, g_adts_file.pcm, 2048);
+        if (fr > 0) {
+            g_adts_file.pcm_frames = fr; g_adts_file.pcm_taken = 0;
+            g_adts_file.rate = aac_rate(g_hls.aac);
+            g_adts_file.channels = aac_channels(g_hls.aac);
+            d->kind = DEC_M4A;
+            d->is_stream = 1;      /* no known duration -- see this function's own comment */
+            d->is_adts_file = 1;
+            d->channels = g_adts_file.channels;
+            d->rate = (unsigned)g_adts_file.rate;
+            d->frames = 0;
+            g_codec = "AAC";
+            return 0;
+        }
+    }
+    aac_close(g_hls.aac);
+    g_hls.aac = NULL;
+    fclose(g_adts_file.fp);
+    g_adts_file.fp = NULL;
+    return -1;
+}
+
 static int dec_open_stream(dec_t *d, const char *url) {
     memset(d, 0, sizeof(*d));
     memset(&g_stream, 0, sizeof(g_stream));
@@ -613,6 +681,32 @@ static uint64_t dec_read32(dec_t *d, int32_t *out, uint64_t want) {
 
 static uint64_t dec_read(dec_t *d, short *out, uint64_t want) {
     if (d->is_hls || d->is_stream) radio_apply_pending_seek();
+    if (d->is_adts_file) {
+        adts_file_t *s = &g_adts_file;
+        uint64_t done = 0;
+        while (done < want) {
+            if (s->pcm_taken >= s->pcm_frames) {
+                int fr = aac_frame(g_hls.aac, s->pcm, 2048);
+                if (fr <= 0) {
+                    if (s->used >= s->len && adts_file_refill(s) <= 0) break;   /* real EOF: a finished file, unlike a live stream */
+                    int took = aac_fill(g_hls.aac, s->buf + s->used, (unsigned)(s->len - s->used));
+                    if (took <= 0) break;
+                    s->used += took;
+                    continue;
+                }
+                s->pcm_frames = fr;
+                s->pcm_taken = 0;
+            }
+            int avail = s->pcm_frames - s->pcm_taken;
+            uint64_t take = (uint64_t)avail < (want - done) ? (uint64_t)avail : (want - done);
+            memcpy(out + done * (size_t)s->channels,
+                   s->pcm + (size_t)s->pcm_taken * (size_t)s->channels,
+                   (size_t)take * (size_t)s->channels * sizeof(short));
+            s->pcm_taken += (int)take;
+            done += take;
+        }
+        return done;
+    }
     if (d->is_hls) {
         hls_src_t *s = &g_hls;
         uint64_t done = 0;
@@ -791,6 +885,10 @@ static int mp3_seek_approx(dec_t *d, const char *path, uint64_t targetFrame,
 
 static void dec_seek(dec_t *d, uint64_t frame, const char *path,
                       drmp3_seek_point **bound_points) {
+    /* No real seek support yet (see dec_open_adts_file()'s own comment) --
+     * a no-op, not a fall-through into the M4A case below, which would call
+     * mp4_seek() against a d->mp4 that was never opened for this path. */
+    if (d->is_adts_file) return;
     if (d->kind == DEC_M4A) {
         /* Access units are a fixed number of frames, so the index is just a
          * division; seeking is to the start of the unit containing it. */
@@ -816,6 +914,13 @@ static void dec_seek(dec_t *d, uint64_t frame, const char *path,
 }
 
 static void dec_close(dec_t *d) {
+    if (d->is_adts_file) {
+        aac_close(g_hls.aac);
+        g_hls.aac = NULL;
+        if (g_adts_file.fp) { fclose(g_adts_file.fp); g_adts_file.fp = NULL; }
+        d->kind = DEC_NONE;
+        return;
+    }
     if (d->is_hls) {
         rb_stop();
         aac_close(g_hls.aac);
@@ -1796,8 +1901,14 @@ static int open_any(dec_t *d, const char *path) {
         const char *dot = strstr(path, ".m3u8");
         if (dot && (!q || dot < q)) is_hls = 1;
     }
+    /* A saved radio recording from an HLS/AAC station -- see
+     * dec_open_adts_file()'s own comment for why this has to be routed by
+     * extension rather than sniff()'s magic-byte dispatch. */
+    size_t plen = strlen(path);
+    int is_adts = !is_url && plen > 4 && !strcmp(path + plen - 4, ".aac");
     int rc = is_hls ? dec_open_hls(d, path)
                     : is_url ? dec_open_stream(d, path)
+                    : is_adts ? dec_open_adts_file(d, path)
                              : dec_open(d, path);
     /* Named like a stream but served as a playlist: open it as one. */
     if (rc == -2) rc = dec_open_hls(d, path);

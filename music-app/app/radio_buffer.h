@@ -64,4 +64,24 @@ double rb_bytes_per_sec(void);
 int rb_active(void);
 rb_kind_t rb_current_kind(void);
 
+/* Recording: taps the exact same bytes the background thread is already
+ * writing into chunk files (see rb_write_bytes() in radio_buffer.c) and
+ * copies them, as-is, into a second, permanent file for as long as
+ * recording is active -- no transcoding, no separate fetch. Starts writing
+ * from whatever arrives *after* this call, not from anything already
+ * buffered (the time-shift window and a recording are two different
+ * lifetimes: one is a rolling 30 minutes that exists whether or not anyone
+ * asked for it, the other is exactly what a listener chose to keep).
+ * path's extension should match rb_current_kind() (.mp3 for RB_KIND_MP3,
+ * .aac for RB_KIND_ADTS -- audio.c's local-file playback dispatches on it)
+ * so the recording is actually listenable afterward.
+ * Returns 0 on success, -1 if the file could not be opened or no session
+ * is active. */
+int rb_recording_start(const char *path);
+
+/* Stop and close the recording (if any). Safe to call when not recording. */
+void rb_recording_stop(void);
+
+int rb_is_recording(void);
+
 #endif
