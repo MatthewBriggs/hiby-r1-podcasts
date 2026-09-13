@@ -5965,10 +5965,19 @@ static void draw_screen(uint16_t *fb) {
             draw_text(fb, 24, cy, radio_name, COL_TEXT, TEXT_PX_TITLE, FB_W - 48);
             draw_text(fb, 24, cy + 52, "Internet radio", COL_DIM, TEXT_PX_BODY, FB_W - 48);
 
-            int pos = audio_pos_ms();
-            snprintf(buf, sizeof(buf), "%d:%02d", pos / 60000, (pos / 1000) % 60);
-            draw_text(fb, 24, cy + 110, buf, COL_DIM, TEXT_PX_SMALL, FB_W);
-            draw_right(fb, cy + 110, audio_is_active() ? "LIVE" : "stopped");
+            /* R111: how far behind live, not elapsed-since-play -- once
+             * rewind exists, "elapsed" and "how far from live" are two
+             * different numbers, and the live-edge readout is the one a
+             * rewound listener actually wants on screen. 0 offset still
+             * reads "LIVE"; behind it, "-M:SS" the same way a remaining-time
+             * clock elsewhere in this app is signed. */
+            long behind_ms = audio_radio_offset_ms();
+            if (behind_ms > 0) {
+                snprintf(buf, sizeof(buf), "-%ld:%02ld", behind_ms / 60000, (behind_ms / 1000) % 60);
+                draw_right(fb, cy + 110, buf);
+            } else {
+                draw_right(fb, cy + 110, audio_is_active() ? "LIVE" : "stopped");
+            }
 
             int cyy = cy + 190, mid = FB_W / 2;
             fill_circle(fb, mid, cyy, 42, COL_ACCENT);
@@ -5976,6 +5985,29 @@ static void draw_screen(uint16_t *fb) {
             else {
                 fill_rect(fb, mid - 15, cyy - 18, 10, 36, COL_BG);
                 fill_rect(fb, mid + 5,  cyy - 18, 10, 36, COL_BG);
+            }
+
+            /* R111: rewind/fast-forward, same -10s/+10s icon and placement
+             * the audiobook player already uses (icon_skip_back/_forward,
+             * off=96 from the transport's own centre) -- explicit request
+             * to match house style rather than invent a new control shape.
+             * Fast-forward greys out at the live edge (nothing buffered
+             * ahead of it to skip into) and rewind greys out once the
+             * buffer's retained window is exhausted -- both real limits,
+             * not decorative. */
+            {
+                int off = 96;
+                long max_rewind = audio_radio_max_rewind_ms();
+                uint16_t back_col = (behind_ms < max_rewind) ? COL_TEXT : COL_DIM;
+                uint16_t fwd_col  = (behind_ms > 0) ? COL_TEXT : COL_DIM;
+                draw_icon(fb, FB_W, FB_H, mid - off - icon_skip_back.w / 2,
+                         cyy - icon_skip_back.h / 2, &icon_skip_back, back_col);
+                draw_icon(fb, FB_W, FB_H, mid + off - icon_skip_forward.w / 2,
+                         cyy - icon_skip_forward.h / 2, &icon_skip_forward, fwd_col);
+                const char *n = "10s";
+                int nw = text_width(n, TEXT_PX_SMALL);
+                draw_text(fb, mid - off - nw / 2, cyy - TEXT_PX_SMALL / 2 + 2, n, back_col, TEXT_PX_SMALL, FB_W);
+                draw_text(fb, mid + off - nw / 2, cyy - TEXT_PX_SMALL / 2 + 2, n, fwd_col, TEXT_PX_SMALL, FB_W);
             }
 
             /* Say which codec actually turned up: an HLS station is AAC, and
@@ -9722,6 +9754,9 @@ static int handle_keys(int fd, key_src_t src) {
                      * both audiobook and podcast. */
                     if (audiobook_mode) { audio_seek_ms(audio_pos_ms() + 10000); seek_toast(+10000); }
                     else if (podcast_mode) { audio_seek_ms(audio_pos_ms() + 30000); seek_toast(+30000); }
+                    else if (radio_mode) {
+                        if (audio_radio_offset_ms() > 0) { audio_radio_seek_relative_ms(+10000); seek_toast(+10000); }
+                    }
                     else                play_index(next_track_index());
                     acted = 1; break;
                 case KEY_NEXTSONG_:             /* the skip-back button */
@@ -9732,6 +9767,9 @@ static int handle_keys(int fd, key_src_t src) {
                      * same way. */
                     if (audiobook_mode) { audio_seek_ms(audio_pos_ms() - 10000); seek_toast(-10000); }
                     else if (podcast_mode) { audio_seek_ms(audio_pos_ms() - 10000); seek_toast(-10000); }
+                    else if (radio_mode) {
+                        if (audio_radio_offset_ms() < audio_radio_max_rewind_ms()) { audio_radio_seek_relative_ms(-10000); seek_toast(-10000); }
+                    }
                     else if (audio_pos_ms() > 3000) audio_seek_ms(0);
                     else play_index(prev_track_index());
                     acted = 1;
@@ -9759,6 +9797,9 @@ static int handle_keys(int fd, key_src_t src) {
             case KEY_NEXTSONG_:
                 if (audiobook_mode) ab_play_chapter(cur_track + 1);
                 else if (podcast_mode) { audio_seek_ms(audio_pos_ms() + 30000); seek_toast(+30000); }
+                else if (radio_mode) {
+                    if (audio_radio_offset_ms() > 0) { audio_radio_seek_relative_ms(+10000); seek_toast(+10000); }
+                }
                 else                play_index(next_track_index());
                 acted = 1;
                 break;
@@ -9780,6 +9821,8 @@ static int handle_keys(int fd, key_src_t src) {
                 } else if (podcast_mode) {
                     audio_seek_ms(audio_pos_ms() - 10000);
                     seek_toast(-10000);
+                } else if (radio_mode) {
+                    if (audio_radio_offset_ms() < audio_radio_max_rewind_ms()) { audio_radio_seek_relative_ms(-10000); seek_toast(-10000); }
                 } else if (audio_pos_ms() > 3000) {
                     audio_seek_ms(0);
                 } else {
@@ -9794,11 +9837,19 @@ static int handle_keys(int fd, key_src_t src) {
                  * path had ever been taught that asymmetry). Audiobook and
                  * plain music already matched the on-screen amount at
                  * 10000, unchanged. */
+                if (radio_mode) {
+                    if (audio_radio_offset_ms() > 0) { audio_radio_seek_relative_ms(+10000); seek_toast(+10000); }
+                    acted = 1; break;
+                }
                 int d = podcast_mode ? 30000 : 10000;
                 audio_seek_ms(audio_pos_ms() + d); seek_toast(+d);
                 acted = 1; break;
             }
             case KEY_REWIND_:
+                if (radio_mode) {
+                    if (audio_radio_offset_ms() < audio_radio_max_rewind_ms()) { audio_radio_seek_relative_ms(-10000); seek_toast(-10000); }
+                    acted = 1; break;
+                }
                 audio_seek_ms(audio_pos_ms() - 10000); seek_toast(-10000);
                 acted = 1; break;
             default: break;
@@ -10520,8 +10571,22 @@ int music_entry(void *a0, void *a1) {
                     }
                 }
             } else if (screen == SC_PLAYING && radio_mode && y >= STATUS_H) {
-                int cyy = 120 + 190;
-                if (y > cyy - 48 && y < cyy + 48) audio_toggle();
+                /* R111: real hit zones under the drawn icons, same idiom
+                 * BG47 uses for podcast's -10s/+30s row -- midpoints between
+                 * adjacent element centres (play at mid, skip icons at
+                 * mid +/- 96, so the boundary is +/- 48), not blind thirds. */
+                int cyy = 120 + 190, mid = FB_W / 2;
+                if (y > cyy - 48 && y < cyy + 48) {
+                    if (x < mid - 48) {
+                        if (audio_radio_offset_ms() < audio_radio_max_rewind_ms())
+                            audio_radio_seek_relative_ms(-10000);
+                    } else if (x > mid + 48) {
+                        if (audio_radio_offset_ms() > 0)
+                            audio_radio_seek_relative_ms(+10000);
+                    } else {
+                        audio_toggle();
+                    }
+                }
             } else if (screen == SC_PLAYING && y >= STATUS_H) {
                 /* R93: the queue control used to sit in the corner the
                  * header once owned, hit-tested separately from everything

@@ -297,9 +297,29 @@ static void radio_apply_pending_seek(void) {
     g_hls.adts_len = g_hls.adts_used = 0;
 }
 
+/* rb_read_at() returning 0 at the live edge does not mean the stream ended
+ * -- it means the background writer (radio_buffer.c) hasn't landed the next
+ * bytes yet, which happens constantly during completely normal playback
+ * since decode consumption and network arrival are only synced on average,
+ * not instant to instant. The direct network reads this replaced used to
+ * just block until real data showed up; reported live as playback stopping
+ * outright ~3-4s into every station (dec_read()'s caller sees one empty
+ * read and calls it finished) until this waited the same way. Bounded so a
+ * genuine dead background thread (rb_active() false) or a truly stalled
+ * station still gets reported rather than hanging the worker forever. */
+static size_t rb_read_at_wait(uint64_t pos, unsigned char *out, size_t len) {
+    for (int tries = 0; tries < 150; tries++) {
+        size_t got = rb_read_at(pos, out, len);
+        if (got > 0) return got;
+        if (!rb_active()) return 0;
+        usleep(20 * 1000);
+    }
+    return 0;
+}
+
 static int stream_fill(stream_t *s) {
     if (!s->pipe || s->len >= STREAM_BUF) return 0;
-    size_t got = rb_read_at(g_radio_cursor, s->buf + s->len, (size_t)(STREAM_BUF - s->len));
+    size_t got = rb_read_at_wait(g_radio_cursor, s->buf + s->len, (size_t)(STREAM_BUF - s->len));
     s->len += (int)got;
     g_radio_cursor += got;
     return (int)got;
@@ -338,7 +358,7 @@ static int stream_decode_frame(stream_t *s) {
  * TS segments to ADTS as they arrive -- see radio_buffer.c's HLS worker --
  * so this reads a clean self-describing AAC bytestream, not raw TS). */
 static int hls_refill(hls_src_t *s) {
-    size_t got = rb_read_at(g_radio_cursor, s->adts, sizeof(s->adts));
+    size_t got = rb_read_at_wait(g_radio_cursor, s->adts, sizeof(s->adts));
     if (got == 0) return 0;
     g_radio_cursor += got;
     s->adts_len = (int)got;
@@ -361,11 +381,15 @@ static int dec_open_hls(dec_t *d, const char *url) {
      * two real HTTPS fetches on this device's TLS-heavy curl path) before
      * the first segment is even requested, so this needs real patience: a
      * live capture showed one open time out and immediately succeed on
-     * retry at the old, shorter budget. 10s, not the 3s first tried. */
-    for (int tries = 0; tries < 200; tries++) {
+     * retry at the old, shorter budget. hls_refill() itself now blocks up
+     * to ~3s per call waiting for the background writer (rb_read_at_wait()
+     * in stream_fill()/hls_refill()'s own comment), so a failed try here is
+     * already a real ~3s wait, not a bare 50ms poll -- 10 tries is ~30s,
+     * covering radio_buffer's own up-to-3 connect retries plus real connect
+     * time, without the two retry layers compounding into minutes. */
+    for (int tries = 0; tries < 10; tries++) {
         if (g_hls.adts_used >= g_hls.adts_len && hls_refill(&g_hls) <= 0) {
             if (!rb_active()) break;   /* background fetch already gave up -- bad URL, no point waiting out the rest */
-            usleep(50 * 1000);
             continue;
         }
         int took = aac_fill(g_hls.aac, g_hls.adts + g_hls.adts_used,
@@ -408,15 +432,13 @@ static int dec_open_stream(dec_t *d, const char *url) {
 
     /* First bytes take a moment to arrive -- the background thread has only
      * just started the real connection (TLS handshake, then a redirect to a
-     * regional pop for some stations). Same 10s budget as the HLS path, and
-     * for the same reason: a live capture showed the old, shorter timeout
-     * fail once and succeed moments later on retry. */
-    for (int tries = 0; tries < 200 && g_stream.len < 7; tries++) {
+     * regional pop for some stations). Same ~30s budget as the HLS path and
+     * for the same reason -- see that loop's own comment on why the count
+     * is 10, not a much larger number, now that stream_fill() itself blocks
+     * for a real stretch per call via rb_read_at_wait(). */
+    for (int tries = 0; tries < 10 && g_stream.len < 7; tries++) {
         stream_fill(&g_stream);
-        if (g_stream.len < 7) {
-            if (!rb_active()) break;   /* background fetch already gave up -- bad URL, no point waiting out the rest */
-            usleep(50 * 1000);
-        }
+        if (g_stream.len < 7 && !rb_active()) break;   /* background fetch already gave up -- bad URL, no point waiting out the rest */
     }
     drmp3dec_init(&g_stream.dec);
     /* A playlist handed to the MP3 path decodes as nothing at all, which is

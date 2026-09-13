@@ -110,17 +110,40 @@ static void rb_write_bytes(int *fd, double *chunk_started, const unsigned char *
     }
 }
 
+/* A live stream's connect can fail on a transient hiccup (early-boot
+ * network not fully up yet, a DNS blip, a momentary redirect failure) that
+ * has nothing to do with the URL being bad. Reported live: a fresh boot hit
+ * exactly this ~15s into boot and the station just sat on "stopped" with an
+ * empty buffer directory -- neither worker retried its own initial connect
+ * at all, unlike a real radio player. Three tries, 1s apart, covers a
+ * genuine hiccup without holding a bad URL's failure report open for long. */
+#define RB_CONNECT_RETRIES 3
+
 static void *rb_worker_mp3(void *arg) {
     (void)arg;
     char cmd[1200];
     snprintf(cmd, sizeof(cmd), "%s -sL --no-buffer --cacert %s '%s' 2>/dev/null",
              RB_CURL_PATH, RB_CA_BUNDLE, g_url);
-    FILE *p = popen(cmd, "r");
+
+    FILE *p = NULL;
+    unsigned char probe[1];
+    size_t probe_got = 0;
+    for (int attempt = 0; g_running && attempt < RB_CONNECT_RETRIES; attempt++) {
+        p = popen(cmd, "r");
+        if (p) {
+            probe_got = fread(probe, 1, 1, p);
+            if (probe_got > 0) break;
+            pclose(p);
+            p = NULL;
+        }
+        if (attempt + 1 < RB_CONNECT_RETRIES) sleep(1);
+    }
     if (!p) { g_active = 0; return NULL; }
 
     int fd = rb_roll_chunk(0);
     double chunk_started = now_mono();
     if (fd < 0) { pclose(p); g_active = 0; return NULL; }
+    if (probe_got > 0) rb_write_bytes(&fd, &chunk_started, probe, probe_got);
 
     unsigned char buf[8192];
     while (g_running) {
@@ -140,7 +163,12 @@ static void *rb_worker_mp3(void *arg) {
 static void *rb_worker_hls(void *arg) {
     (void)arg;
     hls_t hls;
-    if (hls_open(&hls, g_url) != 0) { g_active = 0; return NULL; }
+    int opened = 0;
+    for (int attempt = 0; g_running && attempt < RB_CONNECT_RETRIES; attempt++) {
+        if (hls_open(&hls, g_url) == 0) { opened = 1; break; }
+        if (attempt + 1 < RB_CONNECT_RETRIES) sleep(1);
+    }
+    if (!opened) { g_active = 0; return NULL; }
 
     int fd = rb_roll_chunk(0);
     double chunk_started = now_mono();
