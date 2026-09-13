@@ -6207,10 +6207,21 @@ static void draw_screen(uint16_t *fb) {
              * buffer's retained window is exhausted -- both real limits,
              * not decorative. */
             {
+                /* R111 follow-up: reported live as invisible against the
+                 * cover-colour background -- these were plain COL_TEXT/
+                 * COL_DIM, the same as the audiobook player's own -10s/+10s
+                 * icons, but audiobook_mode deliberately keeps a fixed
+                 * plain background (see this screen's own art-box comment
+                 * further up) where COL_TEXT always contrasts. Radio's
+                 * background is np_col_bg() now, which a dark theme (this
+                 * NRK cover's navy, say) makes plain COL_TEXT/COL_DIM
+                 * illegible against. np_col_fg()/np_col_dim() track it. */
                 int off = 96;
                 long max_rewind = audio_radio_max_rewind_ms();
-                uint16_t back_col = (behind_ms < max_rewind) ? COL_TEXT : COL_DIM;
-                uint16_t fwd_col  = (behind_ms > 0) ? COL_TEXT : COL_DIM;
+                uint16_t enabled_col = np_col_fg();
+                uint16_t disabled_col = np_col_dim();
+                uint16_t back_col = (behind_ms < max_rewind) ? enabled_col : disabled_col;
+                uint16_t fwd_col  = (behind_ms > 0) ? enabled_col : disabled_col;
                 draw_icon(fb, FB_W, FB_H, mid - off - icon_skip_back.w / 2,
                          cyy - icon_skip_back.h / 2, &icon_skip_back, back_col);
                 draw_icon(fb, FB_W, FB_H, mid + off - icon_skip_forward.w / 2,
@@ -6230,16 +6241,20 @@ static void draw_screen(uint16_t *fb) {
              * side, per explicit request to place it there rather than
              * invent new spacing. Ring and dot both turn the same red
              * "Wi-Fi is off"/error text already uses elsewhere on this
-             * screen while actually recording, with a "REC" label under it
-             * -- otherwise a plain outline ring with a dot, the universal
-             * "tap to record" affordance, in the ordinary text colour. */
+             * screen while actually recording (an alert colour, kept fixed
+             * across themes on purpose, unlike the idle state below), with
+             * a "REC" label under it -- otherwise a plain outline ring
+             * with a dot, the universal "tap to record" affordance, in the
+             * theme's own colours (see the skip icons' own comment just
+             * above for why plain COL_LINE/COL_TEXT/COL_BG went invisible
+             * here once the background became theme-derived). */
             {
                 int rec_x = mid + 96 + 70;
                 int recording = rb_is_recording();
-                uint16_t ring_col = recording ? RGB(230, 80, 70) : COL_LINE;
-                uint16_t dot_col  = recording ? RGB(230, 80, 70) : COL_TEXT;
+                uint16_t ring_col = recording ? RGB(230, 80, 70) : np_col_dim();
+                uint16_t dot_col  = recording ? RGB(230, 80, 70) : np_col_fg();
                 fill_circle(fb, rec_x, cyy, 22, ring_col);
-                fill_circle(fb, rec_x, cyy, 20, COL_BG);
+                fill_circle(fb, rec_x, cyy, 20, np_col_bg());
                 fill_circle(fb, rec_x, cyy, 10, dot_col);
                 if (recording)
                     draw_text(fb, rec_x - text_width("REC", TEXT_PX_SMALL) / 2,
